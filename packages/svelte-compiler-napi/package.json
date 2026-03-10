@@ -1,0 +1,10 @@
+{
+  "name": "svelte-compiler-napi",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./index.cjs",
+  "scripts": {
+    "build": "node -e \"\"",
+    "check": "node --check ./index.cjs"
+  }
+}

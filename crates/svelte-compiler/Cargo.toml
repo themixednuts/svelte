@@ -1,0 +1,40 @@
+[package]
+name = "svelte-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core compiler API for the Rust Svelte toolchain"
+
+[dependencies]
+aria-query.workspace = true
+biome_aria.workspace = true
+biome_aria_metadata.workspace = true
+bumpalo.workspace = true
+camino.workspace = true
+futures.workspace = true
+memchr.workspace = true
+html-escape.workspace = true
+lightningcss.workspace = true
+miette.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_ast_visit.workspace = true
+oxc_estree.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-svelte.workspace = true
+unicode-ident.workspace = true
+winnow.workspace = true
+
+[dev-dependencies]
+datatest-stable.workspace = true
+svelte-test-fixtures = { path = "../svelte-test-fixtures" }

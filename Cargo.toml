@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/svelte-cli",
+  "crates/svelte-compiler",
+  "crates/svelte-compiler-napi",
+  "crates/svelte-vite-rolldown",
+  "crates/svelte-vite-rolldown-napi",
+  "crates/svelte-test-fixtures",
+]
+default-members = ["crates/svelte-cli", "crates/svelte-compiler"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+authors = ["mixednuts"]
+repository = "https://github.com/sveltejs/svelte"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+aria-query = "0.0.6"
+biome_aria = "0.5.7"
+biome_aria_metadata = "0.5.7"
+bumpalo = { version = "3.17.0", features = ["collections"] }
+camino = { version = "1.2.2", features = ["serde1"] }
+clap = { version = "4.5.60", features = ["derive"] }
+datatest-stable = "0.3.3"
+futures = "0.3.31"
+memchr = "2.8.0"
+html-escape = "0.2.13"
+lightningcss = { version = "1.0.0-alpha.70", default-features = false }
+miette = { version = "7.6.0", features = ["fancy"] }
+oxc_allocator = "=0.115.0"
+oxc_ast = { version = "=0.115.0", features = ["serialize"] }
+oxc_ast_visit = { version = "=0.115.0", features = ["serialize"] }
+oxc_estree = { version = "=0.115.0", features = ["serialize"] }
+oxc_parser = "=0.115.0"
+oxc_span = "=0.115.0"
+napi = "=3.8.3"
+napi-derive = "=3.5.2"
+napi-build = "=2.3.1"
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.149"
+rustc-hash = "1.1.0"
+smallvec = "1.15.1"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
+tower-lsp-server = "0.23.0"
+tree-sitter = "0.26.6"
+tree-sitter-language = "0.1.7"
+tree-sitter-htmlx = { path = "../tree-sitter-htmlx/crates/tree-sitter-htmlx" }
+tree-sitter-svelte = { path = "../tree-sitter-htmlx/crates/tree-sitter-svelte" }
+unicode-ident = "1.0.22"
+winnow = "0.7.14"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

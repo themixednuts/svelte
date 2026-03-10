@@ -1,0 +1,18 @@
+{
+  "name": "@svelte-rs/vite-rolldown-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runtime-agnostic bridge utilities for Rust Svelte compile APIs",
+  "exports": {
+    ".": "./src/index.js",
+    "./node": "./src/node.js",
+    "./compiler/node": "./src/compiler-node.js",
+    "./vite": "./src/vite-plugin.js",
+    "./compat/svelte-compiler": "./src/compat-svelte-compiler.js"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "check": "node --check ./src/index.js && node --check ./src/node.js && node --check ./src/compiler-node.js && node --check ./src/vite-plugin.js && node --check ./src/compat-svelte-compiler.js && node --test ./src/compat-svelte-compiler.test.js"
+  }
+}

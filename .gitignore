@@ -1,0 +1,35 @@
+# Dependency directories
+node_modules/
+
+# IDE related
+.idea
+
+# Test coverage
+coverage
+*.lcov
+
+# Optional eslint cache
+.eslintcache
+
+# dotenv environment variables file
+.env
+.env.test
+
+# build output
+.vercel
+
+# OS-specific
+.DS_Store
+
+tmp
+.claude/
+.codemogger/
+/svelte/
+/kit/
+/svelte-language-tools/
+packages/svelte-compiler-napi/.native/
+
+benchmarking/compare/.results
+
+# Rust build output
+target/
