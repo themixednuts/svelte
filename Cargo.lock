@@ -2050,7 +2050,6 @@ dependencies = [
  "serde_json",
  "smallvec",
  "svelte-syntax",
- "svelte-test-fixtures",
  "thiserror",
  "tree-sitter",
  "tree-sitter-htmlx-svelte",

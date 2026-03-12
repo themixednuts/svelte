@@ -28,10 +28,15 @@ use svelte_compiler::{
     PreprocessOutput, PreprocessResult, PreprocessorGroup, PrintOptions, SourceMap, compile,
     compile_module, migrate, parse, parse_css, preprocess, print,
 };
-use svelte_test_fixtures::{
-    CompilerSuite, FixtureCase, detect_repo_root, discover_suite_cases,
-    discover_suite_cases_by_name, load_test_config,
+#[path = "support/fixture/mod.rs"]
+mod fixture_support;
+#[path = "support/repo/mod.rs"]
+mod repo_support;
+
+use fixture_support::{
+    FixtureCase, discover_suite_cases, discover_suite_cases_by_name, load_test_config,
 };
+use repo_support::detect_repo_root;
 
 const COMPILER_MAPPED_JS_SUITES: &[&str] = &[
     "compiler-errors",
@@ -90,8 +95,7 @@ fn to_fixture_json<T: Serialize>(value: &T) -> FixtureJson {
 #[test]
 fn parser_modern_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserModern)
-        .expect("discover parser-modern");
+    let cases = discover_suite_cases(&repo_root, "parser-modern").expect("discover parser-modern");
 
     let mut failures = Vec::new();
 
@@ -171,8 +175,7 @@ fn parser_modern_suite_ported() {
 #[test]
 fn parser_legacy_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserLegacy)
-        .expect("discover parser-legacy");
+    let cases = discover_suite_cases(&repo_root, "parser-legacy").expect("discover parser-legacy");
 
     let mut failures = Vec::new();
 
@@ -228,8 +231,7 @@ fn parser_legacy_suite_ported() {
 fn debug_single_parser_legacy_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserLegacy)
-        .expect("discover parser-legacy");
+    let cases = discover_suite_cases(&repo_root, "parser-legacy").expect("discover parser-legacy");
     let case = cases
         .into_iter()
         .find(|case| case.name == fixture_name)
@@ -274,8 +276,7 @@ fn debug_single_parser_legacy_fixture() {
 fn debug_single_parser_modern_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserModern)
-        .expect("discover parser-modern");
+    let cases = discover_suite_cases(&repo_root, "parser-modern").expect("discover parser-modern");
     let case = cases
         .into_iter()
         .find(|case| case.name == fixture_name)
@@ -320,7 +321,7 @@ fn debug_single_parser_modern_fixture() {
 fn debug_single_print_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Print).expect("discover print");
+    let cases = discover_suite_cases(&repo_root, "print").expect("discover print");
     let case = cases
         .into_iter()
         .find(|case| case.name == fixture_name)
@@ -356,8 +357,7 @@ fn debug_single_print_fixture() {
 fn debug_single_parser_modern_roundtrip_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserModern)
-        .expect("discover parser-modern");
+    let cases = discover_suite_cases(&repo_root, "parser-modern").expect("discover parser-modern");
     let case = cases
         .into_iter()
         .find(|case| case.name == fixture_name)
@@ -403,8 +403,8 @@ fn debug_single_parser_modern_roundtrip_fixture() {
 #[test]
 fn compiler_errors_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::CompilerErrors)
-        .expect("discover compiler-errors");
+    let cases =
+        discover_suite_cases(&repo_root, "compiler-errors").expect("discover compiler-errors");
 
     let mut failures = Vec::new();
 
@@ -812,8 +812,7 @@ fn migrate_svelte_component_fixture_ported() {
 #[test]
 fn migrate_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases =
-        discover_suite_cases(&repo_root, CompilerSuite::Migrate).expect("discover migrate suite");
+    let cases = discover_suite_cases(&repo_root, "migrate").expect("discover migrate suite");
 
     for case in cases {
         assert_migrate_fixture(&case.name);
@@ -823,8 +822,7 @@ fn migrate_suite_ported() {
 #[test]
 fn preprocess_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Preprocess)
-        .expect("discover preprocess suite");
+    let cases = discover_suite_cases(&repo_root, "preprocess").expect("discover preprocess suite");
 
     for case in cases {
         assert_preprocess_fixture(&case.name);
@@ -1376,7 +1374,7 @@ fn debug_single_migrate_fixture() {
 #[test]
 fn css_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Css).expect("discover css suite");
+    let cases = discover_suite_cases(&repo_root, "css").expect("discover css suite");
 
     let mut failures = Vec::new();
 
@@ -1475,7 +1473,7 @@ fn css_suite_ported() {
 fn debug_single_css_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Css).expect("discover css suite");
+    let cases = discover_suite_cases(&repo_root, "css").expect("discover css suite");
     let case = cases
         .into_iter()
         .find(|case| case.name == fixture_name)
@@ -1818,8 +1816,7 @@ fn parse_js_string_field(source: &str, field_name: &str) -> Option<String> {
 #[test]
 fn print_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases =
-        discover_suite_cases(&repo_root, CompilerSuite::Print).expect("discover print suite");
+    let cases = discover_suite_cases(&repo_root, "print").expect("discover print suite");
 
     let mut failures = Vec::new();
 
@@ -1872,8 +1869,7 @@ fn print_suite_ported() {
 #[test]
 fn validator_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Validator)
-        .expect("discover validator suite");
+    let cases = discover_suite_cases(&repo_root, "validator").expect("discover validator suite");
 
     let mut failures = Vec::new();
 
@@ -2016,8 +2012,7 @@ fn validator_suite_ported() {
 #[test]
 fn validator_suite_ported_smoke() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Validator)
-        .expect("discover validator suite");
+    let cases = discover_suite_cases(&repo_root, "validator").expect("discover validator suite");
 
     let mut failures = Vec::new();
 
@@ -2100,8 +2095,8 @@ fn validator_suite_ported_smoke() {
 fn debug_single_validator_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let mut cases = discover_suite_cases(&repo_root, CompilerSuite::Validator)
-        .expect("discover validator suite");
+    let mut cases =
+        discover_suite_cases(&repo_root, "validator").expect("discover validator suite");
     cases.retain(|case| case.name == fixture_name);
     let case = cases
         .into_iter()
@@ -2155,8 +2150,7 @@ fn debug_single_validator_fixture() {
 #[test]
 fn snapshot_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases =
-        discover_suite_cases(&repo_root, CompilerSuite::Snapshot).expect("discover snapshot suite");
+    let cases = discover_suite_cases(&repo_root, "snapshot").expect("discover snapshot suite");
 
     let mut failures = Vec::new();
 
@@ -2257,8 +2251,7 @@ fn snapshot_suite_ported() {
 #[test]
 fn snapshot_js_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let mut cases =
-        discover_suite_cases(&repo_root, CompilerSuite::Snapshot).expect("discover snapshot suite");
+    let mut cases = discover_suite_cases(&repo_root, "snapshot").expect("discover snapshot suite");
 
     if let Ok(fixture_name) = std::env::var("SVELTE_FIXTURE") {
         cases.retain(|case| case.name == fixture_name);
@@ -2606,8 +2599,7 @@ fn js_unported_suites_compile_smoke() {
 fn debug_single_snapshot_js_fixture() {
     let fixture_name = std::env::var("SVELTE_FIXTURE").expect("set SVELTE_FIXTURE=<fixture-name>");
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let mut cases =
-        discover_suite_cases(&repo_root, CompilerSuite::Snapshot).expect("discover snapshot suite");
+    let mut cases = discover_suite_cases(&repo_root, "snapshot").expect("discover snapshot suite");
     cases.retain(|case| case.name == fixture_name);
     let case = cases
         .into_iter()
@@ -2795,8 +2787,7 @@ fn debug_single_js_unported_compile_fixture() {
 #[test]
 fn sourcemaps_suite_ported() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Sourcemaps)
-        .expect("discover sourcemaps suite");
+    let cases = discover_suite_cases(&repo_root, "sourcemaps").expect("discover sourcemaps suite");
 
     let mut failures = Vec::new();
 
@@ -4273,8 +4264,7 @@ fn css_parse_suite_ported() {
 #[test]
 fn debug_a11y_no_static_element_interactions_case() {
     let repo_root = detect_repo_root().expect("failed to detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::Validator)
-        .expect("discover validator cases");
+    let cases = discover_suite_cases(&repo_root, "validator").expect("discover validator cases");
     let case = cases
         .into_iter()
         .find(|case| case.name == "a11y-no-static-element-interactions")

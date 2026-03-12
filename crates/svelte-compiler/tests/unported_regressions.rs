@@ -1,7 +1,9 @@
 use std::{fs, sync::Arc};
 
 use svelte_compiler::{CompileOptions, GenerateTarget, compile};
-use svelte_test_fixtures::detect_repo_root;
+#[path = "support/repo/mod.rs"]
+mod repo_support;
+use repo_support::detect_repo_root;
 
 fn load_fixture(relative_path: &str) -> String {
     let repo_root = detect_repo_root().expect("detect repo root");

@@ -38,4 +38,3 @@ winnow.workspace = true
 
 [dev-dependencies]
 datatest-stable.workspace = true
-svelte-test-fixtures = { version = "0.1.0", path = "../svelte-test-fixtures" }

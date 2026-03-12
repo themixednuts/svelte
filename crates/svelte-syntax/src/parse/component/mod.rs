@@ -42,6 +42,7 @@ pub(crate) use modern::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+/// Selects which public AST shape the parser should return.
 pub enum ParseMode {
     #[default]
     Legacy,
@@ -78,11 +79,17 @@ impl std::str::FromStr for ParseMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Options for parsing Svelte source into the public AST.
 pub struct ParseOptions {
+    /// Optional source filename used in diagnostics.
     pub filename: Option<Utf8PathBuf>,
+    /// Optional project root used by path-sensitive tooling.
     pub root_dir: Option<Utf8PathBuf>,
+    /// Compatibility flag matching Svelte's JavaScript API.
     pub modern: Option<bool>,
+    /// Preferred AST shape when `modern` is not set.
     pub mode: ParseMode,
+    /// Return a best-effort AST for malformed input when possible.
     pub loose: bool,
 }
 
@@ -139,10 +146,15 @@ impl<'src> SvelteParserCore<'src> {
     }
 }
 
+/// Parse a Svelte component into the public AST.
+///
+/// This matches the shape of Svelte's `parse(...)` API and can return either
+/// the legacy or modern AST.
 pub fn parse(source: &str, options: ParseOptions) -> Result<Document, CompileError> {
     SvelteParserCore::new(source, options).parse()
 }
 
+/// Parse a Svelte component directly into the modern AST root.
 pub fn parse_modern_root(source: &str) -> Result<crate::ast::modern::Root, CompileError> {
     let source_text = SourceText::new(SourceId::new(0), source, None);
     let cst = crate::cst::parse_svelte(source_text)?;

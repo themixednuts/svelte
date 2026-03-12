@@ -1,3 +1,38 @@
+//! Syntax-only Svelte parsing utilities.
+//!
+//! This crate exposes the Svelte AST, CST, and parser entrypoints without the
+//! compiler pipeline.
+//!
+//! # Examples
+//!
+//! Parse a component into the public AST:
+//!
+//! ```
+//! use svelte_syntax::{parse, ParseMode, ParseOptions};
+//!
+//! let document = parse(
+//!     "<script>let count = 0;</script><button>{count}</button>",
+//!     ParseOptions {
+//!         mode: ParseMode::Modern,
+//!         ..ParseOptions::default()
+//!     },
+//! )?;
+//!
+//! assert!(matches!(document.root, svelte_syntax::ast::Root::Modern(_)));
+//! # Ok::<(), svelte_syntax::CompileError>(())
+//! ```
+//!
+//! Parse raw source into a tree-sitter CST:
+//!
+//! ```
+//! use svelte_syntax::{SourceId, SourceText, parse_svelte};
+//!
+//! let source = SourceText::new(SourceId::new(0), "<div class='greeting'>hi</div>", None);
+//! let cst = parse_svelte(source)?;
+//!
+//! assert_eq!(cst.root_kind(), "document");
+//! # Ok::<(), svelte_syntax::CompileError>(())
+//! ```
 pub mod ast;
 pub mod cst;
 mod error;
@@ -5,8 +40,10 @@ mod parse;
 mod primitives;
 mod source;
 
+/// Parse Svelte source into a tree-sitter CST.
 pub use cst::parse_svelte;
 pub use error::{CompileError, CompilerDiagnosticKind, SourceLocation, SourcePosition};
+/// Parse Svelte source into the public AST.
 pub use parse::{
     AttributeKind, ElementKind, ParseMode, ParseOptions, RawField, SvelteElementKind,
     attach_estree_comments_to_tree, attach_leading_comments_to_expression,
@@ -24,4 +61,5 @@ pub use parse::{
     walk_estree_node, walk_raw_value,
 };
 pub use primitives::{BytePos, SourceId, Span};
+/// Source text plus filename and offset helpers used by the parser.
 pub use source::SourceText;

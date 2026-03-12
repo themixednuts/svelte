@@ -7,11 +7,13 @@ use crate::primitives::{BytePos, Span};
 use crate::source::SourceText;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Languages supported by the CST parser.
 pub enum Language {
     Svelte,
 }
 
 #[derive(Debug)]
+/// Parsed tree-sitter document.
 pub struct Document<'src> {
     pub language: Language,
     pub source: SourceText<'src>,
@@ -19,26 +21,33 @@ pub struct Document<'src> {
 }
 
 impl<'src> Document<'src> {
+    /// Return the root tree-sitter node.
     pub fn root_node(&self) -> Node<'_> {
         self.tree.root_node()
     }
 
+    /// Return the root node kind.
     pub fn root_kind(&self) -> &str {
         self.root_node().kind()
     }
 
+    /// Return `true` if the CST contains parse errors.
     pub fn has_error(&self) -> bool {
         self.root_node().has_error()
     }
 
+    /// Return the root node span in byte offsets.
     pub fn root_span(&self) -> Span {
         node_span(self.root_node())
     }
 }
 
+/// Typestate marker for a parser before a language has been selected.
 pub struct Unconfigured;
+/// Typestate marker for a parser after a language has been selected.
 pub struct Configured;
 
+/// Tree-sitter-backed CST parser.
 pub struct CstParser<State> {
     parser: Parser,
     language: Option<Language>,
@@ -46,6 +55,7 @@ pub struct CstParser<State> {
 }
 
 impl CstParser<Unconfigured> {
+    /// Create a parser with no configured language.
     pub fn new() -> Self {
         Self {
             parser: Parser::new(),
@@ -54,6 +64,7 @@ impl CstParser<Unconfigured> {
         }
     }
 
+    /// Configure the parser for a supported language.
     pub fn configure(mut self, language: Language) -> Result<CstParser<Configured>, CompileError> {
         let ts_lang = match language {
             Language::Svelte => tree_sitter_svelte::language(),
@@ -78,6 +89,7 @@ impl Default for CstParser<Unconfigured> {
 }
 
 impl CstParser<Configured> {
+    /// Parse source text into a CST document.
     pub fn parse<'src>(
         &mut self,
         source: SourceText<'src>,
@@ -97,6 +109,7 @@ impl CstParser<Configured> {
     }
 }
 
+/// Parse Svelte source into a CST document in one call.
 pub fn parse_svelte<'src>(source: SourceText<'src>) -> Result<Document<'src>, CompileError> {
     let mut parser = CstParser::new().configure(Language::Svelte)?;
     parser.parse(source)

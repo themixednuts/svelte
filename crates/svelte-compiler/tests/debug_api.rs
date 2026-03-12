@@ -1,12 +1,13 @@
-use super::{Compiler, ParseMode, ParseOptions};
-use crate::SourceId;
-use crate::cst::parse_svelte;
-use crate::source::SourceText;
 use oxc_allocator::Allocator;
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
 use oxc_parser::{ParseOptions as OxcParseOptions, Parser};
 use oxc_span::SourceType;
-use svelte_test_fixtures::{CompilerSuite, detect_repo_root, discover_suite_cases};
+use svelte_compiler::{Compiler, ParseMode, ParseOptions, SourceId, SourceText, parse_svelte};
+
+#[path = "support/debug/mod.rs"]
+mod debug_support;
+
+use debug_support::load_suite_cases;
 
 #[test]
 #[ignore]
@@ -540,9 +541,7 @@ fn debug_diff_legacy_fixture_from_env() {
 }
 
 fn debug_diff_modern_case(case_name: &str) {
-    let repo_root = detect_repo_root().expect("detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserModern)
-        .expect("discover modern parser cases");
+    let cases = load_suite_cases("parser-modern").expect("discover modern parser cases");
     let case = cases
         .into_iter()
         .find(|fixture| fixture.name == case_name)
@@ -588,9 +587,7 @@ fn debug_diff_modern_case(case_name: &str) {
 }
 
 fn debug_diff_legacy_case(case_name: &str) {
-    let repo_root = detect_repo_root().expect("detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserLegacy)
-        .expect("discover legacy parser cases");
+    let cases = load_suite_cases("parser-legacy").expect("discover legacy parser cases");
     let case = cases
         .into_iter()
         .find(|fixture| fixture.name == case_name)
@@ -639,9 +636,7 @@ fn debug_diff_legacy_case(case_name: &str) {
 #[ignore]
 fn debug_dump_legacy_cst_case_from_env() {
     let case_name = std::env::var("LEGACY_FIXTURE").expect("set LEGACY_FIXTURE env var");
-    let repo_root = detect_repo_root().expect("detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserLegacy)
-        .expect("discover legacy parser cases");
+    let cases = load_suite_cases("parser-legacy").expect("discover legacy parser cases");
     let case = cases
         .into_iter()
         .find(|fixture| fixture.name == case_name)
@@ -699,9 +694,7 @@ fn debug_dump_legacy_cst_case_from_env() {
 #[ignore]
 fn debug_dump_modern_cst_case_from_env() {
     let case_name = std::env::var("MODERN_FIXTURE").expect("set MODERN_FIXTURE env var");
-    let repo_root = detect_repo_root().expect("detect repo root");
-    let cases = discover_suite_cases(&repo_root, CompilerSuite::ParserModern)
-        .expect("discover modern parser cases");
+    let cases = load_suite_cases("parser-modern").expect("discover modern parser cases");
     let case = cases
         .into_iter()
         .find(|fixture| fixture.name == case_name)

@@ -25,6 +25,7 @@ pub(crate) use svelte_syntax::{
     is_valid_component_name, is_valid_element_name, is_void_element_name,
 };
 
+/// Current Svelte compiler version string.
 pub static VERSION: &str = "5.53.9";
 
 macro_rules! impl_enum_text_traits {
@@ -58,6 +59,7 @@ macro_rules! impl_enum_text_traits {
 }
 
 #[derive(Clone, Copy)]
+/// Input passed to a custom CSS hash callback.
 pub struct CssHashInput<'a> {
     pub name: &'a str,
     pub filename: &'a str,
@@ -76,6 +78,7 @@ impl fmt::Debug for CssHashInput<'_> {
 }
 
 #[derive(Clone)]
+/// Callback used to filter warnings during compilation.
 pub struct WarningFilterCallback(Arc<dyn Fn(&Warning) -> bool + 'static>);
 
 impl WarningFilterCallback {
@@ -99,6 +102,7 @@ impl fmt::Debug for WarningFilterCallback {
 }
 
 #[derive(Clone)]
+/// Callback used to override Svelte's generated CSS hash.
 pub struct CssHashGetterCallback(Arc<dyn for<'a> Fn(CssHashInput<'a>) -> Arc<str> + 'static>);
 
 impl CssHashGetterCallback {
@@ -124,6 +128,7 @@ impl fmt::Debug for CssHashGetterCallback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
+/// Selects which public AST representation `parse` returns.
 pub enum ParseMode {
     #[default]
     Legacy,
@@ -137,11 +142,17 @@ impl_enum_text_traits!(ParseMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Options for parsing a component without compiling it.
 pub struct ParseOptions {
+    /// Optional source filename used in diagnostics.
     pub filename: Option<Utf8PathBuf>,
+    /// Optional project root used by path-sensitive tooling.
     pub root_dir: Option<Utf8PathBuf>,
+    /// Compatibility flag matching Svelte's JavaScript API.
     pub modern: Option<bool>,
+    /// Preferred AST shape when `modern` is not set.
     pub mode: ParseMode,
+    /// Return a best-effort AST for malformed input when possible.
     pub loose: bool,
 }
 
@@ -159,6 +170,7 @@ impl ParseOptions {
 type PrintCommentGetter = dyn Fn(&EstreeNode) -> Box<[EstreeNode]> + 'static;
 
 #[derive(Clone)]
+/// Callback used to attach comment nodes when printing the modern AST.
 pub struct PrintCommentGetterCallback(Arc<PrintCommentGetter>);
 
 impl PrintCommentGetterCallback {
@@ -184,7 +196,9 @@ impl fmt::Debug for PrintCommentGetterCallback {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Options for converting a parsed AST back into Svelte source.
 pub struct PrintOptions {
+    /// Keep whitespace-only text nodes instead of collapsing them where possible.
     pub preserve_whitespace: bool,
     #[serde(skip, default)]
     pub get_leading_comments: Option<PrintCommentGetterCallback>,
@@ -193,6 +207,7 @@ pub struct PrintOptions {
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Selects which modern AST node should be printed.
 pub enum ModernPrintTarget<'a> {
     Root {
         source: &'a str,
@@ -422,11 +437,13 @@ impl_enum_text_traits!(ErrorMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Experimental compiler switches.
 pub struct ExperimentalOptions {
     pub r#async: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Sourcemap configuration accepted by the compiler.
 pub struct SourceMap {
     pub version: u32,
     pub file: Option<Arc<str>>,
@@ -439,6 +456,7 @@ pub struct SourceMap {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+/// Options for compiling a `.svelte` component or rune-enabled module.
 pub struct CompileOptions {
     pub name: Option<Arc<str>>,
     pub filename: Option<Utf8PathBuf>,
@@ -506,6 +524,7 @@ impl Default for CompileOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Warning emitted during analysis or code generation.
 pub struct Warning {
     pub code: Arc<str>,
     pub message: Arc<str>,
@@ -517,6 +536,7 @@ pub struct Warning {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Generated output artifact such as JavaScript or CSS.
 pub struct OutputArtifact {
     pub code: Arc<str>,
     pub map: Option<SourceMap>,
@@ -524,11 +544,13 @@ pub struct OutputArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Extra metadata produced during compilation.
 pub struct CompileMetadata {
     pub runes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Result of compiling a component or module.
 pub struct CompileResult {
     pub js: OutputArtifact,
     pub css: Option<OutputArtifact>,
@@ -538,6 +560,7 @@ pub struct CompileResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Result of printing a Svelte AST node.
 pub struct PrintedOutput {
     pub code: Arc<str>,
     pub map: SourceMap,
@@ -545,6 +568,7 @@ pub struct PrintedOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+/// Attribute values passed to preprocessors.
 pub enum PreprocessAttributeValue {
     String(Arc<str>),
     Bool(bool),
@@ -557,6 +581,7 @@ impl Default for PreprocessAttributeValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// One parsed attribute passed to a tag preprocessor.
 pub struct PreprocessAttribute {
     pub name: Arc<str>,
     pub value: PreprocessAttributeValue,
@@ -565,12 +590,14 @@ pub struct PreprocessAttribute {
 pub type PreprocessAttributes = BTreeMap<Arc<str>, PreprocessAttributeValue>;
 
 #[derive(Debug, Clone, Copy)]
+/// Input passed to a markup preprocessor.
 pub struct PreprocessMarkup<'a> {
     pub content: &'a str,
     pub filename: Option<&'a Utf8Path>,
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Input passed to a script or style preprocessor.
 pub struct PreprocessTag<'a> {
     pub content: &'a str,
     pub attributes: &'a PreprocessAttributes,
@@ -578,6 +605,7 @@ pub struct PreprocessTag<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Output returned by one preprocessor step.
 pub struct PreprocessOutput {
     pub code: Arc<str>,
     pub dependencies: Box<[Utf8PathBuf]>,
@@ -620,6 +648,7 @@ pub type AsyncTagPreprocessor = Arc<
 >;
 
 #[derive(Clone, Default)]
+/// Collection of preprocessors applied in source order.
 pub struct PreprocessorGroup {
     pub name: Option<Arc<str>>,
     pub markup: Option<MarkupPreprocessor>,
@@ -653,6 +682,7 @@ impl PreprocessorGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Options for running preprocessors over component source code.
 pub struct PreprocessOptions {
     pub filename: Option<Utf8PathBuf>,
     #[serde(skip, default)]
@@ -660,6 +690,7 @@ pub struct PreprocessOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Final result of a preprocessing run.
 pub struct PreprocessResult {
     pub code: Arc<str>,
     pub dependencies: Box<[Utf8PathBuf]>,
@@ -668,17 +699,20 @@ pub struct PreprocessResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
+/// Options for best-effort code migration.
 pub struct MigrateOptions {
     pub filename: Option<Utf8PathBuf>,
     pub use_ts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Result of a migration run.
 pub struct MigrateResult {
     pub code: Arc<str>,
 }
 
 #[derive(Debug, Default)]
+/// Convenience object that mirrors the free compiler functions.
 pub struct Compiler;
 
 impl Compiler {
@@ -743,6 +777,3 @@ impl Compiler {
         crate::compiler::phases::migrate::migrate(source, options)
     }
 }
-
-#[cfg(test)]
-mod debug_tests;
