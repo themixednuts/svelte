@@ -29,7 +29,7 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
-svelte-syntax = { version = "0.1.0", path = "../svelte-syntax" }
+svelte-syntax.workspace = true
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-svelte.workspace = true

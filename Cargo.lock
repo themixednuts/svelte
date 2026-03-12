@@ -2013,7 +2013,7 @@ checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 
 [[package]]
 name = "svelte"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "camino",
  "clap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-compiler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aria-query",
  "biome_aria",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-compiler-napi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "napi",
  "napi-build",
@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-kit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "brotli",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-syntax"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bumpalo",
  "camino",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-test-fixtures"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "camino",
  "serde",
@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-vite-rolldown"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "camino",
  "serde",
@@ -2143,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "svelte-vite-rolldown-napi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "napi",
  "napi-build",
