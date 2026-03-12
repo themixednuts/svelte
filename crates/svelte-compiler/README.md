@@ -1,27 +1,46 @@
-# svelte-compiler (Rust port)
+# svelte-compiler
 
-This crate ports Svelte compiler parser behavior to typed Rust ASTs.
+`svelte-compiler` provides the public compiler surface for working with Svelte in Rust.
 
-## Porting rules for this branch
+It supports:
 
-- Use typed Rust AST nodes for public parser output (legacy + modern).
-- Prefer `oxc_*` crates for JavaScript/TypeScript parsing, expression parsing, and pattern parsing.
-- Match JavaScript Svelte parser fixture output as closely as possible.
-- Keep parser paths panic-free in production code; recover or return structured errors instead.
-- Preserve existing fixture semantics before introducing new Rust-specific behavior.
+- parsing Svelte components into the public AST
+- printing modern AST nodes back to source
+- compiling components into JavaScript and CSS artifacts
+- compiling rune-enabled modules
+- preprocessing source with custom hooks
+- best-effort source migration helpers
 
-## Expression and pattern parsing
+## Install
 
-- Legacy and modern expression parsing routes through OXC whenever possible.
-- For ambiguous legacy block/attribute cases, parser recovery falls back to source-slice parsing while still using OXC parse output.
-- Type information on snippet parameters is preserved by converting OXC pattern nodes directly into legacy expression nodes.
+```toml
+[dependencies]
+svelte-compiler = "0.1.1"
+```
 
-## HTML entity decoding
+## Example
 
-- Entity decoding is implemented with `html-escape` for robust named entity support.
-- Svelte-compatible semicolon-less decoding behavior is preserved where applicable (for example, `&quot` before non-alphanumeric boundaries).
+```rust
+use svelte_compiler::{CompileOptions, compile};
 
-## Current known parity gaps
+let result = compile(
+    "<script>let name = 'world';</script><h1>Hello {name}</h1>",
+    CompileOptions::default(),
+)?;
 
-- A small set of legacy parser fixtures still differ in malformed-input recovery and comment attachment edge cases.
-- Unicode offset parity in some legacy fixtures still needs JS-equivalent index mapping for non-BMP characters.
+assert!(result.js.code.contains("Hello"));
+# Ok::<(), svelte_compiler::CompileError>(())
+```
+
+## Main APIs
+
+- `compile` compiles a `.svelte` component
+- `compile_module` compiles a rune-enabled JavaScript or TypeScript module
+- `parse` parses a component into the public AST
+- `print` and `print_modern` turn AST nodes back into Svelte source
+- `preprocess` runs one or more preprocessors over source text
+- `migrate` performs a best-effort migration to modern Svelte syntax
+
+## License
+
+MIT
