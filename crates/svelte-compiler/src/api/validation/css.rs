@@ -3,6 +3,7 @@ use crate::ast::modern::{
     Css, CssBlock, CssBlockChild, CssDeclaration, CssNameSelector, CssNode, CssPseudoClassSelector,
     CssRelativeSelector, CssRule, CssSelectorList, CssSimpleSelector,
 };
+use crate::{SourceId, SourceText};
 
 pub(super) fn detect_css_compiler_errors(source: &str, root: &Root) -> Option<CompileError> {
     if let Some(css) = root.css.as_ref()
@@ -750,23 +751,19 @@ fn compile_error_custom_css(
     start: usize,
     end: usize,
 ) -> CompileError {
-    let (start_line, start_column) = line_column_at_offset(source, start);
-    let (end_line, end_column) = line_column_at_offset(source, end);
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
 
     CompileError {
         code: Arc::from(code),
         message: message.into(),
-        position: Some(Box::new(SourcePosition { start, end })),
-        start: Some(Box::new(SourceLocation {
-            line: start_line,
-            column: start_column,
-            character: start,
+        position: Some(Box::new(SourcePosition {
+            start: start_location.character,
+            end: end_location.character,
         })),
-        end: Some(Box::new(SourceLocation {
-            line: end_line,
-            column: end_column,
-            character: end,
-        })),
+        start: Some(Box::new(start_location)),
+        end: Some(Box::new(end_location)),
         filename: None,
     }
 }

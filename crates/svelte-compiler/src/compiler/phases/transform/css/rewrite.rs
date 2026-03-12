@@ -1,49 +1,35 @@
 //! CSS selector/keyframe rewrites and output generation.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use camino::Utf8Path;
 
 use crate::ast::modern::{CssBlockChild, CssNode};
-use crate::compiler::phases::transform::sourcemap::{
-    self, SourceMapSource, SparseMappingHint, SparseMappingOptions,
-};
+use crate::compiler::phases::transform::output::OutputContext;
+use crate::compiler::phases::transform::sourcemap::SparseMappingHint;
 
 use super::scoping;
-use super::usage::{CssUsageContext, build_css_usage_context};
+use super::usage::build_css_usage_context;
 use super::{GeneratedCssOutput, TextReplacement};
 
 pub(crate) fn generate_component_css_output(
-    source: &str,
+    ctx: OutputContext<'_>,
     root: &crate::ast::modern::Root,
     css_hash: Option<&str>,
     dev: bool,
-    source_filename: Option<&Utf8Path>,
     output_filename: Option<&Utf8Path>,
-    include_map: bool,
 ) -> Option<GeneratedCssOutput> {
+    let source = ctx.source.text;
+    let css_ctx = ctx.with_output_filename(output_filename);
+    let include_map = ctx.include_map(output_filename);
     let (_, _, content_start, content_end) =
         crate::compiler::phases::parse::style_block_ranges(root)
             .into_iter()
             .next()?;
     let css_source = source.get(content_start..content_end)?;
     let Some(hash) = css_hash else {
-        let map = include_map.then(|| {
-            sourcemap::build_sparse_sourcemap(SparseMappingOptions {
-                output: css_source,
-                output_filename,
-                sources: vec![SourceMapSource {
-                    filename: Arc::from(
-                        source_filename
-                            .map(Utf8Path::as_str)
-                            .unwrap_or("input.svelte"),
-                    ),
-                    code: source,
-                }],
-                hints: vec![],
-            })
-        });
+        let map =
+            include_map.then(|| css_ctx.build_sparse_sourcemap(css_source, "input.svelte", vec![]));
         return Some(GeneratedCssOutput {
             code: css_source.to_string(),
             map,
@@ -56,36 +42,15 @@ pub(crate) fn generate_component_css_output(
     let mut replacements = Vec::new();
     let usage = build_css_usage_context(root, dev);
 
-    collect_css_selector_and_keyframe_rewrites(
-        source,
-        &children,
-        hash,
-        &mut keyframes,
-        &mut replacements,
-        false,
-        false,
-        false,
-        &usage,
-    );
+    let mut rewrite_ctx =
+        scoping::RewriteContext::new(source, hash, &mut keyframes, &mut replacements, &usage);
+    collect_css_selector_and_keyframe_rewrites(&children, &mut rewrite_ctx);
     collect_css_animation_value_rewrites(source, &children, &keyframes, &mut replacements);
 
     if replacements.is_empty() {
         let code = source.get(content_start..content_end)?.to_string();
-        let map = include_map.then(|| {
-            sourcemap::build_sparse_sourcemap(SparseMappingOptions {
-                output: &code,
-                output_filename,
-                sources: vec![SourceMapSource {
-                    filename: Arc::from(
-                        source_filename
-                            .map(Utf8Path::as_str)
-                            .unwrap_or("input.svelte"),
-                    ),
-                    code: source,
-                }],
-                hints: vec![],
-            })
-        });
+        let map =
+            include_map.then(|| css_ctx.build_sparse_sourcemap(&code, "input.svelte", vec![]));
         return Some(GeneratedCssOutput { code, map });
     }
 
@@ -135,19 +100,7 @@ pub(crate) fn generate_component_css_output(
             })
             .collect::<Vec<_>>();
         hints.extend(collect_simple_css_scope_hints(css_source, hash));
-        sourcemap::build_sparse_sourcemap(SparseMappingOptions {
-            output: &output,
-            output_filename,
-            sources: vec![SourceMapSource {
-                filename: Arc::from(
-                    source_filename
-                        .map(Utf8Path::as_str)
-                        .unwrap_or("input.svelte"),
-                ),
-                code: source,
-            }],
-            hints,
-        })
+        css_ctx.build_sparse_sourcemap(&output, "input.svelte", hints)
     });
 
     Some(GeneratedCssOutput { code: output, map })
@@ -223,29 +176,11 @@ pub(crate) fn compact_escaped_id_scope_spacing(css: &str, hash: &str) -> String 
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_css_selector_and_keyframe_rewrites(
-    source: &str,
     nodes: &[CssNode],
-    hash: &str,
-    keyframes: &mut BTreeMap<String, String>,
-    replacements: &mut Vec<TextReplacement>,
-    inside_keyframes: bool,
-    nested_in_rule: bool,
-    inside_global_block: bool,
-    usage: &CssUsageContext,
+    ctx: &mut scoping::RewriteContext<'_>,
 ) {
-    scoping::collect_css_selector_and_keyframe_rewrites(
-        source,
-        nodes,
-        hash,
-        keyframes,
-        replacements,
-        inside_keyframes,
-        nested_in_rule,
-        inside_global_block,
-        usage,
-    );
+    scoping::collect_css_selector_and_keyframe_rewrites(nodes, ctx, scoping::RewriteFrame::root());
 }
 
 pub(crate) fn collect_css_animation_value_rewrites(

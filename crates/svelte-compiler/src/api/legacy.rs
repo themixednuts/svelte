@@ -1,12 +1,12 @@
 use super::modern::{
-    RawField, estree_node_field, estree_node_field_mut, estree_node_field_str,
-    estree_node_has_field, estree_node_type, modern_element_name, parse_modern_script,
-    parse_modern_style, recover_modern_error_nodes,
+    RawField, estree_node_field, estree_node_field_mut, estree_node_field_str, estree_node_type,
+    modern_element_name, parse_modern_script, parse_modern_style, recover_modern_error_nodes,
 };
 use super::*;
 use crate::ast::common::Span;
 use crate::ast::legacy;
 use crate::ast::modern;
+use crate::{SourceId, SourceText};
 
 pub(crate) fn parse_root(source: &str, root: Node<'_>, _loose: bool) -> legacy::Root {
     let mut html_cst_children = Vec::new();
@@ -502,7 +502,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
         modern::Node::Comment(comment) => Some(legacy::Node::Comment(legacy::Comment {
             start: comment.start,
             end: comment.end,
-            ignores: parse_svelte_ignores(&comment.data).into_boxed_slice(),
+            ignores: parse_svelte_ignores(&comment.data),
             data: comment.data,
         })),
         modern::Node::RegularElement(element) => legacy_element_from_parts(
@@ -929,89 +929,6 @@ fn legacy_attributes_from_modern(attributes: Vec<modern::Attribute>) -> Vec<lega
     out
 }
 
-impl From<modern::DirectiveAttribute> for legacy::DirectiveAttribute {
-    fn from(directive: modern::DirectiveAttribute) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            expression: Some(legacy_expression_from_modern_or_empty(directive.expression)),
-            modifiers: directive.modifiers,
-        }
-    }
-}
-
-impl From<modern::StyleDirective> for legacy::StyleDirective {
-    fn from(directive: modern::StyleDirective) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            modifiers: directive.modifiers,
-            value: directive.value.into(),
-        }
-    }
-}
-
-impl From<modern::TransitionDirective> for legacy::TransitionDirective {
-    fn from(directive: modern::TransitionDirective) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            expression: Some(legacy_expression_from_modern_or_empty(directive.expression)),
-            modifiers: directive.modifiers,
-            intro: directive.intro,
-            outro: directive.outro,
-        }
-    }
-}
-
-impl From<modern::AttributeValueList> for legacy::AttributeValueList {
-    fn from(value: modern::AttributeValueList) -> Self {
-        match value {
-            modern::AttributeValueList::Boolean(flag) => Self::Boolean(flag),
-            modern::AttributeValueList::Values(values) => Self::Values(
-                values
-                    .into_vec()
-                    .into_iter()
-                    .map(Into::into)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-            modern::AttributeValueList::ExpressionTag(tag) => Self::Values(
-                vec![legacy::AttributeValue::MustacheTag(legacy::MustacheTag {
-                    start: tag.start,
-                    end: tag.end,
-                    expression: legacy_expression_from_modern_or_empty(tag.expression),
-                })]
-                .into_boxed_slice(),
-            ),
-        }
-    }
-}
-
-impl From<modern::AttributeValue> for legacy::AttributeValue {
-    fn from(value: modern::AttributeValue) -> Self {
-        match value {
-            modern::AttributeValue::Text(text) => Self::Text(legacy::Text {
-                start: text.start,
-                end: text.end,
-                raw: Some(text.raw),
-                data: text.data,
-            }),
-            modern::AttributeValue::ExpressionTag(tag) => Self::MustacheTag(legacy::MustacheTag {
-                start: tag.start,
-                end: tag.end,
-                expression: legacy_expression_from_modern_or_empty(tag.expression),
-            }),
-        }
-    }
-}
-
 fn legacy_expression_from_modern_or_empty(expression: modern::Expression) -> legacy::Expression {
     if let Some(converted) = legacy_expression_from_modern_expression(expression.clone(), false) {
         return converted;
@@ -1317,23 +1234,13 @@ fn parse_legacy_doctype(source: &str, node: Node<'_>) -> Option<legacy::Node> {
                 if !token.is_empty() {
                     let abs_start = base + start_idx;
                     let abs_end = base + idx;
-                    let (start_line, start_col) = line_column_at_offset(source, abs_start);
-                    let (end_line, end_col) = line_column_at_offset(source, abs_end);
                     attributes.push(legacy::Attribute::Attribute(legacy::NamedAttribute {
                         start: abs_start,
                         end: abs_end,
                         name: Arc::from(token),
                         name_loc: legacy::NameLocation {
-                            start: SourceLocation {
-                                line: start_line,
-                                column: start_col,
-                                character: abs_start,
-                            },
-                            end: SourceLocation {
-                                line: end_line,
-                                column: end_col,
-                                character: abs_end,
-                            },
+                            start: source_location_at_offset(source, abs_start),
+                            end: source_location_at_offset(source, abs_end),
                         },
                         value: legacy::AttributeValueList::Boolean(true),
                     }));
@@ -1352,23 +1259,13 @@ fn parse_legacy_doctype(source: &str, node: Node<'_>) -> Option<legacy::Node> {
         if !token.is_empty() {
             let abs_start = base + start_idx;
             let abs_end = base + inner.len();
-            let (start_line, start_col) = line_column_at_offset(source, abs_start);
-            let (end_line, end_col) = line_column_at_offset(source, abs_end);
             attributes.push(legacy::Attribute::Attribute(legacy::NamedAttribute {
                 start: abs_start,
                 end: abs_end,
                 name: Arc::from(token),
                 name_loc: legacy::NameLocation {
-                    start: SourceLocation {
-                        line: start_line,
-                        column: start_col,
-                        character: abs_start,
-                    },
-                    end: SourceLocation {
-                        line: end_line,
-                        column: end_col,
-                        character: abs_end,
-                    },
+                    start: source_location_at_offset(source, abs_start),
+                    end: source_location_at_offset(source, abs_end),
                 },
                 value: legacy::AttributeValueList::Boolean(true),
             }));
@@ -1438,15 +1335,24 @@ fn parse_legacy_attributes(source: &str, tag_node: Node<'_>) -> Vec<legacy::Attr
         let mut name_loc = if let Some(name_node) = name_node {
             legacy::NameLocation {
                 start: source_location_from_point(
+                    source,
                     name_node.start_position(),
                     name_node.start_byte(),
                 ),
-                end: source_location_from_point(name_node.end_position(), name_node.end_byte()),
+                end: source_location_from_point(
+                    source,
+                    name_node.end_position(),
+                    name_node.end_byte(),
+                ),
             }
         } else {
             legacy::NameLocation {
-                start: source_location_from_point(child.start_position(), child.start_byte()),
-                end: source_location_from_point(child.start_position(), child.start_byte()),
+                start: source_location_from_point(
+                    source,
+                    child.start_position(),
+                    child.start_byte(),
+                ),
+                end: source_location_from_point(source, child.start_position(), child.start_byte()),
             }
         };
 
@@ -1458,9 +1364,7 @@ fn parse_legacy_attributes(source: &str, tag_node: Node<'_>) -> Vec<legacy::Attr
         let mut attr_cursor = child.walk();
         for attr_child in child.named_children(&mut attr_cursor) {
             match attr_child.kind() {
-                "attribute_name" => {
-                    directive = parse_directive_head(text_for_node(source, attr_child).as_ref());
-                }
+                "attribute_name" => directive = parse_directive_head(source, attr_child),
                 "quoted_attribute_value" => {
                     let mut found_named = false;
                     let mut quoted_cursor = attr_child.walk();
@@ -1577,18 +1481,12 @@ fn parse_legacy_attributes(source: &str, tag_node: Node<'_>) -> Vec<legacy::Attr
                     }
                 }
                 "spread_attribute" => {
-                    let raw = text_for_node(source, attr_child);
-                    let raw_ref = raw.as_ref();
-                    if let Some(inner) = raw_ref
-                        .strip_prefix("{...")
-                        .and_then(|text| text.strip_suffix('}'))
+                    if let Some((expression_text, expression_start)) =
+                        spread_attribute_expression_text(source, attr_child)
                     {
-                        let trimmed = inner.trim();
-                        let leading = inner.find(trimmed).unwrap_or(0);
-                        let expression_start = attr_child.start_byte() + 4 + leading;
                         let (line, column) = line_column_at_offset(source, expression_start);
                         spread_expression = parse_legacy_expression_from_text(
-                            trimmed,
+                            expression_text.as_ref(),
                             expression_start,
                             line,
                             column,
@@ -2069,23 +1967,13 @@ pub(crate) fn parse_modern_attributes(
             if let Some((name, start, end)) =
                 recover_modern_invalid_attribute_from_error(source, child)
             {
-                let (start_line, start_column) = line_column_at_offset(source, start);
-                let (end_line, end_column) = line_column_at_offset(source, end);
                 out.push(modern::Attribute::Attribute(modern::NamedAttribute {
                     start,
                     end,
                     name,
                     name_loc: legacy::NameLocation {
-                        start: SourceLocation {
-                            line: start_line,
-                            column: start_column,
-                            character: start,
-                        },
-                        end: SourceLocation {
-                            line: end_line,
-                            column: end_column,
-                            character: end,
-                        },
+                        start: source_location_at_offset(source, start),
+                        end: source_location_at_offset(source, end),
                     },
                     value: modern::AttributeValueList::Boolean(true),
                     value_syntax: modern::AttributeValueSyntax::Boolean,
@@ -2121,25 +2009,21 @@ pub(crate) fn parse_modern_attributes(
         let mut name_loc = if let Some(name_node) = name_node {
             legacy::NameLocation {
                 start: source_location_from_point(
+                    source,
                     name_node.start_position(),
                     name_node.start_byte(),
                 ),
-                end: source_location_from_point(name_node.end_position(), name_node.end_byte()),
+                end: source_location_from_point(
+                    source,
+                    name_node.end_position(),
+                    name_node.end_byte(),
+                ),
             }
         } else {
             let start = child.start_byte().saturating_add(1).min(child.end_byte());
-            let (line, column) = line_column_at_offset(source, start);
             legacy::NameLocation {
-                start: SourceLocation {
-                    line,
-                    column,
-                    character: start,
-                },
-                end: SourceLocation {
-                    line,
-                    column,
-                    character: start,
-                },
+                start: source_location_at_offset(source, start),
+                end: source_location_at_offset(source, start),
             }
         };
 
@@ -2154,26 +2038,20 @@ pub(crate) fn parse_modern_attributes(
         for attr_child in child.named_children(&mut attr_cursor) {
             match attr_child.kind() {
                 "spread_attribute" => {
-                    let raw = text_for_node(source, attr_child);
-                    let raw_ref = raw.as_ref();
-                    if let Some(inner) = raw_ref
-                        .strip_prefix("{...")
-                        .and_then(|text| text.strip_suffix('}'))
+                    if let Some((expression_text, expression_start)) =
+                        spread_attribute_expression_text(source, attr_child)
                     {
-                        let trimmed = inner.trim();
-                        let leading = inner.find(trimmed).unwrap_or(0);
-                        let expression_start = attr_child.start_byte() + 4 + leading;
                         let (line, column) = line_column_at_offset(source, expression_start);
                         spread_expression =
                             crate::compiler::phases::parse::parse_modern_expression_with_oxc(
-                                trimmed,
+                                expression_text.as_ref(),
                                 expression_start,
                                 line,
                                 column,
                             )
                             .or_else(|| {
                                 parse_modern_expression_from_text(
-                                    trimmed,
+                                    expression_text.as_ref(),
                                     expression_start,
                                     line,
                                     column,
@@ -2181,9 +2059,7 @@ pub(crate) fn parse_modern_attributes(
                             });
                     }
                 }
-                "attribute_name" => {
-                    directive = parse_directive_head(text_for_node(source, attr_child).as_ref());
-                }
+                "attribute_name" => directive = parse_directive_head(source, attr_child),
                 "quoted_attribute_value" => {
                     attribute_value_syntax = modern::AttributeValueSyntax::Quoted;
                     if error.is_none() {
@@ -2322,20 +2198,9 @@ pub(crate) fn parse_modern_attributes(
                                     RawField::End,
                                 ))
                                 .unwrap_or(start + identifier_name.len());
-                                let (start_line, start_column) =
-                                    line_column_at_offset(source, start);
-                                let (end_line, end_column) = line_column_at_offset(source, end);
                                 name_loc = legacy::NameLocation {
-                                    start: SourceLocation {
-                                        line: start_line,
-                                        column: start_column,
-                                        character: start,
-                                    },
-                                    end: SourceLocation {
-                                        line: end_line,
-                                        column: end_column,
-                                        character: end,
-                                    },
+                                    start: source_location_at_offset(source, start),
+                                    end: source_location_at_offset(source, end),
                                 };
                             }
 
@@ -2559,10 +2424,15 @@ pub(crate) fn parse_modern_attributes(
                 name = text;
                 name_loc = legacy::NameLocation {
                     start: source_location_from_point(
+                        source,
                         name_node.start_position(),
                         name_node.start_byte(),
                     ),
-                    end: source_location_from_point(name_node.end_position(), name_node.end_byte()),
+                    end: source_location_from_point(
+                        source,
+                        name_node.end_position(),
+                        name_node.end_byte(),
+                    ),
                 };
             }
         }
@@ -2772,10 +2642,10 @@ fn detect_attr_error_in_value(source: &str, node: Node<'_>) -> Option<modern::At
                 end: child.start_byte(),
             });
         }
-        if kind == "expression" {
-            if let Some(error) = detect_attr_error_in_expression(source, child) {
-                return Some(error);
-            }
+        if kind == "expression"
+            && let Some(error) = detect_attr_error_in_expression(source, child)
+        {
+            return Some(error);
         }
     }
     None
@@ -2891,7 +2761,7 @@ fn parse_legacy_comment(source: &str, node: Node<'_>) -> legacy::Comment {
         start: node.start_byte(),
         end: node.end_byte(),
         data: Arc::from(data_text),
-        ignores: ignores.into_boxed_slice(),
+        ignores,
     }
 }
 
@@ -3010,7 +2880,75 @@ impl std::str::FromStr for DirectiveKind {
     }
 }
 
-fn parse_directive_head(value: &str) -> Option<DirectiveHead> {
+fn collect_named_descendants<'a>(node: Node<'a>, kind: &str, out: &mut Vec<Node<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            out.push(child);
+        }
+        collect_named_descendants(child, kind, out);
+    }
+}
+
+fn first_named_descendant<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    let mut out = Vec::new();
+    collect_named_descendants(node, kind, &mut out);
+    out.into_iter().next()
+}
+
+fn trimmed_node_text(source: &str, node: Node<'_>) -> Option<(Arc<str>, usize)> {
+    let raw = text_for_node(source, node);
+    let raw = raw.as_ref();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let leading = raw.find(trimmed).unwrap_or(0);
+    Some((Arc::from(trimmed), node.start_byte() + leading))
+}
+
+fn spread_attribute_expression_text(source: &str, node: Node<'_>) -> Option<(Arc<str>, usize)> {
+    if let Some(content) = node.child_by_field_name("content") {
+        return trimmed_node_text(source, content);
+    }
+
+    let raw = text_for_node(source, node);
+    let raw = raw.as_ref();
+    let inner = raw.strip_prefix("{...")?.strip_suffix('}')?;
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let leading = inner.find(trimmed).unwrap_or(0);
+    Some((Arc::from(trimmed), node.start_byte() + 4 + leading))
+}
+
+fn parse_directive_head(source: &str, name_node: Node<'_>) -> Option<DirectiveHead> {
+    let prefix = first_named_descendant(name_node, "attribute_directive");
+    let name = first_named_descendant(name_node, "attribute_identifier");
+    if let (Some(prefix), Some(name)) = (prefix, name) {
+        let prefix = text_for_node(source, prefix);
+        let name = text_for_node(source, name);
+        let mut modifier_nodes = Vec::new();
+        collect_named_descendants(name_node, "attribute_modifier", &mut modifier_nodes);
+        let modifiers = modifier_nodes
+            .into_iter()
+            .map(|node| text_for_node(source, node))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        return Some(DirectiveHead {
+            kind: prefix.as_ref().parse().ok(),
+            prefix,
+            name,
+            modifiers,
+        });
+    }
+
+    parse_directive_head_from_text(text_for_node(source, name_node).as_ref())
+}
+
+fn parse_directive_head_from_text(value: &str) -> Option<DirectiveHead> {
     let mut parts = value.split('|');
     let first = parts.next()?;
     let (prefix, name) = first.split_once(':')?;
@@ -3037,6 +2975,17 @@ fn shorthand_directive_identifier_expression(
     }
 
     if let Some(name_node) = name_node {
+        if let Some(identifier_node) = first_named_descendant(name_node, "attribute_identifier")
+            && let Some((binding_name, name_abs)) = trimmed_node_text(source, identifier_node)
+        {
+            let (line, column) = line_column_at_offset(source, name_abs);
+            if let Some(parsed) =
+                parse_modern_expression_from_text(binding_name.as_ref(), name_abs, line, column)
+            {
+                return Some(parsed);
+            }
+        }
+
         let raw = text_for_node(source, name_node);
         let raw = raw.as_ref();
         if let Some(colon_idx) = raw.find(':') {
@@ -4040,11 +3989,9 @@ fn parse_legacy_loose_element_from_start_tag(
 
     let mut matching_close_idx: Option<usize> = None;
     let mut boundary_idx = nodes.len();
-    #[allow(clippy::needless_range_loop)]
-    for candidate_idx in (index + 1)..nodes.len() {
-        let candidate = nodes[candidate_idx];
+    for (candidate_idx, candidate) in nodes.iter().enumerate().skip(index + 1) {
         if candidate.kind() == "end_tag" {
-            let close_name = legacy_tag_name_from_tag_node(source, candidate);
+            let close_name = legacy_tag_name_from_tag_node(source, *candidate);
             if close_name == name {
                 matching_close_idx = Some(candidate_idx);
                 boundary_idx = candidate_idx;
@@ -4054,7 +4001,7 @@ fn parse_legacy_loose_element_from_start_tag(
             break;
         }
         if candidate.kind() == "ERROR" {
-            let raw = text_for_node(source, candidate);
+            let raw = text_for_node(source, *candidate);
             let trimmed = raw.trim_start();
             if let Some(rest) = trimmed.strip_prefix("</")
                 && let Some(tail) = rest.strip_prefix(name.as_ref())
@@ -4371,7 +4318,15 @@ fn parse_attribute_shorthand(source: &str, node: Node<'_>) -> Option<legacy::Att
         let end = start + trimmed.len();
         let (line, column) = line_column_at_offset(source, start);
         parse_legacy_expression_from_text(inner, start, line, column, true).or_else(|| {
-            let loc = legacy_loc(line, column, column + trimmed.len(), start, end, true);
+            let loc = legacy_loc(
+                source,
+                line,
+                column,
+                column + trimmed.len(),
+                start,
+                end,
+                true,
+            );
             Some(legacy_empty_identifier_expression(start, end, Some(loc)))
         })
     } else {
@@ -4677,6 +4632,7 @@ pub(crate) fn parse_identifier_name(text: &str) -> Option<Arc<str>> {
 }
 
 fn legacy_loc(
+    source: &str,
     line: usize,
     start_col: usize,
     end_col: usize,
@@ -4688,12 +4644,12 @@ fn legacy_loc(
         start: legacy::ExpressionPoint {
             line,
             column: start_col,
-            character: include_character.then_some(start),
+            character: include_character.then_some(source_utf16_offset(source, start)),
         },
         end: legacy::ExpressionPoint {
             line,
             column: end_col,
-            character: include_character.then_some(end),
+            character: include_character.then_some(source_utf16_offset(source, end)),
         },
     }
 }
@@ -4708,12 +4664,20 @@ pub(crate) fn text_for_node(source: &str, node: Node<'_>) -> Arc<str> {
     Arc::from(node.utf8_text(source.as_bytes()).unwrap_or_default())
 }
 
-pub(crate) fn source_location_from_point(point: Point, character: usize) -> SourceLocation {
-    SourceLocation {
-        line: point.row + 1,
-        column: point.column,
-        character,
-    }
+fn source_utf16_offset(source: &str, offset: usize) -> usize {
+    SourceText::new(SourceId::new(0), source, None).utf16_offset(offset)
+}
+
+fn source_location_at_offset(source: &str, offset: usize) -> SourceLocation {
+    SourceText::new(SourceId::new(0), source, None).location_at_offset(offset)
+}
+
+pub(crate) fn source_location_from_point(
+    source: &str,
+    _point: Point,
+    offset: usize,
+) -> SourceLocation {
+    source_location_at_offset(source, offset)
 }
 
 fn decode_html_entities(raw: &str) -> Arc<str> {
@@ -4798,62 +4762,6 @@ fn decode_html_entity_piece(entity: &str) -> Option<String> {
     }
     Some(decoded.into_owned())
 }
-impl From<modern::Script> for legacy::Script {
-    fn from(script: modern::Script) -> Self {
-        let mut content = script.content;
-        legacy_normalize_estree_node(&mut content);
-
-        Self {
-            r#type: script.r#type,
-            start: script.start,
-            end: script.end,
-            context: script.context,
-            content,
-        }
-    }
-}
-
-fn legacy_normalize_estree_node(node: &mut modern::EstreeNode) {
-    if matches!(
-        estree_node_field(node, RawField::Type),
-        Some(modern::EstreeValue::String(kind)) if kind.as_ref() == "ExportNamedDeclaration"
-    ) && !estree_node_has_field(node, RawField::Source)
-    {
-        node.fields
-            .insert("source".to_string(), modern::EstreeValue::Null);
-    }
-
-    if matches!(
-        estree_node_field(node, RawField::Type),
-        Some(modern::EstreeValue::String(kind)) if kind.as_ref() == "ImportExpression"
-    ) && !estree_node_has_field(node, RawField::Options)
-    {
-        node.fields
-            .insert("options".to_string(), modern::EstreeValue::Null);
-    }
-
-    for value in node.fields.values_mut() {
-        legacy_normalize_raw_value(value);
-    }
-}
-
-fn legacy_normalize_raw_value(value: &mut modern::EstreeValue) {
-    match value {
-        modern::EstreeValue::Object(node) => legacy_normalize_estree_node(node),
-        modern::EstreeValue::Array(items) => {
-            for item in items.iter_mut() {
-                legacy_normalize_raw_value(item);
-            }
-        }
-        modern::EstreeValue::String(_)
-        | modern::EstreeValue::Int(_)
-        | modern::EstreeValue::UInt(_)
-        | modern::EstreeValue::Number(_)
-        | modern::EstreeValue::Bool(_)
-        | modern::EstreeValue::Null => {}
-    }
-}
-
 fn collect_legacy_document_comments(
     source: &str,
     html_children: &[legacy::Node],

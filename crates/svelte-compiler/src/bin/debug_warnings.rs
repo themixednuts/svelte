@@ -25,13 +25,11 @@ fn main() {
                 let start = warning
                     .start
                     .as_ref()
-                    .map(|s| format!("{}:{}", s.line, s.column))
-                    .unwrap_or_else(|| "-".to_string());
+                    .map_or_else(|| "-".to_string(), |s| format!("{}:{}", s.line, s.column));
                 let end = warning
                     .end
                     .as_ref()
-                    .map(|s| format!("{}:{}", s.line, s.column))
-                    .unwrap_or_else(|| "-".to_string());
+                    .map_or_else(|| "-".to_string(), |s| format!("{}:{}", s.line, s.column));
                 println!("{} {}..{} {}", warning.code, start, end, warning.message);
             }
         }

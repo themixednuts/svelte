@@ -42,10 +42,10 @@ pub(crate) fn compile_component_js_code(
         return Some(output);
     }
     if target == GenerateTarget::Client {
-        return compile_generic_client_markup_js(source, target, root, filename);
+        return compile_generic_client_markup_js(source, root, filename);
     }
     if target == GenerateTarget::Server {
-        return compile_generic_server_markup_js(source, target, root, filename);
+        return compile_generic_server_markup_js(source, root, filename);
     }
     None
 }
@@ -180,10 +180,10 @@ fn collect_state_bindings_from_variable_declaration(
         let Some(init) = estree_node_field_object(declarator, RawField::Init) else {
             continue;
         };
-        if extract_state_call_argument(init).is_some() {
-            if let Some(name) = estree_node_field_str(id, RawField::Name) {
-                bindings.insert(name.to_string());
-            }
+        if extract_state_call_argument(init).is_some()
+            && let Some(name) = estree_node_field_str(id, RawField::Name)
+        {
+            bindings.insert(name.to_string());
         }
     }
     Ok(())

@@ -1,6 +1,6 @@
 //! CSS selector/keyframe rewrite and scoping logic.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use lightningcss::selector::{
     Component as LightningComponent, Selector as LightningSelector,
@@ -18,74 +18,84 @@ use super::usage::{
     CssUsageContext, EachBoundaryKind,
 };
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_css_selector_and_keyframe_rewrites(
-    source: &str,
-    nodes: &[CssNode],
-    hash: &str,
-    keyframes: &mut BTreeMap<String, String>,
-    replacements: &mut Vec<TextReplacement>,
-    inside_keyframes: bool,
-    nested_in_rule: bool,
-    inside_global_block: bool,
-    usage: &CssUsageContext,
-) {
-    for node in nodes {
-        match node {
-            CssNode::Rule(rule) => {
-                collect_css_rule_selector_and_keyframe_rewrites(
-                    source,
-                    rule,
-                    hash,
-                    keyframes,
-                    replacements,
-                    inside_keyframes,
-                    nested_in_rule,
-                    inside_global_block,
-                    None,
-                    usage,
-                );
-            }
-            CssNode::Atrule(atrule) => collect_css_atrule_selector_and_keyframe_rewrites(
-                source,
-                atrule,
-                hash,
-                keyframes,
-                replacements,
-                inside_keyframes,
-                nested_in_rule,
-                inside_global_block,
-                None,
-                usage,
-            ),
+pub(crate) struct RewriteContext<'a> {
+    source: &'a str,
+    hash: &'a str,
+    keyframes: &'a mut BTreeMap<String, String>,
+    replacements: &'a mut Vec<TextReplacement>,
+    usage: &'a CssUsageContext,
+}
+
+impl<'a> RewriteContext<'a> {
+    pub(crate) fn new(
+        source: &'a str,
+        hash: &'a str,
+        keyframes: &'a mut BTreeMap<String, String>,
+        replacements: &'a mut Vec<TextReplacement>,
+        usage: &'a CssUsageContext,
+    ) -> Self {
+        Self {
+            source,
+            hash,
+            keyframes,
+            replacements,
+            usage,
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_css_rule_selector_and_keyframe_rewrites(
-    source: &str,
-    rule: &CssRule,
-    hash: &str,
-    keyframes: &mut BTreeMap<String, String>,
-    replacements: &mut Vec<TextReplacement>,
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RewriteFrame<'a> {
     inside_keyframes: bool,
     nested_in_rule: bool,
     inside_global_block: bool,
-    parent_selector: Option<&str>,
-    usage: &CssUsageContext,
+    parent_selector: Option<&'a str>,
+}
+
+impl RewriteFrame<'_> {
+    pub(crate) fn root() -> Self {
+        Self::default()
+    }
+}
+
+pub(crate) fn collect_css_selector_and_keyframe_rewrites(
+    nodes: &[CssNode],
+    ctx: &mut RewriteContext<'_>,
+    frame: RewriteFrame<'_>,
 ) {
-    let prelude = source
+    for node in nodes {
+        match node {
+            CssNode::Rule(rule) => {
+                collect_css_rule_selector_and_keyframe_rewrites(rule, ctx, frame);
+            }
+            CssNode::Atrule(atrule) => {
+                collect_css_atrule_selector_and_keyframe_rewrites(atrule, ctx, frame);
+            }
+        }
+    }
+}
+
+fn collect_css_rule_selector_and_keyframe_rewrites(
+    rule: &CssRule,
+    ctx: &mut RewriteContext<'_>,
+    frame: RewriteFrame<'_>,
+) {
+    let prelude = ctx
+        .source
         .get(rule.prelude.start..rule.prelude.end)
         .unwrap_or_default();
     let is_global_block_rule = prelude.trim() == ":global";
-    let children_in_global =
-        inside_global_block || is_global_block_rule || find_bare_global_pseudo(prelude).is_some();
-    let children_nested_in_rule = nested_in_rule || selector_has_local_subject(prelude);
+    let children_in_global = frame.inside_global_block
+        || is_global_block_rule
+        || find_bare_global_pseudo(prelude).is_some();
+    let children_nested_in_rule = frame.nested_in_rule || selector_has_local_subject(prelude);
 
     if is_global_block_rule {
-        if let Some(opening) = source.get(rule.prelude.start..rule.block.start.saturating_add(1)) {
-            replacements.push(TextReplacement {
+        if let Some(opening) = ctx
+            .source
+            .get(rule.prelude.start..rule.block.start.saturating_add(1))
+        {
+            ctx.replacements.push(TextReplacement {
                 start: rule.prelude.start,
                 end: rule.block.start.saturating_add(1),
                 text: format!("/* {opening}*/"),
@@ -93,7 +103,7 @@ fn collect_css_rule_selector_and_keyframe_rewrites(
         }
         if rule.block.end > rule.block.start {
             let close_start = rule.block.end - 1;
-            replacements.push(TextReplacement {
+            ctx.replacements.push(TextReplacement {
                 start: close_start,
                 end: rule.block.end,
                 text: "/*}*/".to_string(),
@@ -101,15 +111,20 @@ fn collect_css_rule_selector_and_keyframe_rewrites(
         }
     }
 
-    if !inside_keyframes && !inside_global_block {
+    if !frame.inside_keyframes && !frame.inside_global_block {
         let can_prune_to_empty = !prelude.contains(":global");
         if (css_rule_is_empty(rule)
             || (can_prune_to_empty
-                && css_rule_will_be_empty_after_pruning(source, rule, usage, parent_selector)))
-            && !usage.dev
+                && css_rule_will_be_empty_after_pruning(
+                    ctx.source,
+                    rule,
+                    ctx.usage,
+                    frame.parent_selector,
+                )))
+            && !ctx.usage.dev
         {
-            if let Some(raw_rule) = source.get(rule.start..rule.end) {
-                replacements.push(TextReplacement {
+            if let Some(raw_rule) = ctx.source.get(rule.start..rule.end) {
+                ctx.replacements.push(TextReplacement {
                     start: rule.start,
                     end: rule.end,
                     text: format!("/* (empty) {}*/", escape_css_comment_body(raw_rule)),
@@ -118,9 +133,9 @@ fn collect_css_rule_selector_and_keyframe_rewrites(
             return;
         }
 
-        if css_rule_is_unused_with_parent(source, rule, usage, parent_selector) {
-            if let Some(raw_rule) = source.get(rule.start..rule.end) {
-                replacements.push(TextReplacement {
+        if css_rule_is_unused_with_parent(ctx.source, rule, ctx.usage, frame.parent_selector) {
+            if let Some(raw_rule) = ctx.source.get(rule.start..rule.end) {
+                ctx.replacements.push(TextReplacement {
                     start: rule.start,
                     end: rule.end,
                     text: format!("/* (unused) {}*/", escape_css_comment_body(raw_rule)),
@@ -130,11 +145,12 @@ fn collect_css_rule_selector_and_keyframe_rewrites(
         }
     }
 
-    if !inside_keyframes && !inside_global_block && !is_global_block_rule {
-        let scoped = scope_selector_list_text_with_mode(prelude, hash, nested_in_rule, false);
-        let scoped = comment_unused_selectors_after_scoping(prelude, &scoped, usage);
+    if !frame.inside_keyframes && !frame.inside_global_block && !is_global_block_rule {
+        let scoped =
+            scope_selector_list_text_with_mode(prelude, ctx.hash, frame.nested_in_rule, false);
+        let scoped = comment_unused_selectors_after_scoping(prelude, &scoped, ctx.usage);
         if scoped != prelude {
-            replacements.push(TextReplacement {
+            ctx.replacements.push(TextReplacement {
                 start: rule.prelude.start,
                 end: rule.prelude.end,
                 text: scoped,
@@ -143,16 +159,14 @@ fn collect_css_rule_selector_and_keyframe_rewrites(
     }
 
     collect_css_block_selector_and_keyframe_rewrites(
-        source,
         &rule.block,
-        hash,
-        keyframes,
-        replacements,
-        inside_keyframes,
-        children_nested_in_rule,
-        children_in_global,
-        Some(prelude),
-        usage,
+        ctx,
+        RewriteFrame {
+            inside_keyframes: frame.inside_keyframes,
+            nested_in_rule: children_nested_in_rule,
+            inside_global_block: children_in_global,
+            parent_selector: Some(prelude),
+        },
     );
 }
 
@@ -163,32 +177,24 @@ fn selector_has_local_subject(selector: &str) -> bool {
     !without_root.trim().is_empty()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_css_atrule_selector_and_keyframe_rewrites(
-    source: &str,
     atrule: &CssAtrule,
-    hash: &str,
-    keyframes: &mut BTreeMap<String, String>,
-    replacements: &mut Vec<TextReplacement>,
-    _inside_keyframes: bool,
-    nested_in_rule: bool,
-    inside_global_block: bool,
-    parent_selector: Option<&str>,
-    usage: &CssUsageContext,
+    ctx: &mut RewriteContext<'_>,
+    frame: RewriteFrame<'_>,
 ) {
     let is_keyframes = atrule.name.as_ref().ends_with("keyframes");
-    if is_keyframes && !inside_global_block {
+    if is_keyframes && !frame.inside_global_block {
         let trimmed = atrule.prelude.trim();
         if !trimmed.is_empty()
-            && let Some((next_name, mapped)) = map_keyframe_name(trimmed, hash)
+            && let Some((next_name, mapped)) = map_keyframe_name(trimmed, ctx.hash)
         {
-            keyframes.insert(trimmed.to_string(), mapped);
-            if let Some((prelude_start, prelude_end)) = css_at_rule_prelude_span(source, atrule)
-                && let Some(raw_prelude) = source.get(prelude_start..prelude_end)
+            ctx.keyframes.insert(trimmed.to_string(), mapped);
+            if let Some((prelude_start, prelude_end)) = css_at_rule_prelude_span(ctx.source, atrule)
+                && let Some(raw_prelude) = ctx.source.get(prelude_start..prelude_end)
             {
                 let rewritten = replace_first_css_identifier(raw_prelude, &next_name);
                 if rewritten != raw_prelude {
-                    replacements.push(TextReplacement {
+                    ctx.replacements.push(TextReplacement {
                         start: prelude_start,
                         end: prelude_end,
                         text: rewritten,
@@ -200,16 +206,14 @@ fn collect_css_atrule_selector_and_keyframe_rewrites(
 
     if let Some(block) = &atrule.block {
         collect_css_block_selector_and_keyframe_rewrites(
-            source,
             block,
-            hash,
-            keyframes,
-            replacements,
-            is_keyframes,
-            nested_in_rule,
-            inside_global_block,
-            parent_selector,
-            usage,
+            ctx,
+            RewriteFrame {
+                inside_keyframes: is_keyframes,
+                nested_in_rule: frame.nested_in_rule,
+                inside_global_block: frame.inside_global_block,
+                parent_selector: frame.parent_selector,
+            },
         );
     }
 }
@@ -282,45 +286,19 @@ fn css_at_rule_prelude_span(source: &str, atrule: &CssAtrule) -> Option<(usize, 
     Some((prelude_start, atrule.end))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_css_block_selector_and_keyframe_rewrites(
-    source: &str,
     block: &CssBlock,
-    hash: &str,
-    keyframes: &mut BTreeMap<String, String>,
-    replacements: &mut Vec<TextReplacement>,
-    inside_keyframes: bool,
-    nested_in_rule: bool,
-    inside_global_block: bool,
-    parent_selector: Option<&str>,
-    usage: &CssUsageContext,
+    ctx: &mut RewriteContext<'_>,
+    frame: RewriteFrame<'_>,
 ) {
     for child in block.children.iter() {
         match child {
-            CssBlockChild::Rule(rule) => collect_css_rule_selector_and_keyframe_rewrites(
-                source,
-                rule,
-                hash,
-                keyframes,
-                replacements,
-                inside_keyframes,
-                nested_in_rule,
-                inside_global_block,
-                parent_selector,
-                usage,
-            ),
-            CssBlockChild::Atrule(atrule) => collect_css_atrule_selector_and_keyframe_rewrites(
-                source,
-                atrule,
-                hash,
-                keyframes,
-                replacements,
-                inside_keyframes,
-                nested_in_rule,
-                inside_global_block,
-                parent_selector,
-                usage,
-            ),
+            CssBlockChild::Rule(rule) => {
+                collect_css_rule_selector_and_keyframe_rewrites(rule, ctx, frame);
+            }
+            CssBlockChild::Atrule(atrule) => {
+                collect_css_atrule_selector_and_keyframe_rewrites(atrule, ctx, frame);
+            }
             CssBlockChild::Declaration(_) => {}
         }
     }
@@ -702,7 +680,6 @@ fn functional_pseudo_inner_spans(selector: &str, pseudo: &str) -> Vec<(usize, us
     out
 }
 
-#[allow(clippy::nonminimal_bool)]
 fn css_selector_segment_is_unused(
     selector: &str,
     usage: &CssUsageContext,
@@ -719,14 +696,16 @@ fn css_selector_segment_is_unused(
         let prefix_classes = extract_selector_class_names(&prefix_normalized);
         if prefix_classes
             .iter()
-            .any(|class| !usage.classes.contains(class))
+            .any(|class| !usage.classes.contains(class.as_str()))
         {
             return true;
         }
 
         let prefix_tags = extract_selector_tag_names(&prefix_normalized);
         if !usage.has_dynamic_svelte_element
-            && prefix_tags.iter().any(|tag| !usage.tags.contains(tag))
+            && prefix_tags
+                .iter()
+                .any(|tag| !usage.tags.contains(tag.as_str()))
         {
             return true;
         }
@@ -770,6 +749,10 @@ fn css_selector_segment_is_unused(
         return false;
     }
 
+    let class_selector_is_bounded = !usage.class_name_unbounded || !normalized.contains('.');
+    let respects_component_boundaries = !usage.has_component_like_elements
+        || !selector_maybe_cross_component_boundary(&normalized, usage);
+
     if !usage.has_dynamic_markup
         && let Some(matches) = host_direct_child_selector_matches(&normalized, usage)
     {
@@ -778,9 +761,8 @@ fn css_selector_segment_is_unused(
 
     if !usage.has_dynamic_markup
         && selector_is_simple_sibling_pattern(&normalized)
-        && !(usage.class_name_unbounded && normalized.contains('.'))
-        && (!usage.has_component_like_elements
-            || !selector_maybe_cross_component_boundary(&normalized, usage))
+        && class_selector_is_bounded
+        && respects_component_boundaries
     {
         return !simple_structure_selector_matches(&normalized, usage);
     }
@@ -788,7 +770,7 @@ fn css_selector_segment_is_unused(
     if usage.has_dynamic_markup
         && usage.has_component_like_elements
         && selector_is_simple_sibling_pattern(&normalized)
-        && !(usage.class_name_unbounded && normalized.contains('.'))
+        && class_selector_is_bounded
         && selector_targets_only_deep_component_tags(&normalized, usage)
         && !selector_maybe_cross_component_boundary(&normalized, usage)
     {
@@ -798,9 +780,8 @@ fn css_selector_segment_is_unused(
     if usage.has_each_blocks
         && !usage.has_non_each_dynamic_markup
         && selector_is_simple_sibling_pattern(&normalized)
-        && !(usage.class_name_unbounded && normalized.contains('.'))
-        && (!usage.has_component_like_elements
-            || !selector_maybe_cross_component_boundary(&normalized, usage))
+        && class_selector_is_bounded
+        && respects_component_boundaries
         && split_selector_parts(&normalized).len() == 2
     {
         return !simple_sibling_selector_matches_with_dynamic_boundaries(&normalized, usage);
@@ -811,10 +792,9 @@ fn css_selector_segment_is_unused(
     if selector_is_simple_structure_pattern(&normalized)
         && !selector_structure_has_render_uncertainty(&normalized, usage)
         && !usage.has_dynamic_svelte_element
-        && !(usage.class_name_unbounded && normalized.contains('.'))
-        && !(has_global_pseudo && !normalized.contains('+') && !normalized.contains('~'))
-        && (!usage.has_component_like_elements
-            || !selector_maybe_cross_component_boundary(&normalized, usage))
+        && class_selector_is_bounded
+        && (!has_global_pseudo || normalized.contains('+') || normalized.contains('~'))
+        && respects_component_boundaries
     {
         return !simple_structure_selector_matches(&normalized, usage);
     }
@@ -871,10 +851,12 @@ fn css_selector_segment_is_unused(
                 let option_tags = extract_selector_tag_names(&option_without_global);
                 let class_possible = option_classes
                     .iter()
-                    .all(|class| usage.classes.contains(class));
+                    .all(|class| usage.classes.contains(class.as_str()));
                 let tag_possible = usage.has_dynamic_svelte_element
                     || option_tags.is_empty()
-                    || option_tags.iter().any(|tag| usage.tags.contains(tag));
+                    || option_tags
+                        .iter()
+                        .any(|tag| usage.tags.contains(tag.as_str()));
                 class_possible && tag_possible
             });
             if !any_possible {
@@ -892,14 +874,17 @@ fn css_selector_segment_is_unused(
 
     let skip_class_mismatch =
         has_not || has_has || usage.class_name_unbounded || normalized.contains(":is(");
-    if !skip_class_mismatch
-        && !(root_only_selector && tags.is_empty() && attributes.is_empty())
-        && classes.iter().any(|class| !usage.classes.contains(class))
+    let should_check_class_mismatch =
+        !(skip_class_mismatch || (root_only_selector && tags.is_empty() && attributes.is_empty()));
+    if should_check_class_mismatch
+        && classes
+            .iter()
+            .any(|class| !usage.classes.contains(class.as_str()))
     {
         return true;
     }
 
-    if !ids.is_empty() && ids.iter().any(|id| !usage.ids.contains(id)) {
+    if !ids.is_empty() && ids.iter().any(|id| !usage.ids.contains(id.as_str())) {
         return true;
     }
 
@@ -918,7 +903,7 @@ fn css_selector_segment_is_unused(
         return false;
     }
 
-    tags.iter().any(|tag| !usage.tags.contains(tag))
+    tags.iter().any(|tag| !usage.tags.contains(tag.as_str()))
 }
 
 fn bare_global_sibling_selector_is_unused(selector: &str, usage: &CssUsageContext) -> Option<bool> {
@@ -1018,7 +1003,11 @@ fn selector_targets_only_deep_component_tags(selector: &str, usage: &CssUsageCon
     tags.iter().any(|tag| {
         let mut has_deep = false;
         let mut has_non_deep = false;
-        for element in usage.elements.iter().filter(|element| element.tag == *tag) {
+        for element in usage
+            .elements
+            .iter()
+            .filter(|element| element.tag.as_ref() == tag)
+        {
             match element.component_depth {
                 Some(depth) if depth >= 2 => has_deep = true,
                 _ => has_non_deep = true,
@@ -1051,7 +1040,7 @@ fn simple_selector_part_matches_boundary(part: &str, candidates: BoundaryCandida
     if !required_tags.is_empty()
         && !required_tags
             .iter()
-            .any(|tag| candidates.tags.contains(tag))
+            .any(|tag| candidates.tags.contains(tag.as_str()))
     {
         return false;
     }
@@ -1059,7 +1048,7 @@ fn simple_selector_part_matches_boundary(part: &str, candidates: BoundaryCandida
     let required_classes = extract_selector_class_names(part);
     required_classes
         .iter()
-        .all(|class| candidates.classes.contains(class))
+        .all(|class| candidates.classes.contains(class.as_str()))
 }
 
 fn find_bare_global_pseudo(selector: &str) -> Option<usize> {
@@ -1138,7 +1127,7 @@ fn selector_maybe_cross_component_boundary(selector: &str, usage: &CssUsageConte
         usage
             .elements
             .iter()
-            .any(|element| element.tag == *tag && element.component_depth == Some(1))
+            .any(|element| element.tag.as_ref() == tag && element.component_depth == Some(1))
     })
 }
 
@@ -1592,7 +1581,7 @@ fn simple_selector_part_matches_element(
     }
     let element = &usage.elements[element_index];
     let tags = extract_selector_tag_names(part);
-    if !tags.is_empty() && !tags.iter().any(|tag| tag == &element.tag) {
+    if !tags.is_empty() && !tags.iter().any(|tag| tag == element.tag.as_ref()) {
         return false;
     }
     let classes = extract_selector_class_names(part);
@@ -1602,7 +1591,7 @@ fn simple_selector_part_matches_element(
     let class_value = element
         .attributes
         .get("class")
-        .map(String::as_str)
+        .map(Arc::as_ref)
         .unwrap_or("");
     classes.iter().all(|class| {
         class_value
@@ -1723,7 +1712,7 @@ fn any_element_has_all_classes(classes: &[String], usage: &CssUsageContext) -> b
         let class_value = element
             .attributes
             .get("class")
-            .map(String::as_str)
+            .map(Arc::as_ref)
             .unwrap_or("");
         classes.iter().all(|class| {
             class_value
@@ -1739,7 +1728,7 @@ fn any_class_has_descendant_with_same_class(classes: &[String], usage: &CssUsage
             let class_value = element
                 .attributes
                 .get("class")
-                .map(String::as_str)
+                .map(Arc::as_ref)
                 .unwrap_or("");
             if !class_value
                 .split_ascii_whitespace()
@@ -1756,7 +1745,7 @@ fn any_class_has_descendant_with_same_class(classes: &[String], usage: &CssUsage
                     let descendant_class = descendant
                         .attributes
                         .get("class")
-                        .map(String::as_str)
+                        .map(Arc::as_ref)
                         .unwrap_or("");
                     descendant_class
                         .split_ascii_whitespace()
@@ -1775,7 +1764,7 @@ fn selector_attribute_matches_element(
     filter: &CssAttributeFilter,
     element: &CssElementUsage,
 ) -> bool {
-    let Some(value) = element.attributes.get(&filter.name) else {
+    let Some(value) = element.attributes.get(filter.name.as_ref()) else {
         return false;
     };
 
@@ -1785,7 +1774,7 @@ fn selector_attribute_matches_element(
         filter_cmp = filter.value.to_ascii_lowercase();
         (value_cmp.as_str(), filter_cmp.as_str())
     } else {
-        (value.as_str(), filter.value.as_str())
+        (value.as_ref(), filter.value.as_ref())
     };
 
     match filter.match_kind {
@@ -1816,13 +1805,13 @@ fn selector_attributes_have_any_match(
 ) -> bool {
     if attributes
         .iter()
-        .any(|filter| usage.dynamic_attributes.contains(&filter.name))
+        .any(|filter| usage.dynamic_attributes.contains(filter.name.as_ref()))
     {
         return true;
     }
 
     usage.elements.iter().any(|element| {
-        if !tags.is_empty() && !tags.iter().any(|tag| tag == &element.tag) {
+        if !tags.is_empty() && !tags.iter().any(|tag| tag == element.tag.as_ref()) {
             return false;
         }
         attributes
@@ -1905,8 +1894,8 @@ fn parse_selector_attribute_filter(inner: &str) -> Option<CssAttributeFilter> {
     };
 
     Some(CssAttributeFilter {
-        name,
-        value,
+        name: Arc::from(name),
+        value: Arc::from(value),
         case_insensitive,
         match_kind,
     })
@@ -2304,7 +2293,6 @@ fn scope_selector_list_text_with_mode(
     out
 }
 
-#[allow(clippy::nonminimal_bool)]
 fn scope_selector_segment_text(
     segment: &str,
     hash: &str,
@@ -2351,7 +2339,7 @@ fn scope_selector_segment_text(
             || clean_trimmed.starts_with(":global.")
             || clean_trimmed.starts_with(":global#")
             || clean_trimmed.starts_with(":global[");
-        if !(attach_global && !combinator_has_symbol) {
+        if !attach_global || combinator_has_symbol {
             out.push_str(&combinator);
         }
 
@@ -2846,10 +2834,11 @@ fn insert_scope_token_into_part(part: &str, token: &str) -> String {
                     cursor += 1;
                 }
                 cursor = consume_identifier_like(part, cursor);
-                if cursor < part.len() && part.as_bytes()[cursor] == b'(' {
-                    if let Some(close) = find_matching_paren(part, cursor) {
-                        cursor = close + 1;
-                    }
+                if cursor < part.len()
+                    && part.as_bytes()[cursor] == b'('
+                    && let Some(close) = find_matching_paren(part, cursor)
+                {
+                    cursor = close + 1;
                 }
                 (cursor, TokenKind::Pseudo)
             }
@@ -3110,54 +3099,6 @@ fn unwrap_pure_global_selector_option(selector: &str) -> Option<&str> {
     trimmed.get(":global(".len()..close)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        GLOBAL_CLOSE_MARKER, GLOBAL_OPEN_MARKER, scope_pseudo_selector_arguments_with_context,
-        scope_selector_segment_text, unwrap_pure_global_selector_option,
-    };
-
-    #[test]
-    fn unwraps_pure_global_selector_option() {
-        assert_eq!(
-            unwrap_pure_global_selector_option(":global(p span)"),
-            Some("p span")
-        );
-    }
-
-    #[test]
-    fn preserves_global_not_arguments() {
-        assert_eq!(
-            scope_pseudo_selector_arguments_with_context(
-                "span.svelte-xyz:not(:global(p span))",
-                "svelte-xyz",
-                true,
-            ),
-            "span.svelte-xyz:not(p span)"
-        );
-    }
-
-    #[test]
-    fn preserves_marker_wrapped_global_not_arguments() {
-        let selector = format!(
-            "span.svelte-xyz:not({}p span{})",
-            GLOBAL_OPEN_MARKER, GLOBAL_CLOSE_MARKER
-        );
-        assert_eq!(
-            scope_pseudo_selector_arguments_with_context(&selector, "svelte-xyz", false),
-            "span.svelte-xyz:not(p span)"
-        );
-    }
-
-    #[test]
-    fn scopes_segment_with_global_not_argument() {
-        assert_eq!(
-            scope_selector_segment_text("span:not(:global(p span))", "svelte-xyz", false, false),
-            "span.svelte-xyz:not(p span)"
-        );
-    }
-}
-
 fn not_argument_should_be_scoped(inner: &str) -> bool {
     let mut depth_paren = 0usize;
     let mut depth_bracket = 0usize;
@@ -3226,4 +3167,50 @@ fn remove_bare_global_tokens(selector: &str) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GLOBAL_CLOSE_MARKER, GLOBAL_OPEN_MARKER, scope_pseudo_selector_arguments_with_context,
+        scope_selector_segment_text, unwrap_pure_global_selector_option,
+    };
+
+    #[test]
+    fn unwraps_pure_global_selector_option() {
+        assert_eq!(
+            unwrap_pure_global_selector_option(":global(p span)"),
+            Some("p span")
+        );
+    }
+
+    #[test]
+    fn preserves_global_not_arguments() {
+        assert_eq!(
+            scope_pseudo_selector_arguments_with_context(
+                "span.svelte-xyz:not(:global(p span))",
+                "svelte-xyz",
+                true,
+            ),
+            "span.svelte-xyz:not(p span)"
+        );
+    }
+
+    #[test]
+    fn preserves_marker_wrapped_global_not_arguments() {
+        let selector =
+            format!("span.svelte-xyz:not({GLOBAL_OPEN_MARKER}p span{GLOBAL_CLOSE_MARKER})");
+        assert_eq!(
+            scope_pseudo_selector_arguments_with_context(&selector, "svelte-xyz", false),
+            "span.svelte-xyz:not(p span)"
+        );
+    }
+
+    #[test]
+    fn scopes_segment_with_global_not_argument() {
+        assert_eq!(
+            scope_selector_segment_text("span:not(:global(p span))", "svelte-xyz", false, false),
+            "span.svelte-xyz:not(p span)"
+        );
+    }
 }

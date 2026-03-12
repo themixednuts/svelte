@@ -11,7 +11,18 @@ use crate::ast::modern::{
     Expression, Fragment, IfBlock, NamedAttribute, Node, RegularElement, Script, ScriptContext,
     Search, SnippetBlock, SvelteElement, TransitionDirective,
 };
-use std::collections::{HashMap, HashSet};
+use crate::estree::{
+    PathStep, collect_pattern_binding_names, is_identifier_or_member_expression,
+    is_ignored_identifier_context, is_type_identifier_context, path_has_function_scope,
+    raw_base_identifier_name as estree_raw_base_identifier_name, raw_callee_name,
+    raw_identifier_name, unwrap_typescript_expression, walk_estree_node_with_path,
+};
+use crate::{SourceId, SourceText};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::ControlFlow,
+    sync::Arc,
+};
 
 pub(super) fn detect_svelte_meta_structure_errors(
     source: &str,
@@ -164,10 +175,10 @@ fn parse_error(
 pub(super) fn detect_tag_invalid_name(source: &str, root: &Root) -> Option<CompileError> {
     let (start, end) = root.fragment.find_map(|entry| match entry.as_node()? {
         Node::RegularElement(element) if !is_valid_element_name(element.name.as_ref()) => {
-            Some(name_range(&element.name_loc))
+            opening_tag_name_range(source, element.start)
         }
         Node::Component(component) if !is_valid_component_name(component.name.as_ref()) => {
-            Some(name_range(&component.name_loc))
+            opening_tag_name_range(source, component.start)
         }
         _ => None,
     })?;
@@ -190,6 +201,18 @@ struct SvelteMetaScanState {
 
 fn name_range(name: &crate::ast::common::NameLocation) -> (usize, usize) {
     (name.start.character, name.end.character)
+}
+
+fn opening_tag_name_range(source: &str, tag_start: usize) -> Option<(usize, usize)> {
+    let start = tag_start.checked_add(1)?;
+    let rest = source.get(start..)?;
+    let name_end = rest
+        .char_indices()
+        .find_map(|(idx, ch)| {
+            (ch.is_whitespace() || matches!(ch, '/' | '>')).then_some(start + idx)
+        })
+        .unwrap_or(source.len());
+    Some((start, name_end))
 }
 
 #[derive(Clone, Copy)]
@@ -235,10 +258,13 @@ fn scan_root_meta(
     start: usize,
     fragment: &Fragment,
     count: &mut usize,
-    element_depth: usize,
-    block_depth: usize,
+    depth: MetaDepth,
     allow_children: bool,
 ) -> Result<(), CompileError> {
+    let MetaDepth {
+        element: element_depth,
+        block: block_depth,
+    } = depth;
     if element_depth > 0 || block_depth > 0 {
         return Err(compile_error_with_range(
             source,
@@ -270,6 +296,12 @@ fn scan_root_meta(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct MetaDepth {
+    element: usize,
+    block: usize,
+}
+
 fn scan_modern_fragment_for_svelte_meta(
     source: &str,
     fragment: &Fragment,
@@ -297,15 +329,17 @@ fn scan_modern_node_for_svelte_meta(
     match node {
         Node::RegularElement(element) => {
             let name = element.name.as_ref();
-            if let ElementKind::Svelte(kind) = classify_element_name(name) {
-                if !kind.is_known() {
-                    return Some(compile_error_with_range(
-                        source,
-                        CompilerDiagnosticKind::SvelteMetaInvalidTag,
-                        element.name_loc.start.character,
-                        element.name_loc.end.character,
-                    ));
-                }
+            if let ElementKind::Svelte(kind) = classify_element_name(name)
+                && !kind.is_known()
+            {
+                let (start, end) = opening_tag_name_range(source, element.start)
+                    .unwrap_or_else(|| name_range(&element.name_loc));
+                return Some(compile_error_with_range(
+                    source,
+                    CompilerDiagnosticKind::SvelteMetaInvalidTag,
+                    start,
+                    end,
+                ));
             }
 
             scan_modern_fragment_for_svelte_meta(
@@ -323,8 +357,10 @@ fn scan_modern_node_for_svelte_meta(
                 element.start,
                 &element.fragment,
                 &mut state.head_count,
-                element_depth,
-                block_depth,
+                MetaDepth {
+                    element: element_depth,
+                    block: block_depth,
+                },
                 true,
             ) {
                 return Some(error);
@@ -344,8 +380,10 @@ fn scan_modern_node_for_svelte_meta(
                 element.start,
                 &element.fragment,
                 &mut state.window_count,
-                element_depth,
-                block_depth,
+                MetaDepth {
+                    element: element_depth,
+                    block: block_depth,
+                },
                 false,
             ) {
                 return Some(error);
@@ -365,8 +403,10 @@ fn scan_modern_node_for_svelte_meta(
                 element.start,
                 &element.fragment,
                 &mut state.document_count,
-                element_depth,
-                block_depth,
+                MetaDepth {
+                    element: element_depth,
+                    block: block_depth,
+                },
                 false,
             ) {
                 return Some(error);
@@ -386,8 +426,10 @@ fn scan_modern_node_for_svelte_meta(
                 element.start,
                 &element.fragment,
                 &mut state.body_count,
-                element_depth,
-                block_depth,
+                MetaDepth {
+                    element: element_depth,
+                    block: block_depth,
+                },
                 false,
             ) {
                 return Some(error);
@@ -533,7 +575,7 @@ fn first_non_whitespace_fragment_range(fragment: &Fragment) -> Option<(usize, us
             }
             return Some((text.start, text.end));
         }
-        return Some(super::super::modern_node_span(node));
+        return Some(crate::api::modern::modern_node_span(node));
     }
     None
 }
@@ -659,39 +701,49 @@ pub(super) fn detect_reactive_declaration_cycle_from_root(
     let names = statements
         .iter()
         .flat_map(|statement| statement.assignments.iter().cloned())
-        .fold(Vec::<String>::new(), |mut names, name| {
-            push_unique_string(&mut names, &name);
+        .fold(OrderedNames::default(), |mut names, name| {
+            names.extend([name]);
             names
         });
-    let name_set = names.iter().cloned().collect::<HashSet<_>>();
+    let (names, name_set) = names.into_parts();
 
-    let mut graph = HashMap::<String, Vec<String>>::new();
+    let mut graph = HashMap::<Arc<str>, OrderedNames>::new();
     for statement in &statements {
         for assignment in &statement.assignments {
             let edges = graph.entry(assignment.clone()).or_default();
             for dependency in &statement.dependencies {
-                if statement.assignment_set.contains(dependency) || !name_set.contains(dependency) {
+                if statement.assignment_set.contains(dependency.as_ref())
+                    || !name_set.contains(dependency.as_ref())
+                {
                     continue;
                 }
-                push_unique_string(edges, dependency);
+                edges.extend([dependency.clone()]);
             }
         }
     }
 
-    let mut stack = Vec::<String>::new();
-    let mut active = HashSet::<String>::new();
-    let mut visited = HashSet::<String>::new();
+    let graph = freeze_name_graph(graph);
+    let mut stack = Vec::<Arc<str>>::new();
+    let mut active = NameSet::default();
+    let mut visited = NameSet::default();
     for name in &names {
         if let Some(cycle) =
-            find_reactive_cycle(name.as_str(), &graph, &mut visited, &mut active, &mut stack)
+            find_reactive_cycle(name.as_ref(), &graph, &mut visited, &mut active, &mut stack)
         {
             let statement = statements
                 .iter()
-                .find(|statement| statement.assignment_set.contains(cycle[0].as_str()))?;
+                .find(|statement| statement.assignment_set.contains(cycle[0].as_ref()))?;
             return Some(compile_error_custom(
                 source,
                 "reactive_declaration_cycle",
-                format!("Cyclical dependency detected: {}", cycle.join(" \u{2192} ")),
+                format!(
+                    "Cyclical dependency detected: {}",
+                    cycle
+                        .iter()
+                        .map(Arc::as_ref)
+                        .collect::<Vec<_>>()
+                        .join(" \u{2192} ")
+                ),
                 statement.start,
                 statement.end,
             ));
@@ -702,12 +754,14 @@ pub(super) fn detect_reactive_declaration_cycle_from_root(
 }
 
 struct ReactiveStatement {
-    assignments: Vec<String>,
-    assignment_set: HashSet<String>,
-    dependencies: Vec<String>,
+    assignments: Box<[Arc<str>]>,
+    assignment_set: NameSet,
+    dependencies: Box<[Arc<str>]>,
     start: usize,
     end: usize,
 }
+
+type NameGraph = HashMap<Arc<str>, Box<[Arc<str>]>>;
 
 fn collect_reactive_statements(program: &EstreeNode) -> Vec<ReactiveStatement> {
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
@@ -730,6 +784,7 @@ fn collect_reactive_statements(program: &EstreeNode) -> Vec<ReactiveStatement> {
         if assignments.is_empty() {
             continue;
         }
+        let (assignments, assignment_set) = assignments.into_parts();
 
         let Some((start, end)) = estree_node_span(statement).or_else(|| estree_node_span(body))
         else {
@@ -737,8 +792,8 @@ fn collect_reactive_statements(program: &EstreeNode) -> Vec<ReactiveStatement> {
         };
 
         statements.push(ReactiveStatement {
-            assignment_set: assignments.iter().cloned().collect(),
-            dependencies: collect_reactive_dependencies(body),
+            assignment_set,
+            dependencies: collect_reactive_dependencies(body).into_boxed_slice(),
             assignments,
             start,
             end,
@@ -748,8 +803,8 @@ fn collect_reactive_statements(program: &EstreeNode) -> Vec<ReactiveStatement> {
     statements
 }
 
-fn collect_reactive_assignment_names(statement: &EstreeNode) -> Vec<String> {
-    let mut names = Vec::new();
+fn collect_reactive_assignment_names(statement: &EstreeNode) -> OrderedNames {
+    let mut names = OrderedNames::default();
     walk_estree_node_with_path(statement, &mut Vec::new(), &mut |node, path| {
         if path_has_function_scope(path) {
             return;
@@ -760,9 +815,7 @@ fn collect_reactive_assignment_names(statement: &EstreeNode) -> Vec<String> {
                 let Some(left) = estree_node_field_object(node, RawField::Left) else {
                     return;
                 };
-                for name in reactive_assignment_target_names(left) {
-                    push_unique_string(&mut names, name.as_str());
-                }
+                names.extend(reactive_assignment_target_names(left));
             }
             Some("UpdateExpression") => {
                 let Some(argument) = estree_node_field_object(node, RawField::Argument) else {
@@ -771,7 +824,7 @@ fn collect_reactive_assignment_names(statement: &EstreeNode) -> Vec<String> {
                 let Some(name) = raw_binding_base_identifier_name(argument) else {
                     return;
                 };
-                push_unique_string(&mut names, name.as_str());
+                names.extend([name]);
             }
             _ => {}
         }
@@ -779,21 +832,21 @@ fn collect_reactive_assignment_names(statement: &EstreeNode) -> Vec<String> {
     names
 }
 
-fn reactive_assignment_target_names(pattern: &EstreeNode) -> Vec<String> {
+fn reactive_assignment_target_names(pattern: &EstreeNode) -> OrderedNames {
     if let Some(name) = raw_binding_base_identifier_name(pattern) {
-        return vec![name];
+        let mut names = OrderedNames::default();
+        names.extend([name]);
+        return names;
     }
 
-    let mut names = Vec::new();
+    let mut names = OrderedNames::default();
     collect_pattern_binding_names(pattern, &mut names);
-    names.into_iter().map(|name| name.to_string()).collect()
+    names
 }
 
-fn raw_binding_base_identifier_name(expression: &EstreeNode) -> Option<String> {
+fn raw_binding_base_identifier_name(expression: &EstreeNode) -> Option<Arc<str>> {
     match estree_node_type(expression) {
-        Some("Identifier") => {
-            estree_node_field_str(expression, RawField::Name).map(ToString::to_string)
-        }
+        Some("Identifier") => estree_node_field_str(expression, RawField::Name).map(Arc::from),
         Some("MemberExpression") => {
             let object = estree_node_field_object(expression, RawField::Object)?;
             raw_binding_base_identifier_name(object)
@@ -802,8 +855,8 @@ fn raw_binding_base_identifier_name(expression: &EstreeNode) -> Option<String> {
     }
 }
 
-fn collect_reactive_dependencies(statement: &EstreeNode) -> Vec<String> {
-    let mut dependencies = Vec::new();
+fn collect_reactive_dependencies(statement: &EstreeNode) -> OrderedNames {
+    let mut dependencies = OrderedNames::default();
     walk_estree_node_with_path(statement, &mut Vec::new(), &mut |node, path| {
         if estree_node_type(node) != Some("Identifier")
             || path_has_function_scope(path)
@@ -817,29 +870,29 @@ fn collect_reactive_dependencies(statement: &EstreeNode) -> Vec<String> {
         let Some(name) = estree_node_field_str(node, RawField::Name) else {
             return;
         };
-        push_unique_string(&mut dependencies, name);
+        dependencies.extend([Arc::from(name)]);
     });
     dependencies
 }
 
 fn find_reactive_cycle(
     name: &str,
-    graph: &HashMap<String, Vec<String>>,
-    visited: &mut HashSet<String>,
-    active: &mut HashSet<String>,
-    stack: &mut Vec<String>,
-) -> Option<Vec<String>> {
-    if let Some(index) = stack.iter().position(|entry| entry == name) {
+    graph: &NameGraph,
+    visited: &mut NameSet,
+    active: &mut NameSet,
+    stack: &mut Vec<Arc<str>>,
+) -> Option<Vec<Arc<str>>> {
+    if let Some(index) = stack.iter().position(|entry| entry.as_ref() == name) {
         let mut cycle = stack[index..].to_vec();
-        cycle.push(name.to_string());
+        cycle.push(name.into());
         return Some(cycle);
     }
     if active.contains(name) || visited.contains(name) {
         return None;
     }
 
-    active.insert(name.to_string());
-    stack.push(name.to_string());
+    active.insert(name.into());
+    stack.push(name.into());
 
     if let Some(dependencies) = graph.get(name) {
         for dependency in dependencies {
@@ -851,103 +904,15 @@ fn find_reactive_cycle(
 
     stack.pop();
     active.remove(name);
-    visited.insert(name.to_string());
+    visited.insert(name.into());
     None
 }
 
-#[derive(Clone, Copy)]
-struct PathStep<'a> {
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-}
-
-fn walk_estree_node_with_path<'a>(
-    node: &'a EstreeNode,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    visitor(node, path);
-    for (key, value) in node.fields.iter() {
-        walk_estree_value_with_path(value, node, key.as_str(), path, visitor);
-    }
-}
-
-fn walk_estree_value_with_path<'a>(
-    value: &'a EstreeValue,
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    match value {
-        EstreeValue::Object(node) => {
-            path.push(PathStep { parent, via_key });
-            walk_estree_node_with_path(node, path, visitor);
-            path.pop();
-        }
-        EstreeValue::Array(values) => {
-            for item in values.iter() {
-                walk_estree_value_with_path(item, parent, via_key, path, visitor);
-            }
-        }
-        EstreeValue::String(_)
-        | EstreeValue::Int(_)
-        | EstreeValue::UInt(_)
-        | EstreeValue::Number(_)
-        | EstreeValue::Bool(_)
-        | EstreeValue::Null => {}
-    }
-}
-
-fn path_has_function_scope(path: &[PathStep<'_>]) -> bool {
-    path.iter().any(|step| {
-        matches!(
-            estree_node_type(step.parent),
-            Some("FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression")
-        )
-    })
-}
-
-fn is_ignored_identifier_context(path: &[PathStep<'_>]) -> bool {
-    let Some(step) = path.last() else {
-        return false;
-    };
-    let parent_type = estree_node_type(step.parent);
-    if matches!(
-        parent_type,
-        Some(
-            "VariableDeclarator"
-                | "FunctionDeclaration"
-                | "FunctionExpression"
-                | "ArrowFunctionExpression"
-                | "ClassDeclaration"
-                | "ImportSpecifier"
-                | "ImportDefaultSpecifier"
-                | "ImportNamespaceSpecifier"
-                | "CatchClause"
-                | "LabeledStatement"
-                | "ExportSpecifier"
-        )
-    ) && matches!(
-        step.via_key,
-        "id" | "params" | "local" | "exported" | "param" | "label"
-    ) {
-        return true;
-    }
-    if parent_type == Some("MemberExpression") && step.via_key == "property" {
-        return true;
-    }
-    if parent_type == Some("Property") && step.via_key == "key" {
-        return true;
-    }
-    false
-}
-
-fn is_type_identifier_context(path: &[PathStep<'_>]) -> bool {
-    path.iter().any(|step| {
-        estree_node_type(step.parent)
-            .is_some_and(|kind| kind.starts_with("TS") || kind == "TSTypeAnnotation")
-    })
+fn freeze_name_graph(graph: HashMap<Arc<str>, OrderedNames>) -> NameGraph {
+    graph
+        .into_iter()
+        .map(|(name, dependencies)| (name, dependencies.into_boxed_slice()))
+        .collect()
 }
 
 fn is_simple_assignment_target(path: &[PathStep<'_>]) -> bool {
@@ -974,13 +939,6 @@ fn is_reactive_labeled_statement(node: &EstreeNode) -> bool {
         }
         _ => false,
     }
-}
-
-fn push_unique_string(out: &mut Vec<String>, value: &str) {
-    if out.iter().any(|existing| existing == value) {
-        return;
-    }
-    out.push(value.to_string());
 }
 
 fn find_invalid_svelte_self_in_fragment(
@@ -1296,9 +1254,7 @@ fn empty_attribute_shorthand_start(attribute: &Attribute) -> Option<usize> {
     let AttributeValueList::ExpressionTag(tag) = &attribute.value else {
         return None;
     };
-    let Some(name) = estree_node_field_str(&tag.expression.0, RawField::Name) else {
-        return None;
-    };
+    let name = estree_node_field_str(&tag.expression.0, RawField::Name)?;
     if !name.is_empty() {
         return None;
     }
@@ -1332,52 +1288,15 @@ fn find_debug_tag_invalid_argument_in_fragment(fragment: &Fragment) -> Option<(u
 fn find_debug_tag_invalid_argument_in_node(node: &Node) -> Option<(usize, usize)> {
     match node {
         Node::DebugTag(tag) => debug_tag_invalid_argument_span(tag),
-        Node::IfBlock(block) => find_debug_tag_invalid_argument_in_fragment(&block.consequent)
-            .or_else(|| {
-                block
-                    .alternate
-                    .as_deref()
-                    .and_then(|alternate| match alternate {
-                        Alternate::Fragment(fragment) => {
-                            find_debug_tag_invalid_argument_in_fragment(fragment)
-                        }
-                        Alternate::IfBlock(block) => {
-                            find_debug_tag_invalid_argument_in_node(&Node::IfBlock(block.clone()))
-                        }
-                    })
-            }),
-        Node::EachBlock(block) => {
-            find_debug_tag_invalid_argument_in_fragment(&block.body).or_else(|| {
-                block
-                    .fallback
-                    .as_ref()
-                    .and_then(find_debug_tag_invalid_argument_in_fragment)
-            })
-        }
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment
-                    && let Some(span) = find_debug_tag_invalid_argument_in_fragment(fragment)
-                {
-                    return Some(span);
-                }
+        _ => match node.try_for_each_child_fragment(|fragment| {
+            match find_debug_tag_invalid_argument_in_fragment(fragment) {
+                Some(span) => std::ops::ControlFlow::Break(span),
+                None => std::ops::ControlFlow::Continue(()),
             }
-            None
-        }
-        Node::SnippetBlock(block) => find_debug_tag_invalid_argument_in_fragment(&block.body),
-        Node::KeyBlock(block) => find_debug_tag_invalid_argument_in_fragment(&block.fragment),
-        Node::RegularElement(element) => {
-            find_debug_tag_invalid_argument_in_fragment(&element.fragment)
-        }
-        Node::Component(component) => {
-            find_debug_tag_invalid_argument_in_fragment(&component.fragment)
-        }
-        Node::SlotElement(slot) => find_debug_tag_invalid_argument_in_fragment(&slot.fragment),
-        _ => None,
+        }) {
+            std::ops::ControlFlow::Break(span) => Some(span),
+            std::ops::ControlFlow::Continue(()) => None,
+        },
     }
 }
 
@@ -1394,6 +1313,33 @@ fn debug_tag_invalid_argument_span(tag: &DebugTag) -> Option<(usize, usize)> {
     None
 }
 
+fn find_error_in_child_fragments(
+    node: &Node,
+    mut visit: impl FnMut(&Fragment) -> Option<CompileError>,
+) -> Option<CompileError> {
+    match node.try_for_each_child_fragment(|fragment| match visit(fragment) {
+        Some(error) => std::ops::ControlFlow::Break(error),
+        None => std::ops::ControlFlow::Continue(()),
+    }) {
+        std::ops::ControlFlow::Break(error) => Some(error),
+        std::ops::ControlFlow::Continue(()) => None,
+    }
+}
+
+fn find_error_in_child_fragments_with_scope(
+    node: &Node,
+    scope: &mut NameStack,
+    mut visit: impl FnMut(&Fragment, &mut NameStack) -> Option<CompileError>,
+) -> Option<CompileError> {
+    match node.try_for_each_child_fragment(|fragment| match visit(fragment, scope) {
+        Some(error) => std::ops::ControlFlow::Break(error),
+        None => std::ops::ControlFlow::Continue(()),
+    }) {
+        std::ops::ControlFlow::Break(error) => Some(error),
+        std::ops::ControlFlow::Continue(()) => None,
+    }
+}
+
 pub(super) fn detect_template_directive_errors_from_root(
     source: &str,
     root: &Root,
@@ -1401,9 +1347,9 @@ pub(super) fn detect_template_directive_errors_from_root(
 ) -> Option<CompileError> {
     let mut context = ValidationContext {
         imports: collect_imported_bindings(root),
-        immutable: Names::from_items(collect_script_constant_bindings(root)),
-        snippets: Names::default(),
-        each: Names::default(),
+        immutable: NameStack::from_items(collect_script_constant_bindings(root)),
+        snippets: NameStack::default(),
+        each: NameStack::default(),
         runes: runes_mode,
     };
     detect_template_directive_errors_in_fragment(source, &root.fragment, None, &mut context)
@@ -1432,7 +1378,7 @@ pub(super) fn detect_const_tag_errors_from_root(
 
 struct ConstCycle<'a> {
     tag: &'a ConstTag,
-    names: Vec<String>,
+    names: Box<[Arc<str>]>,
 }
 
 pub(super) fn detect_bind_invalid_value_from_root(
@@ -1440,7 +1386,7 @@ pub(super) fn detect_bind_invalid_value_from_root(
     root: &Root,
     runes_mode: bool,
 ) -> Option<CompileError> {
-    let mut bindable = Names::from_items(collect_bindable_bindings(root, runes_mode));
+    let mut bindable = NameStack::from_items(collect_bindable_bindings(root, runes_mode));
     detect_bind_invalid_value_in_fragment(source, &root.fragment, &mut bindable)
 }
 
@@ -1449,14 +1395,14 @@ pub(super) fn detect_bind_invalid_value_warn_mode_from_root(
     root: &Root,
     runes_mode: bool,
 ) -> Option<CompileError> {
-    let mut bindable = Names::from_items(collect_bindable_bindings(root, runes_mode));
+    let mut bindable = NameStack::from_items(collect_bindable_bindings(root, runes_mode));
     bindable.extend(collect_script_constant_bindings(root));
     detect_bind_invalid_value_in_fragment(source, &root.fragment, &mut bindable)
 }
 
 pub(super) fn detect_constant_binding_from_root(source: &str, root: &Root) -> Option<CompileError> {
-    let immutable = Names::from_items(collect_script_constant_bindings(root));
-    let mut scope = Names::default();
+    let immutable = NameStack::from_items(collect_script_constant_bindings(root));
+    let mut scope = NameStack::default();
     detect_constant_binding_in_fragment(source, &root.fragment, &immutable, &mut scope)
 }
 
@@ -1467,23 +1413,19 @@ fn compile_error_custom(
     start: usize,
     end: usize,
 ) -> CompileError {
-    let (start_line, start_column) = line_column_at_offset(source, start);
-    let (end_line, end_column) = line_column_at_offset(source, end);
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
 
     CompileError {
         code: Arc::from(code),
         message: message.into(),
-        position: Some(Box::new(SourcePosition { start, end })),
-        start: Some(Box::new(SourceLocation {
-            line: start_line,
-            column: start_column,
-            character: start,
+        position: Some(Box::new(SourcePosition {
+            start: start_location.character,
+            end: end_location.character,
         })),
-        end: Some(Box::new(SourceLocation {
-            line: end_line,
-            column: end_column,
-            character: end,
-        })),
+        start: Some(Box::new(start_location)),
+        end: Some(Box::new(end_location)),
         filename: None,
     }
 }
@@ -2220,13 +2162,6 @@ fn detect_svelte_head_illegal_attribute_in_fragment(
 ) -> Option<CompileError> {
     for node in fragment.nodes.iter() {
         match node {
-            Node::RegularElement(element) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &element.fragment)
-                {
-                    return Some(error);
-                }
-            }
             Node::SvelteHead(el) => {
                 if let Some(attribute) = el.attributes.first() {
                     let (start, end) = attribute_span(attribute);
@@ -2244,101 +2179,13 @@ fn detect_svelte_head_illegal_attribute_in_fragment(
                     return Some(error);
                 }
             }
-            Node::Component(component) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &component.fragment)
-                {
-                    return Some(error);
-                }
-            }
-            Node::SlotElement(slot) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &slot.fragment)
-                {
-                    return Some(error);
-                }
-            }
-            Node::SvelteBody(_)
-            | Node::SvelteWindow(_)
-            | Node::SvelteDocument(_)
-            | Node::SvelteComponent(_)
-            | Node::SvelteElement(_)
-            | Node::SvelteSelf(_)
-            | Node::SvelteFragment(_)
-            | Node::SvelteBoundary(_)
-            | Node::TitleElement(_) => {
-                let fragment = node.as_element().unwrap().fragment();
-                if let Some(error) =
+            _ => {
+                if let Some(error) = find_error_in_child_fragments(node, |fragment| {
                     detect_svelte_head_illegal_attribute_in_fragment(source, fragment)
-                {
+                }) {
                     return Some(error);
                 }
             }
-            Node::IfBlock(block) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &block.consequent)
-                {
-                    return Some(error);
-                }
-                if let Some(alternate) = block.alternate.as_deref() {
-                    let result = match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_svelte_head_illegal_attribute_in_fragment(source, fragment)
-                        }
-                        Alternate::IfBlock(block) => {
-                            detect_svelte_head_illegal_attribute_in_fragment(
-                                source,
-                                &block.consequent,
-                            )
-                        }
-                    };
-                    if result.is_some() {
-                        return result;
-                    }
-                }
-            }
-            Node::EachBlock(block) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &block.body)
-                {
-                    return Some(error);
-                }
-                if let Some(fallback) = block.fallback.as_ref()
-                    && let Some(error) =
-                        detect_svelte_head_illegal_attribute_in_fragment(source, fallback)
-                {
-                    return Some(error);
-                }
-            }
-            Node::AwaitBlock(block) => {
-                for branch in [
-                    block.pending.as_ref(),
-                    block.then.as_ref(),
-                    block.catch.as_ref(),
-                ] {
-                    if let Some(fragment) = branch
-                        && let Some(error) =
-                            detect_svelte_head_illegal_attribute_in_fragment(source, fragment)
-                    {
-                        return Some(error);
-                    }
-                }
-            }
-            Node::SnippetBlock(block) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &block.body)
-                {
-                    return Some(error);
-                }
-            }
-            Node::KeyBlock(block) => {
-                if let Some(error) =
-                    detect_svelte_head_illegal_attribute_in_fragment(source, &block.fragment)
-                {
-                    return Some(error);
-                }
-            }
-            _ => {}
         }
     }
     None
@@ -2408,85 +2255,13 @@ fn detect_text_content_model_errors_in_fragment(
                     ));
                 }
             }
-            Node::Component(_)
-            | Node::SlotElement(_)
-            | Node::SvelteHead(_)
-            | Node::SvelteBody(_)
-            | Node::SvelteWindow(_)
-            | Node::SvelteDocument(_)
-            | Node::SvelteComponent(_)
-            | Node::SvelteElement(_)
-            | Node::SvelteSelf(_)
-            | Node::SvelteFragment(_)
-            | Node::SvelteBoundary(_) => {
-                let fragment = node.as_element().unwrap().fragment();
-                if let Some(error) = detect_text_content_model_errors_in_fragment(source, fragment)
-                {
+            _ => {
+                if let Some(error) = find_error_in_child_fragments(node, |child| {
+                    detect_text_content_model_errors_in_fragment(source, child)
+                }) {
                     return Some(error);
                 }
             }
-            Node::IfBlock(block) => {
-                if let Some(error) =
-                    detect_text_content_model_errors_in_fragment(source, &block.consequent)
-                {
-                    return Some(error);
-                }
-                if let Some(alternate) = block.alternate.as_deref() {
-                    let result = match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_text_content_model_errors_in_fragment(source, fragment)
-                        }
-                        Alternate::IfBlock(block) => {
-                            detect_text_content_model_errors_in_fragment(source, &block.consequent)
-                        }
-                    };
-                    if result.is_some() {
-                        return result;
-                    }
-                }
-            }
-            Node::EachBlock(block) => {
-                if let Some(error) =
-                    detect_text_content_model_errors_in_fragment(source, &block.body)
-                {
-                    return Some(error);
-                }
-                if let Some(fallback) = block.fallback.as_ref()
-                    && let Some(error) =
-                        detect_text_content_model_errors_in_fragment(source, fallback)
-                {
-                    return Some(error);
-                }
-            }
-            Node::AwaitBlock(block) => {
-                for branch in [
-                    block.pending.as_ref(),
-                    block.then.as_ref(),
-                    block.catch.as_ref(),
-                ] {
-                    if let Some(fragment) = branch
-                        && let Some(error) =
-                            detect_text_content_model_errors_in_fragment(source, fragment)
-                    {
-                        return Some(error);
-                    }
-                }
-            }
-            Node::SnippetBlock(block) => {
-                if let Some(error) =
-                    detect_text_content_model_errors_in_fragment(source, &block.body)
-                {
-                    return Some(error);
-                }
-            }
-            Node::KeyBlock(block) => {
-                if let Some(error) =
-                    detect_text_content_model_errors_in_fragment(source, &block.fragment)
-                {
-                    return Some(error);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -2574,7 +2349,7 @@ pub(super) fn detect_snippet_shadowing_prop_from_root(
             .attributes
             .iter()
             .filter_map(component_prop_attribute_name)
-            .collect::<HashSet<_>>();
+            .collect::<NameSet>();
         if prop_names.is_empty() {
             continue;
         }
@@ -2595,25 +2370,25 @@ pub(super) fn detect_snippet_shadowing_prop_from_root(
     None
 }
 
-fn component_prop_attribute_name(attribute: &Attribute) -> Option<String> {
+fn component_prop_attribute_name(attribute: &Attribute) -> Option<Arc<str>> {
     match attribute {
-        Attribute::Attribute(attribute) => Some(attribute.name.to_string()),
-        Attribute::BindDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::ClassDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::StyleDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::LetDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::OnDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::AnimateDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::UseDirective(attribute) => Some(attribute.name.to_string()),
-        Attribute::TransitionDirective(attribute) => Some(attribute.name.to_string()),
+        Attribute::Attribute(attribute) => Some(attribute.name.clone()),
+        Attribute::BindDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::ClassDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::StyleDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::LetDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::OnDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::AnimateDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::UseDirective(attribute) => Some(attribute.name.clone()),
+        Attribute::TransitionDirective(attribute) => Some(attribute.name.clone()),
         Attribute::SpreadAttribute(_) | Attribute::AttachTag(_) => None,
     }
 }
 
 fn find_component_scope_snippet_with_name(
     fragment: &Fragment,
-    names: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    names: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     fragment.search(|entry, _| match entry {
         Entry::Node(Node::Component(_)) => Search::Skip,
         Entry::Node(Node::SnippetBlock(block)) => {
@@ -2621,7 +2396,7 @@ fn find_component_scope_snippet_with_name(
                 return Search::Continue;
             };
             if names.contains(name.as_ref()) {
-                Search::Found((name.to_string(), block.start, block.end))
+                Search::Found((name, block.start, block.end))
             } else {
                 Search::Continue
             }
@@ -2679,20 +2454,12 @@ pub(super) fn detect_additional_template_structure_errors_from_root(
     detect_additional_template_structure_errors_in_fragment(
         source,
         &root.fragment,
-        false,
-        false,
-        false,
-        false,
-        false,
-        None,
-        false,
+        StructureContext::default(),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn detect_additional_template_structure_errors_in_fragment(
-    source: &str,
-    fragment: &Fragment,
+#[derive(Clone, Default)]
+struct StructureContext {
     inside_anchor: bool,
     inside_paragraph: bool,
     inside_textarea: bool,
@@ -2700,25 +2467,58 @@ fn detect_additional_template_structure_errors_in_fragment(
     inside_dd: bool,
     direct_parent_name: Option<Arc<str>>,
     direct_parent_is_custom_element: bool,
+}
+
+impl StructureContext {
+    fn with_element(&self, element: &RegularElement, is_custom_element: bool) -> Self {
+        Self {
+            inside_anchor: self.inside_anchor || element.name.as_ref() == "a",
+            inside_paragraph: self.inside_paragraph || element.name.as_ref() == "p",
+            inside_textarea: self.inside_textarea || element.name.as_ref() == "textarea",
+            inside_form: self.inside_form || element.name.as_ref() == "form",
+            inside_dd: if element.name.as_ref() == "dl" || is_custom_element {
+                false
+            } else if element.name.as_ref() == "dd" {
+                true
+            } else {
+                self.inside_dd
+            },
+            direct_parent_name: Some(element.name.clone()),
+            direct_parent_is_custom_element: is_custom_element,
+        }
+    }
+
+    fn inside_control_branch(&self) -> Self {
+        Self {
+            inside_form: false,
+            ..self.clone()
+        }
+    }
+}
+
+fn detect_additional_template_structure_errors_in_fragment(
+    source: &str,
+    fragment: &Fragment,
+    context: StructureContext,
 ) -> Option<CompileError> {
     for node in &fragment.nodes {
         match node {
             Node::Text(text)
-                if direct_parent_name.as_deref() == Some("tbody")
+                if context.direct_parent_name.as_deref() == Some("tbody")
                     && text.data.chars().any(|ch| !ch.is_whitespace()) =>
             {
                 return Some(tbody_child_invalid_placement_error(
                     source, "#text", text.start, text.end,
                 ));
             }
-            Node::ExpressionTag(tag) if direct_parent_name.as_deref() == Some("tbody") => {
+            Node::ExpressionTag(tag) if context.direct_parent_name.as_deref() == Some("tbody") => {
                 return Some(tbody_child_invalid_placement_error(
                     source, "#text", tag.start, tag.end,
                 ));
             }
             Node::RegularElement(element) => {
                 let is_custom_element = is_custom_element_name(element.name.as_ref());
-                if inside_anchor && element.name.as_ref() == "a" {
+                if context.inside_anchor && element.name.as_ref() == "a" {
                     return Some(node_invalid_placement_error(
                         source,
                         "a",
@@ -2727,7 +2527,9 @@ fn detect_additional_template_structure_errors_in_fragment(
                         element.end,
                     ));
                 }
-                if inside_paragraph && is_paragraph_forbidden_descendant(element.name.as_ref()) {
+                if context.inside_paragraph
+                    && is_paragraph_forbidden_descendant(element.name.as_ref())
+                {
                     return Some(node_invalid_placement_error(
                         source,
                         element.name.as_ref(),
@@ -2736,7 +2538,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                         element.end,
                     ));
                 }
-                if inside_form && element.name.as_ref() == "form" {
+                if context.inside_form && element.name.as_ref() == "form" {
                     return Some(node_invalid_placement_error(
                         source,
                         "form",
@@ -2745,7 +2547,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                         element.end,
                     ));
                 }
-                if inside_dd && element.name.as_ref() == "dt" {
+                if context.inside_dd && element.name.as_ref() == "dt" {
                     return Some(node_invalid_placement_error(
                         source,
                         "dt",
@@ -2754,7 +2556,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                         element.end,
                     ));
                 }
-                if direct_parent_name.as_deref() == Some("tbody")
+                if context.direct_parent_name.as_deref() == Some("tbody")
                     && !is_custom_element
                     && !matches!(
                         element.name.as_ref(),
@@ -2768,9 +2570,9 @@ fn detect_additional_template_structure_errors_in_fragment(
                         element.end,
                     ));
                 }
-                if let Some(parent) = direct_parent_name.as_deref()
+                if let Some(parent) = context.direct_parent_name.as_deref()
                     && element.name.as_ref() == "tbody"
-                    && !direct_parent_is_custom_element
+                    && !context.direct_parent_is_custom_element
                     && parent != "table"
                 {
                     return Some(tbody_parent_invalid_placement_error(
@@ -2786,27 +2588,10 @@ fn detect_additional_template_structure_errors_in_fragment(
                     return Some(error);
                 }
 
-                let child_inside_anchor = inside_anchor || element.name.as_ref() == "a";
-                let child_inside_paragraph = inside_paragraph || element.name.as_ref() == "p";
-                let child_inside_textarea = inside_textarea || element.name.as_ref() == "textarea";
-                let child_inside_form = inside_form || element.name.as_ref() == "form";
-                let child_inside_dd = if element.name.as_ref() == "dl" || is_custom_element {
-                    false
-                } else if element.name.as_ref() == "dd" {
-                    true
-                } else {
-                    inside_dd
-                };
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &element.fragment,
-                    child_inside_anchor,
-                    child_inside_paragraph,
-                    child_inside_textarea,
-                    child_inside_form,
-                    child_inside_dd,
-                    Some(element.name.clone()),
-                    is_custom_element,
+                    context.with_element(element, is_custom_element),
                 ) {
                     return Some(error);
                 }
@@ -2815,13 +2600,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &component.fragment,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    inside_form,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2830,13 +2609,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &slot.fragment,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    inside_form,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2848,13 +2621,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &el.fragment,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    inside_form,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2869,13 +2636,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     el.fragment(),
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    inside_form,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2891,31 +2652,20 @@ fn detect_additional_template_structure_errors_in_fragment(
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     fragment,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    inside_form,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.clone(),
                 ) {
                     return Some(error);
                 }
             }
             Node::IfBlock(block) => {
-                if inside_textarea {
+                if context.inside_textarea {
                     return Some(textarea_block_error(source, "if", block.start));
                 }
+                let branch_context = context.inside_control_branch();
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &block.consequent,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    false,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    branch_context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2925,26 +2675,14 @@ fn detect_additional_template_structure_errors_in_fragment(
                             detect_additional_template_structure_errors_in_fragment(
                                 source,
                                 fragment,
-                                inside_anchor,
-                                inside_paragraph,
-                                inside_textarea,
-                                false,
-                                inside_dd,
-                                direct_parent_name.clone(),
-                                direct_parent_is_custom_element,
+                                branch_context.clone(),
                             )
                         }
                         Alternate::IfBlock(block) => {
                             detect_additional_template_structure_errors_in_fragment(
                                 source,
                                 &block.consequent,
-                                inside_anchor,
-                                inside_paragraph,
-                                inside_textarea,
-                                false,
-                                inside_dd,
-                                direct_parent_name.clone(),
-                                direct_parent_is_custom_element,
+                                branch_context.clone(),
                             )
                         }
                     };
@@ -2954,19 +2692,14 @@ fn detect_additional_template_structure_errors_in_fragment(
                 }
             }
             Node::EachBlock(block) => {
-                if inside_textarea {
+                if context.inside_textarea {
                     return Some(textarea_block_error(source, "each", block.start));
                 }
+                let branch_context = context.inside_control_branch();
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &block.body,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    false,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    branch_context.clone(),
                 ) {
                     return Some(error);
                 }
@@ -2974,22 +2707,17 @@ fn detect_additional_template_structure_errors_in_fragment(
                     && let Some(error) = detect_additional_template_structure_errors_in_fragment(
                         source,
                         fallback,
-                        inside_anchor,
-                        inside_paragraph,
-                        inside_textarea,
-                        false,
-                        inside_dd,
-                        direct_parent_name.clone(),
-                        direct_parent_is_custom_element,
+                        branch_context.clone(),
                     )
                 {
                     return Some(error);
                 }
             }
             Node::AwaitBlock(block) => {
-                if inside_textarea {
+                if context.inside_textarea {
                     return Some(textarea_block_error(source, "await", block.start));
                 }
+                let branch_context = context.inside_control_branch();
                 for branch in [
                     block.pending.as_ref(),
                     block.then.as_ref(),
@@ -2999,13 +2727,7 @@ fn detect_additional_template_structure_errors_in_fragment(
                         && let Some(error) = detect_additional_template_structure_errors_in_fragment(
                             source,
                             fragment,
-                            inside_anchor,
-                            inside_paragraph,
-                            inside_textarea,
-                            false,
-                            inside_dd,
-                            direct_parent_name.clone(),
-                            direct_parent_is_custom_element,
+                            branch_context.clone(),
                         )
                     {
                         return Some(error);
@@ -3013,42 +2735,30 @@ fn detect_additional_template_structure_errors_in_fragment(
                 }
             }
             Node::SnippetBlock(block) => {
-                if inside_textarea {
+                if context.inside_textarea {
                     return Some(textarea_block_error(source, "snippet", block.start));
                 }
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &block.body,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    false,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.inside_control_branch(),
                 ) {
                     return Some(error);
                 }
             }
             Node::KeyBlock(block) => {
-                if inside_textarea {
+                if context.inside_textarea {
                     return Some(textarea_block_error(source, "key", block.start));
                 }
                 if let Some(error) = detect_additional_template_structure_errors_in_fragment(
                     source,
                     &block.fragment,
-                    inside_anchor,
-                    inside_paragraph,
-                    inside_textarea,
-                    false,
-                    inside_dd,
-                    direct_parent_name.clone(),
-                    direct_parent_is_custom_element,
+                    context.inside_control_branch(),
                 ) {
                     return Some(error);
                 }
             }
-            Node::HtmlTag(tag) if inside_textarea => {
+            Node::HtmlTag(tag) if context.inside_textarea => {
                 return Some(compile_error_custom(
                     source,
                     "tag_invalid_placement",
@@ -3427,57 +3137,53 @@ struct EachContext {
     animation_relevant_children: usize,
 }
 
-#[derive(Clone, Copy)]
-struct Mark(usize);
-
-#[derive(Default)]
-struct Names(Vec<Arc<str>>);
-
-impl Names {
-    fn from_items<I>(items: I) -> Self
-    where
-        I: IntoIterator,
-        I::Item: Into<Arc<str>>,
-    {
-        Self(items.into_iter().map(Into::into).collect())
+impl NameStack {
+    fn extend_expression_bindings(&mut self, expression: &Expression) {
+        self.extend(expression_binding_names(expression));
     }
 
-    fn mark(&self) -> Mark {
-        Mark(self.0.len())
+    fn extend_optional_expression_bindings(&mut self, expression: Option<&Expression>) {
+        if let Some(expression) = expression {
+            self.extend_expression_bindings(expression);
+        }
     }
 
-    fn reset(&mut self, mark: Mark) {
-        self.0.truncate(mark.0);
+    fn extend_optional_name(&mut self, name: Option<&Arc<str>>) {
+        if let Some(name) = name {
+            self.push(name.clone());
+        }
     }
 
-    fn push(&mut self, name: Arc<str>) {
-        self.0.push(name);
+    fn extend_each_block_bindings(&mut self, block: &EachBlock) {
+        if let Some(context) = block.context.as_ref() {
+            self.extend_expression_bindings(context);
+        }
+        self.extend_optional_name(block.index.as_ref());
     }
 
-    fn extend<I>(&mut self, items: I)
-    where
-        I: IntoIterator<Item = Arc<str>>,
-    {
-        self.0.extend(items);
+    fn extend_snippet_parameters(&mut self, block: &SnippetBlock) {
+        for parameter in &block.parameters {
+            self.extend_expression_bindings(parameter);
+        }
     }
 
-    fn contains(&self, name: &str) -> bool {
-        self.0.iter().any(|item| item.as_ref() == name)
+    fn extend_const_tag_identifiers(&mut self, tag: &ConstTag) {
+        self.extend(const_tag_declared_identifiers(tag));
     }
 }
 
 #[derive(Clone, Copy)]
 struct ContextMark {
-    immutable: Mark,
-    snippets: Mark,
-    each: Mark,
+    immutable: NameMark,
+    snippets: NameMark,
+    each: NameMark,
 }
 
 struct ValidationContext {
-    imports: HashSet<String>,
-    immutable: Names,
-    snippets: Names,
-    each: Names,
+    imports: NameSet,
+    immutable: NameStack,
+    snippets: NameStack,
+    each: NameStack,
     runes: bool,
 }
 
@@ -3496,6 +3202,18 @@ impl ValidationContext {
         self.each.reset(mark.each);
     }
 
+    fn with_frame<T>(
+        &mut self,
+        extend: impl FnOnce(&mut Self),
+        visit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let mark = self.mark();
+        extend(self);
+        let result = visit(self);
+        self.reset(mark);
+        result
+    }
+
     fn push_component_lets(&mut self, component: &Component) {
         for attribute in &component.attributes {
             if let Attribute::LetDirective(directive) = attribute {
@@ -3507,32 +3225,64 @@ impl ValidationContext {
 
     fn push_snippet_params(&mut self, block: &SnippetBlock) {
         for parameter in &block.parameters {
-            let names = expression_binding_names(parameter);
-            self.immutable.extend(names.iter().cloned());
-            self.snippets.extend(names);
+            self.immutable.extend_expression_bindings(parameter);
+            self.snippets.extend_expression_bindings(parameter);
         }
     }
 
     fn push_each_bindings(&mut self, block: &EachBlock) {
-        if let Some(context) = block.context.as_ref() {
-            self.each.extend(expression_binding_names(context));
-        }
-        if let Some(index) = &block.index {
-            self.each.push(index.clone());
-        }
+        self.each.extend_each_block_bindings(block);
     }
 
     fn push_const(&mut self, tag: &ConstTag) {
-        self.immutable.extend(const_tag_declared_identifiers(tag));
+        self.immutable.extend_const_tag_identifiers(tag);
+    }
+
+    fn with_component_lets<T>(
+        &mut self,
+        component: &Component,
+        visit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.with_frame(|context| context.push_component_lets(component), visit)
+    }
+
+    fn with_snippet_params<T>(
+        &mut self,
+        block: &SnippetBlock,
+        visit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.with_frame(|context| context.push_snippet_params(block), visit)
+    }
+
+    fn with_each_bindings<T>(
+        &mut self,
+        block: &EachBlock,
+        visit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.with_frame(|context| context.push_each_bindings(block), visit)
+    }
+
+    fn with_await_binding<T>(
+        &mut self,
+        binding: Option<&Expression>,
+        visit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.with_frame(
+            |context| {
+                context
+                    .immutable
+                    .extend_optional_expression_bindings(binding)
+            },
+            visit,
+        )
     }
 }
 
 #[derive(Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
 enum AssignmentKind {
-    ConstantAssignment,
-    SnippetParameterAssignment,
-    EachItemInvalidAssignment,
+    Constant,
+    SnippetParameter,
+    EachItemInvalid,
 }
 
 #[derive(Clone, Copy)]
@@ -3548,273 +3298,275 @@ fn detect_template_directive_errors_in_fragment(
     each: Option<EachContext>,
     context: &mut ValidationContext,
 ) -> Option<CompileError> {
-    let mark = context.mark();
-
-    for node in &fragment.nodes {
-        match node {
-            Node::RegularElement(element) => {
-                if let Some(error) = detect_element_directive_errors(source, element, each, context)
-                {
-                    return Some(error);
-                }
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &element.fragment,
-                    each,
-                    context,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::Component(component) => {
-                let mark = context.mark();
-                context.push_component_lets(component);
-
-                if let Some(error) = detect_component_directive_errors(source, component, context) {
-                    return Some(error);
-                }
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &component.fragment,
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-
-                context.reset(mark);
-            }
-            Node::SlotElement(slot) => {
-                for attribute in &slot.attributes {
-                    let Attribute::Attribute(attribute) = attribute else {
-                        continue;
-                    };
-                    if attribute.name.as_ref() != "name" {
-                        continue;
-                    }
-                    let Some(name) = static_attribute_text(attribute) else {
-                        return Some(compile_error_custom(
-                            source,
-                            "slot_element_invalid_name",
-                            "slot attribute must be a static value",
-                            attribute.start,
-                            attribute.end,
-                        ));
-                    };
-                    if name == "default" {
-                        return Some(compile_error_custom(
-                            source,
-                            "slot_element_invalid_name_default",
-                            "`default` is a reserved word — it cannot be used as a slot name",
-                            attribute.start,
-                            attribute.end,
-                        ));
-                    }
-                }
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &slot.fragment,
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::SvelteWindow(_) | Node::SvelteDocument(_) => {
-                let el = node.as_element().unwrap();
-                for attribute in el.attributes() {
-                    if let Attribute::BindDirective(directive) = attribute {
+    context.with_frame(
+        |_| {},
+        |context| {
+            for node in &fragment.nodes {
+                match node {
+                    Node::RegularElement(element) => {
                         if let Some(error) =
-                            detect_bind_target_error_for_name(source, el.name(), directive)
+                            detect_element_directive_errors(source, element, each, context)
                         {
                             return Some(error);
                         }
-                        if let Some(error) =
-                            detect_bind_directive_error(source, directive, context, true)
-                        {
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            &element.fragment,
+                            each,
+                            context,
+                        ) {
                             return Some(error);
                         }
                     }
-                }
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    el.fragment(),
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::SvelteElement(element) => {
-                if let Some(error) = detect_element_directive_errors(source, element, each, context)
-                {
-                    return Some(error);
-                }
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &element.fragment,
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::SvelteHead(_)
-            | Node::SvelteBody(_)
-            | Node::SvelteComponent(_)
-            | Node::SvelteSelf(_)
-            | Node::SvelteFragment(_)
-            | Node::SvelteBoundary(_)
-            | Node::TitleElement(_) => {
-                let fragment = node.as_element().unwrap().fragment();
-                if let Some(error) =
-                    detect_template_directive_errors_in_fragment(source, fragment, None, context)
-                {
-                    return Some(error);
-                }
-            }
-            Node::IfBlock(block) => {
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &block.consequent,
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-                if let Some(alternate) = &block.alternate {
-                    match alternate.as_ref() {
-                        Alternate::Fragment(fragment) => {
-                            if let Some(error) = detect_template_directive_errors_in_fragment(
-                                source, fragment, None, context,
-                            ) {
+                    Node::Component(component) => {
+                        if let Some(error) = context.with_component_lets(component, |context| {
+                            if let Some(error) =
+                                detect_component_directive_errors(source, component, context)
+                            {
                                 return Some(error);
                             }
-                        }
-                        Alternate::IfBlock(elseif) => {
-                            if let Some(error) = detect_template_directive_errors_in_fragment(
+                            detect_template_directive_errors_in_fragment(
                                 source,
-                                &elseif.consequent,
+                                &component.fragment,
                                 None,
                                 context,
-                            ) {
-                                return Some(error);
+                            )
+                        }) {
+                            return Some(error);
+                        }
+                    }
+                    Node::SlotElement(slot) => {
+                        for attribute in &slot.attributes {
+                            let Attribute::Attribute(attribute) = attribute else {
+                                continue;
+                            };
+                            if attribute.name.as_ref() != "name" {
+                                continue;
+                            }
+                            let Some(name) = static_attribute_text(attribute) else {
+                                return Some(compile_error_custom(
+                                    source,
+                                    "slot_element_invalid_name",
+                                    "slot attribute must be a static value",
+                                    attribute.start,
+                                    attribute.end,
+                                ));
+                            };
+                            if name == "default" {
+                                return Some(compile_error_custom(
+                                    source,
+                                    "slot_element_invalid_name_default",
+                                    "`default` is a reserved word — it cannot be used as a slot name",
+                                    attribute.start,
+                                    attribute.end,
+                                ));
+                            }
+                        }
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            &slot.fragment,
+                            None,
+                            context,
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::SvelteWindow(_) | Node::SvelteDocument(_) => {
+                        let el = node.as_element().unwrap();
+                        for attribute in el.attributes() {
+                            if let Attribute::BindDirective(directive) = attribute {
+                                if let Some(error) =
+                                    detect_bind_target_error_for_name(source, el.name(), directive)
+                                {
+                                    return Some(error);
+                                }
+                                if let Some(error) =
+                                    detect_bind_directive_error(source, directive, context, true)
+                                {
+                                    return Some(error);
+                                }
+                            }
+                        }
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            el.fragment(),
+                            None,
+                            context,
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::SvelteElement(element) => {
+                        if let Some(error) =
+                            detect_element_directive_errors(source, element, each, context)
+                        {
+                            return Some(error);
+                        }
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            &element.fragment,
+                            None,
+                            context,
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::SvelteHead(_)
+                    | Node::SvelteBody(_)
+                    | Node::SvelteComponent(_)
+                    | Node::SvelteSelf(_)
+                    | Node::SvelteFragment(_)
+                    | Node::SvelteBoundary(_)
+                    | Node::TitleElement(_) => {
+                        let fragment = node.as_element().unwrap().fragment();
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source, fragment, None, context,
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::IfBlock(block) => {
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            &block.consequent,
+                            None,
+                            context,
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(alternate) = &block.alternate {
+                            match alternate.as_ref() {
+                                Alternate::Fragment(fragment) => {
+                                    if let Some(error) = detect_template_directive_errors_in_fragment(
+                                        source, fragment, None, context,
+                                    ) {
+                                        return Some(error);
+                                    }
+                                }
+                                Alternate::IfBlock(elseif) => {
+                                    if let Some(error) = detect_template_directive_errors_in_fragment(
+                                        source,
+                                        &elseif.consequent,
+                                        None,
+                                        context,
+                                    ) {
+                                        return Some(error);
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
-            Node::KeyBlock(block) => {
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &block.fragment,
-                    None,
-                    context,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::AwaitBlock(block) => {
-                if let Some(pending) = &block.pending
-                    && let Some(error) =
-                        detect_template_directive_errors_in_fragment(source, pending, None, context)
-                {
-                    return Some(error);
-                }
-                if let Some(then) = &block.then {
-                    let mark = context.mark();
-                    if let Some(value) = block.value.as_ref() {
-                        context.immutable.extend(expression_binding_names(value));
-                    }
-                    if let Some(error) =
-                        detect_template_directive_errors_in_fragment(source, then, None, context)
-                    {
-                        return Some(error);
-                    }
-                    context.reset(mark);
-                }
-                if let Some(catch) = &block.catch {
-                    let mark = context.mark();
-                    if let Some(error) = block.error.as_ref() {
-                        context.immutable.extend(expression_binding_names(error));
-                    }
-                    if let Some(error) =
-                        detect_template_directive_errors_in_fragment(source, catch, None, context)
-                    {
-                        return Some(error);
-                    }
-                    context.reset(mark);
-                }
-            }
-            Node::SnippetBlock(block) => {
-                let mark = context.mark();
-                context.push_snippet_params(block);
-                if let Some(error) =
-                    detect_template_directive_errors_in_fragment(source, &block.body, None, context)
-                {
-                    return Some(error);
-                }
-                context.reset(mark);
-            }
-            Node::EachBlock(block) => {
-                let body_each = EachContext {
-                    keyed: block.key.is_some(),
-                    animation_relevant_children: count_animation_relevant_nodes(&block.body),
-                };
-
-                let mark = context.mark();
-                context.push_each_bindings(block);
-
-                if let Some(error) = detect_template_directive_errors_in_fragment(
-                    source,
-                    &block.body,
-                    Some(body_each),
-                    context,
-                ) {
-                    return Some(error);
-                }
-                context.reset(mark);
-
-                if let Some(fallback) = &block.fallback
-                    && let Some(error) = detect_template_directive_errors_in_fragment(
-                        source, fallback, None, context,
-                    )
-                {
-                    return Some(error);
-                }
-            }
-            Node::ConstTag(tag) => {
-                context.push_const(tag);
-            }
-            Node::ExpressionTag(tag) => {
-                if let Some(violation) =
-                    find_assignment_violation_in_template_expression(&tag.expression, context)
-                {
-                    let kind = match violation.kind {
-                        AssignmentKind::ConstantAssignment => {
-                            CompilerDiagnosticKind::ConstantAssignment
+                    Node::KeyBlock(block) => {
+                        if let Some(error) = detect_template_directive_errors_in_fragment(
+                            source,
+                            &block.fragment,
+                            None,
+                            context,
+                        ) {
+                            return Some(error);
                         }
-                        AssignmentKind::SnippetParameterAssignment => {
-                            CompilerDiagnosticKind::SnippetParameterAssignment
+                    }
+                    Node::AwaitBlock(block) => {
+                        if let Some(pending) = &block.pending
+                            && let Some(error) = detect_template_directive_errors_in_fragment(
+                                source, pending, None, context,
+                            )
+                        {
+                            return Some(error);
                         }
-                        AssignmentKind::EachItemInvalidAssignment => {
-                            CompilerDiagnosticKind::EachItemInvalidAssignment
+                        if let Some(then) = &block.then
+                            && let Some(error) = context.with_await_binding(
+                                block.value.as_ref(),
+                                |context| {
+                                    detect_template_directive_errors_in_fragment(
+                                        source, then, None, context,
+                                    )
+                                },
+                            )
+                        {
+                            return Some(error);
                         }
-                    };
-                    return Some(compile_error_with_range(
-                        source,
-                        kind,
-                        violation.start,
-                        violation.end,
-                    ));
+                        if let Some(catch) = &block.catch
+                            && let Some(error) = context.with_await_binding(
+                                block.error.as_ref(),
+                                |context| {
+                                    detect_template_directive_errors_in_fragment(
+                                        source, catch, None, context,
+                                    )
+                                },
+                            )
+                        {
+                            return Some(error);
+                        }
+                    }
+                    Node::SnippetBlock(block) => {
+                        if let Some(error) = context.with_snippet_params(block, |context| {
+                            detect_template_directive_errors_in_fragment(
+                                source,
+                                &block.body,
+                                None,
+                                context,
+                            )
+                        }) {
+                            return Some(error);
+                        }
+                    }
+                    Node::EachBlock(block) => {
+                        let body_each = EachContext {
+                            keyed: block.key.is_some(),
+                            animation_relevant_children: count_animation_relevant_nodes(&block.body),
+                        };
+
+                        if let Some(error) = context.with_each_bindings(block, |context| {
+                            detect_template_directive_errors_in_fragment(
+                                source,
+                                &block.body,
+                                Some(body_each),
+                                context,
+                            )
+                        }) {
+                            return Some(error);
+                        }
+
+                        if let Some(fallback) = &block.fallback
+                            && let Some(error) = detect_template_directive_errors_in_fragment(
+                                source, fallback, None, context,
+                            )
+                        {
+                            return Some(error);
+                        }
+                    }
+                    Node::ConstTag(tag) => {
+                        context.push_const(tag);
+                    }
+                    Node::ExpressionTag(tag) => {
+                        if let Some(violation) =
+                            find_assignment_violation_in_template_expression(&tag.expression, context)
+                        {
+                            let kind = match violation.kind {
+                                AssignmentKind::Constant => CompilerDiagnosticKind::ConstantAssignment,
+                                AssignmentKind::SnippetParameter => {
+                                    CompilerDiagnosticKind::SnippetParameterAssignment
+                                }
+                                AssignmentKind::EachItemInvalid => {
+                                    CompilerDiagnosticKind::EachItemInvalidAssignment
+                                }
+                            };
+                            return Some(compile_error_with_range(
+                                source,
+                                kind,
+                                violation.start,
+                                violation.end,
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
-        }
-    }
 
-    context.reset(mark);
-    None
+            None
+        },
+    )
 }
 
 pub(super) fn detect_attribute_invalid_name(source: &str, root: &Root) -> Option<CompileError> {
@@ -3845,41 +3597,9 @@ fn detect_attribute_syntax_in_node(source: &str, node: &Node) -> Option<CompileE
         Node::SlotElement(slot) => {
             detect_attribute_syntax_in_element(source, &slot.attributes, &slot.fragment)
         }
-        Node::IfBlock(block) => detect_attribute_syntax_in_fragment(source, &block.consequent)
-            .or_else(|| {
-                block
-                    .alternate
-                    .as_deref()
-                    .and_then(|alternate| match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_attribute_syntax_in_fragment(source, fragment)
-                        }
-                        Alternate::IfBlock(block) => {
-                            detect_attribute_syntax_in_node(source, &Node::IfBlock(block.clone()))
-                        }
-                    })
-            }),
-        Node::EachBlock(block) => {
-            detect_attribute_syntax_in_fragment(source, &block.body).or_else(|| {
-                block
-                    .fallback
-                    .as_ref()
-                    .and_then(|fragment| detect_attribute_syntax_in_fragment(source, fragment))
-            })
-        }
-        Node::KeyBlock(block) => detect_attribute_syntax_in_fragment(source, &block.fragment),
-        Node::AwaitBlock(block) => {
-            for branch in [&block.pending, &block.then, &block.catch] {
-                if let Some(fragment) = branch.as_ref()
-                    && let Some(error) = detect_attribute_syntax_in_fragment(source, fragment)
-                {
-                    return Some(error);
-                }
-            }
-            None
-        }
-        Node::SnippetBlock(block) => detect_attribute_syntax_in_fragment(source, &block.body),
-        _ => None,
+        _ => find_error_in_child_fragments(node, |fragment| {
+            detect_attribute_syntax_in_fragment(source, fragment)
+        }),
     }
 }
 
@@ -4005,16 +3725,9 @@ fn detect_attribute_invalid_name_in_node(source: &str, node: &Node) -> Option<Co
             {
                 return Some(error);
             }
-            detect_attribute_invalid_name_in_fragment(source, &element.fragment)
-        }
-        Node::Component(component) => {
-            detect_attribute_invalid_name_in_fragment(source, &component.fragment)
-        }
-        Node::SvelteComponent(component) => {
-            detect_attribute_invalid_name_in_fragment(source, &component.fragment)
-        }
-        Node::SvelteSelf(component) => {
-            detect_attribute_invalid_name_in_fragment(source, &component.fragment)
+            find_error_in_child_fragments(node, |fragment| {
+                detect_attribute_invalid_name_in_fragment(source, fragment)
+            })
         }
         Node::SlotElement(slot) => {
             if let Some(error) =
@@ -4022,55 +3735,28 @@ fn detect_attribute_invalid_name_in_node(source: &str, node: &Node) -> Option<Co
             {
                 return Some(error);
             }
-            detect_attribute_invalid_name_in_fragment(source, &slot.fragment)
+            find_error_in_child_fragments(node, |fragment| {
+                detect_attribute_invalid_name_in_fragment(source, fragment)
+            })
         }
         Node::IfBlock(block) => {
-            if let Some(error) =
-                detect_attribute_invalid_name_in_fragment(source, &block.consequent)
-            {
-                return Some(error);
-            }
-            match &block.alternate {
-                Some(alternate) => match alternate.as_ref() {
-                    Alternate::Fragment(fragment) => {
-                        detect_attribute_invalid_name_in_fragment(source, fragment)
-                    }
-                    Alternate::IfBlock(block) => {
-                        detect_attribute_invalid_name_in_if_block(source, block)
-                    }
-                },
-                None => None,
-            }
+            detect_attribute_invalid_name_in_fragment(source, &block.consequent).or_else(|| {
+                block
+                    .alternate
+                    .as_deref()
+                    .and_then(|alternate| match alternate {
+                        Alternate::Fragment(fragment) => {
+                            detect_attribute_invalid_name_in_fragment(source, fragment)
+                        }
+                        Alternate::IfBlock(block) => {
+                            detect_attribute_invalid_name_in_if_block(source, block)
+                        }
+                    })
+            })
         }
-        Node::EachBlock(block) => {
-            if let Some(error) = detect_attribute_invalid_name_in_fragment(source, &block.body) {
-                return Some(error);
-            }
-            match &block.fallback {
-                Some(fragment) => detect_attribute_invalid_name_in_fragment(source, fragment),
-                None => None,
-            }
-        }
-        Node::KeyBlock(block) => detect_attribute_invalid_name_in_fragment(source, &block.fragment),
-        Node::AwaitBlock(block) => {
-            if let Some(pending) = &block.pending
-                && let Some(error) = detect_attribute_invalid_name_in_fragment(source, pending)
-            {
-                return Some(error);
-            }
-            if let Some(then) = &block.then
-                && let Some(error) = detect_attribute_invalid_name_in_fragment(source, then)
-            {
-                return Some(error);
-            }
-            if let Some(catch) = &block.catch {
-                detect_attribute_invalid_name_in_fragment(source, catch)
-            } else {
-                None
-            }
-        }
-        Node::SnippetBlock(block) => detect_attribute_invalid_name_in_fragment(source, &block.body),
-        _ => None,
+        _ => find_error_in_child_fragments(node, |fragment| {
+            detect_attribute_invalid_name_in_fragment(source, fragment)
+        }),
     }
 }
 
@@ -4282,13 +3968,11 @@ fn detect_element_directive_errors<E: Element>(
                     find_assignment_violation_in_template_expression(&directive.expression, context)
                 {
                     let kind = match violation.kind {
-                        AssignmentKind::ConstantAssignment => {
-                            CompilerDiagnosticKind::ConstantAssignment
-                        }
-                        AssignmentKind::SnippetParameterAssignment => {
+                        AssignmentKind::Constant => CompilerDiagnosticKind::ConstantAssignment,
+                        AssignmentKind::SnippetParameter => {
                             CompilerDiagnosticKind::SnippetParameterAssignment
                         }
-                        AssignmentKind::EachItemInvalidAssignment => {
+                        AssignmentKind::EachItemInvalid => {
                             CompilerDiagnosticKind::EachItemInvalidAssignment
                         }
                     };
@@ -4564,7 +4248,7 @@ fn bind_expr(directive: &DirectiveAttribute) -> BindExpr<'_> {
         return BindExpr::Pair(&directive.expression, len);
     }
 
-    if is_identifier_or_member_expression(&directive.expression) {
+    if is_identifier_or_member_expression(target) {
         return BindExpr::Target;
     }
 
@@ -4692,7 +4376,7 @@ enum SlotKind {
 struct SlotFrame {
     kind: SlotKind,
     name: Option<Arc<str>>,
-    slots: HashSet<Arc<str>>,
+    slots: NameSet,
 }
 
 impl SlotFrame {
@@ -4700,7 +4384,7 @@ impl SlotFrame {
         Self {
             kind,
             name: None,
-            slots: HashSet::new(),
+            slots: NameSet::default(),
         }
     }
 
@@ -4708,7 +4392,7 @@ impl SlotFrame {
         Self {
             kind: SlotKind::Component,
             name: Some(name.clone()),
-            slots: HashSet::new(),
+            slots: NameSet::default(),
         }
     }
 }
@@ -4722,210 +4406,32 @@ fn detect_slot_attribute_errors_in_fragment(
         if let Some(error) = detect_slot_attribute_error_for_node(source, node, fragment, stack) {
             return Some(error);
         }
-
-        match node {
-            Node::RegularElement(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::Component(component) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &component.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SlotElement(slot) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &slot.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::IfBlock(block) => {
-                stack.push(slot_frame(node));
-                if let Some(error) =
-                    detect_slot_attribute_errors_in_fragment(source, &block.consequent, stack)
-                {
-                    stack.pop();
-                    return Some(error);
-                }
-                if let Some(alternate) = block.alternate.as_deref() {
-                    let result = match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_slot_attribute_errors_in_fragment(source, fragment, stack)
-                        }
-                        Alternate::IfBlock(block) => detect_slot_attribute_errors_in_fragment(
-                            source,
-                            &block.consequent,
-                            stack,
-                        ),
-                    };
-                    if result.is_some() {
-                        stack.pop();
-                        return result;
-                    }
-                }
-                stack.pop();
-            }
-            Node::EachBlock(block) => {
-                stack.push(slot_frame(node));
-                if let Some(error) =
-                    detect_slot_attribute_errors_in_fragment(source, &block.body, stack)
-                {
-                    stack.pop();
-                    return Some(error);
-                }
-                if let Some(fallback) = block.fallback.as_ref()
-                    && let Some(error) =
-                        detect_slot_attribute_errors_in_fragment(source, fallback, stack)
-                {
-                    stack.pop();
-                    return Some(error);
-                }
-                stack.pop();
-            }
-            Node::AwaitBlock(block) => {
-                stack.push(slot_frame(node));
-                for branch in [
-                    block.pending.as_ref(),
-                    block.then.as_ref(),
-                    block.catch.as_ref(),
-                ] {
-                    if let Some(fragment) = branch
-                        && let Some(error) =
-                            detect_slot_attribute_errors_in_fragment(source, fragment, stack)
-                    {
-                        stack.pop();
-                        return Some(error);
-                    }
-                }
-                stack.pop();
-            }
-            Node::SnippetBlock(block) => {
-                stack.push(slot_frame(node));
-                let result = detect_slot_attribute_errors_in_fragment(source, &block.body, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::KeyBlock(block) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &block.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteComponent(component) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &component.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteElement(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteSelf(component) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &component.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteFragment(fragment_node) => {
-                stack.push(slot_frame(node));
-                let result = detect_slot_attribute_errors_in_fragment(
-                    source,
-                    &fragment_node.fragment,
-                    stack,
-                );
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteBoundary(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteHead(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteBody(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteWindow(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::SvelteDocument(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            Node::TitleElement(element) => {
-                stack.push(slot_frame(node));
-                let result =
-                    detect_slot_attribute_errors_in_fragment(source, &element.fragment, stack);
-                stack.pop();
-                if result.is_some() {
-                    return result;
-                }
-            }
-            _ => {}
+        if let Some(error) = detect_slot_attribute_errors_in_child_fragments(source, node, stack) {
+            return Some(error);
         }
     }
 
     None
+}
+
+fn detect_slot_attribute_errors_in_child_fragments(
+    source: &str,
+    node: &Node,
+    stack: &mut Vec<SlotFrame>,
+) -> Option<CompileError> {
+    stack.push(slot_frame(node));
+    let result = node.try_for_each_child_fragment(|fragment| {
+        if let Some(error) = detect_slot_attribute_errors_in_fragment(source, fragment, stack) {
+            ControlFlow::Break(error)
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    stack.pop();
+    match result {
+        ControlFlow::Break(error) => Some(error),
+        ControlFlow::Continue(()) => None,
+    }
 }
 
 fn detect_slot_attribute_error_for_node(
@@ -5089,43 +4595,62 @@ enum ConstOwner {
 
 #[derive(Clone, Default)]
 struct ConstScope {
-    inherited: HashSet<String>,
-    current: HashSet<String>,
+    inherited: NameSet,
+    current: NameSet,
 }
 
 impl ConstScope {
-    fn visible(&self, local: &HashSet<String>) -> HashSet<String> {
+    fn visible(&self, local: &NameSet) -> NameSet {
         let mut visible = self.inherited.clone();
         visible.extend(self.current.iter().cloned());
         visible.extend(local.iter().cloned());
         visible
     }
 
-    fn current_visible(&self, local: &HashSet<String>) -> HashSet<String> {
+    fn current_visible(&self, local: &NameSet) -> NameSet {
         let mut visible = self.current.clone();
         visible.extend(local.iter().cloned());
         visible
     }
 
-    fn child(&self, local: &HashSet<String>) -> Self {
+    fn child(&self, local: &NameSet) -> Self {
         Self {
             inherited: self.visible(local),
-            current: HashSet::new(),
+            current: NameSet::default(),
         }
     }
 
-    fn snippet(
-        &self,
-        local: &HashSet<String>,
-        parameters: &[Expression],
-        owner: ConstOwner,
-    ) -> Self {
+    fn with_expression_bindings(mut self, expression: &Expression) -> Self {
+        insert_expression_binding_names(expression, &mut self.current);
+        self
+    }
+
+    fn with_optional_expression_bindings(self, expression: Option<&Expression>) -> Self {
+        match expression {
+            Some(expression) => self.with_expression_bindings(expression),
+            None => self,
+        }
+    }
+
+    fn with_optional_name(mut self, name: Option<&Arc<str>>) -> Self {
+        if let Some(name) = name {
+            self.current.insert(name.clone());
+        }
+        self
+    }
+
+    fn with_each_block_bindings(self, block: &EachBlock) -> Self {
+        self.with_optional_expression_bindings(block.context.as_ref())
+            .with_optional_name(block.index.as_ref())
+    }
+
+    fn snippet(&self, local: &NameSet, parameters: &[Expression], owner: ConstOwner) -> Self {
         let mut inherited = self.inherited.clone();
         if !matches!(owner, ConstOwner::Component | ConstOwner::Boundary) {
             inherited.extend(self.current.iter().cloned());
             inherited.extend(local.iter().cloned());
         }
-        let mut current = HashSet::new();
+        let mut current = NameSet::default();
         for parameter in parameters {
             insert_expression_binding_names(parameter, &mut current);
         }
@@ -5144,7 +4669,15 @@ fn detect_const_tag_errors_in_fragment(
         return Some(compile_error_custom(
             source,
             "const_tag_cycle",
-            format!("Cyclical dependency detected: {}", cycle.names.join(" → ")),
+            format!(
+                "Cyclical dependency detected: {}",
+                cycle
+                    .names
+                    .iter()
+                    .map(Arc::as_ref)
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
             cycle.tag.start,
             cycle.tag.end,
         ));
@@ -5154,7 +4687,7 @@ fn detect_const_tag_errors_in_fragment(
         return Some(error);
     }
 
-    let mut local = HashSet::<String>::new();
+    let mut local = NameSet::default();
 
     for node in &fragment.nodes {
         match node {
@@ -5197,7 +4730,7 @@ fn detect_const_tag_errors_in_fragment(
                 }
 
                 for (name, _, _) in bindings {
-                    local.insert(name.to_string());
+                    local.insert(name);
                 }
             }
             Node::RegularElement(_)
@@ -5260,13 +4793,7 @@ fn detect_const_tag_errors_in_fragment(
                 }
             }
             Node::EachBlock(block) => {
-                let mut child = scope.child(&local);
-                if let Some(context) = block.context.as_ref() {
-                    insert_expression_binding_names(context, &mut child.current);
-                }
-                if let Some(index) = block.index.as_ref() {
-                    child.current.insert(index.to_string());
-                }
+                let child = scope.child(&local).with_each_block_bindings(block);
                 if let Some(error) = detect_const_tag_errors_in_fragment(
                     source,
                     &block.body,
@@ -5303,10 +4830,9 @@ fn detect_const_tag_errors_in_fragment(
                 }
 
                 if let Some(then) = block.then.as_ref() {
-                    let mut then_scope = child.clone();
-                    if let Some(value) = block.value.as_ref() {
-                        insert_expression_binding_names(value, &mut then_scope.current);
-                    }
+                    let then_scope = child
+                        .clone()
+                        .with_optional_expression_bindings(block.value.as_ref());
                     if let Some(error) = detect_const_tag_errors_in_fragment(
                         source,
                         then,
@@ -5319,10 +4845,9 @@ fn detect_const_tag_errors_in_fragment(
                 }
 
                 if let Some(catch) = block.catch.as_ref() {
-                    let mut catch_scope = child.clone();
-                    if let Some(error_binding) = block.error.as_ref() {
-                        insert_expression_binding_names(error_binding, &mut catch_scope.current);
-                    }
+                    let catch_scope = child
+                        .clone()
+                        .with_optional_expression_bindings(block.error.as_ref());
                     if let Some(error) = detect_const_tag_errors_in_fragment(
                         source,
                         catch,
@@ -5394,7 +4919,7 @@ fn detect_const_tag_invalid_reference(
             continue;
         }
 
-        let mut available = HashSet::new();
+        let mut available = NameSet::default();
         for parameter in &block.parameters {
             insert_expression_binding_names(parameter, &mut available);
         }
@@ -5417,21 +4942,21 @@ fn detect_const_tag_invalid_reference(
     None
 }
 
-fn unavailable_const_names(fragment: &Fragment) -> HashSet<String> {
-    let mut local = HashSet::new();
+fn unavailable_const_names(fragment: &Fragment) -> NameSet {
+    let mut local = NameSet::default();
     for node in &fragment.nodes {
         let Node::ConstTag(tag) = node else {
             continue;
         };
         for (name, _, _) in const_tag_declared_bindings(tag) {
-            local.insert(name.to_string());
+            local.insert(name);
         }
     }
     if local.is_empty() {
         return local;
     }
 
-    let mut used = HashSet::new();
+    let mut used = NameSet::default();
     for node in &fragment.nodes {
         if matches!(node, Node::SnippetBlock(_)) {
             continue;
@@ -5445,9 +4970,9 @@ fn unavailable_const_names(fragment: &Fragment) -> HashSet<String> {
 
 fn find_unavailable_const_reference_in_fragment(
     fragment: &Fragment,
-    unavailable: &HashSet<String>,
-    inherited: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    unavailable: &NameSet,
+    inherited: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     let mut visible = inherited.clone();
 
     for node in &fragment.nodes {
@@ -5458,7 +4983,7 @@ fn find_unavailable_const_reference_in_fragment(
         match node {
             Node::ConstTag(tag) => {
                 for (name, _, _) in const_tag_declared_bindings(tag) {
-                    visible.insert(name.to_string());
+                    visible.insert(name);
                 }
             }
             Node::IfBlock(block) => {
@@ -5490,13 +5015,7 @@ fn find_unavailable_const_reference_in_fragment(
                 }
             }
             Node::EachBlock(block) => {
-                let mut child = visible.clone();
-                if let Some(context) = block.context.as_ref() {
-                    insert_expression_binding_names(context, &mut child);
-                }
-                if let Some(index) = block.index.as_ref() {
-                    child.insert(index.to_string());
-                }
+                let child = visible_with_each_block_bindings(&visible, block);
                 if let Some(found) =
                     find_unavailable_const_reference_in_fragment(&block.body, unavailable, &child)
                 {
@@ -5520,10 +5039,8 @@ fn find_unavailable_const_reference_in_fragment(
                     return Some(found);
                 }
                 if let Some(then) = block.then.as_ref() {
-                    let mut child = visible.clone();
-                    if let Some(value) = block.value.as_ref() {
-                        insert_expression_binding_names(value, &mut child);
-                    }
+                    let child =
+                        visible_with_optional_expression_bindings(&visible, block.value.as_ref());
                     if let Some(found) =
                         find_unavailable_const_reference_in_fragment(then, unavailable, &child)
                     {
@@ -5531,10 +5048,8 @@ fn find_unavailable_const_reference_in_fragment(
                     }
                 }
                 if let Some(catch) = block.catch.as_ref() {
-                    let mut child = visible.clone();
-                    if let Some(error) = block.error.as_ref() {
-                        insert_expression_binding_names(error, &mut child);
-                    }
+                    let child =
+                        visible_with_optional_expression_bindings(&visible, block.error.as_ref());
                     if let Some(found) =
                         find_unavailable_const_reference_in_fragment(catch, unavailable, &child)
                     {
@@ -5543,10 +5058,7 @@ fn find_unavailable_const_reference_in_fragment(
                 }
             }
             Node::SnippetBlock(block) => {
-                let mut child = visible.clone();
-                for parameter in &block.parameters {
-                    insert_expression_binding_names(parameter, &mut child);
-                }
+                let child = visible_with_snippet_parameters(&visible, block);
                 if let Some(found) =
                     find_unavailable_const_reference_in_fragment(&block.body, unavailable, &child)
                 {
@@ -5579,62 +5091,55 @@ fn find_unavailable_const_reference_in_fragment(
     None
 }
 
-fn collect_const_references_in_node(
-    node: &Node,
-    names: &HashSet<String>,
-    out: &mut HashSet<String>,
-) {
-    let _ = find_unavailable_const_reference_in_node(node, names, &HashSet::new()).map(
+fn visible_with_expression_bindings(visible: &NameSet, expression: &Expression) -> NameSet {
+    let mut child = visible.clone();
+    insert_expression_binding_names(expression, &mut child);
+    child
+}
+
+fn visible_with_optional_expression_bindings(
+    visible: &NameSet,
+    expression: Option<&Expression>,
+) -> NameSet {
+    match expression {
+        Some(expression) => visible_with_expression_bindings(visible, expression),
+        None => visible.clone(),
+    }
+}
+
+fn visible_with_each_block_bindings(visible: &NameSet, block: &EachBlock) -> NameSet {
+    let mut child = visible.clone();
+    if let Some(context) = block.context.as_ref() {
+        insert_expression_binding_names(context, &mut child);
+    }
+    extend_name_set_with_optional_name(&mut child, block.index.as_ref());
+    child
+}
+
+fn visible_with_snippet_parameters(visible: &NameSet, block: &SnippetBlock) -> NameSet {
+    let mut child = visible.clone();
+    for parameter in &block.parameters {
+        insert_expression_binding_names(parameter, &mut child);
+    }
+    child
+}
+
+fn collect_const_references_in_node(node: &Node, names: &NameSet, out: &mut NameSet) {
+    let _ = find_unavailable_const_reference_in_node(node, names, &NameSet::default()).map(
         |(name, _, _)| {
             out.insert(name);
         },
     );
 
     match node {
-        Node::IfBlock(block) => {
-            collect_const_references_in_fragment(&block.consequent, names, out);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_const_references_in_fragment(fragment, names, out);
-                    }
-                    Alternate::IfBlock(block) => {
-                        collect_const_references_in_fragment(&block.consequent, names, out);
-                    }
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_const_references_in_fragment(&block.body, names, out);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_const_references_in_fragment(fallback, names, out);
-            }
-        }
-        Node::AwaitBlock(block) => {
-            for branch in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = branch {
-                    collect_const_references_in_fragment(fragment, names, out);
-                }
-            }
-        }
-        Node::KeyBlock(block) => collect_const_references_in_fragment(&block.fragment, names, out),
-        _ => {
-            if let Some(element) = node.as_element() {
-                collect_const_references_in_fragment(element.fragment(), names, out);
-            }
-        }
+        Node::SnippetBlock(_) => {}
+        _ => node.for_each_child_fragment(|fragment| {
+            collect_const_references_in_fragment(fragment, names, out);
+        }),
     }
 }
 
-fn collect_const_references_in_fragment(
-    fragment: &Fragment,
-    names: &HashSet<String>,
-    out: &mut HashSet<String>,
-) {
+fn collect_const_references_in_fragment(fragment: &Fragment, names: &NameSet, out: &mut NameSet) {
     for node in &fragment.nodes {
         collect_const_references_in_node(node, names, out);
     }
@@ -5642,9 +5147,9 @@ fn collect_const_references_in_fragment(
 
 fn detect_const_tag_invalid_reference_in_attrs(
     attrs: &[Attribute],
-    visible: &HashSet<String>,
-    unavailable: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    visible: &NameSet,
+    unavailable: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     for attr in attrs {
         let found = match attr {
             Attribute::Attribute(attr) => match &attr.value {
@@ -5698,9 +5203,9 @@ fn detect_const_tag_invalid_reference_in_attrs(
 
 fn find_unavailable_const_reference_in_node(
     node: &Node,
-    unavailable: &HashSet<String>,
-    visible: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    unavailable: &NameSet,
+    visible: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     let expression = match node {
         Node::ExpressionTag(tag) => {
             find_unavailable_const_reference(&tag.expression, visible, unavailable)
@@ -5753,9 +5258,9 @@ fn find_unavailable_const_reference_in_node(
 
 fn find_unavailable_const_reference(
     expression: &Expression,
-    visible: &HashSet<String>,
-    unavailable: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    visible: &NameSet,
+    unavailable: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     let mut found = None;
     walk_estree_node_with_path(&expression.0, &mut Vec::new(), &mut |node, path| {
         if found.is_some()
@@ -5778,15 +5283,15 @@ fn find_unavailable_const_reference(
         let Some((start, end)) = estree_node_span(node) else {
             return;
         };
-        found = Some((name.to_string(), start, end));
+        found = Some((Arc::from(name), start, end));
     });
     found
 }
 
 fn find_const_cycle(fragment: &Fragment) -> Option<ConstCycle<'_>> {
-    let mut tags = HashMap::<String, &ConstTag>::new();
-    let mut graph = HashMap::<String, Vec<String>>::new();
-    let mut order = Vec::<String>::new();
+    let mut tags = HashMap::<Arc<str>, &ConstTag>::new();
+    let mut graph = HashMap::<Arc<str>, OrderedNames>::new();
+    let mut order = Vec::<Arc<str>>::new();
 
     for node in &fragment.nodes {
         let Node::ConstTag(tag) = node else {
@@ -5800,9 +5305,9 @@ fn find_const_cycle(fragment: &Fragment) -> Option<ConstCycle<'_>> {
 
         let deps = const_tag_dependencies(tag);
         for (name, _, _) in bindings {
-            tags.insert(name.to_string(), tag);
-            graph.insert(name.to_string(), deps.clone());
-            order.push(name.to_string());
+            tags.insert(name.clone(), tag);
+            graph.insert(name.clone(), deps.clone());
+            order.push(name);
         }
     }
 
@@ -5814,9 +5319,10 @@ fn find_const_cycle(fragment: &Fragment) -> Option<ConstCycle<'_>> {
         deps.retain(|dep| tags.contains_key(dep));
     }
 
-    let mut stack = Vec::<String>::new();
-    let mut active = HashSet::<String>::new();
-    let mut visited = HashSet::<String>::new();
+    let graph = freeze_name_graph(graph);
+    let mut stack = Vec::<Arc<str>>::new();
+    let mut active = NameSet::default();
+    let mut visited = NameSet::default();
 
     for name in &order {
         let Some(cycle) = find_reactive_cycle(name, &graph, &mut visited, &mut active, &mut stack)
@@ -5824,15 +5330,18 @@ fn find_const_cycle(fragment: &Fragment) -> Option<ConstCycle<'_>> {
             continue;
         };
         let tag = tags.get(&cycle[0])?;
-        return Some(ConstCycle { tag, names: cycle });
+        return Some(ConstCycle {
+            tag,
+            names: cycle.into_boxed_slice(),
+        });
     }
 
     None
 }
 
-fn const_tag_dependencies(tag: &ConstTag) -> Vec<String> {
+fn const_tag_dependencies(tag: &ConstTag) -> OrderedNames {
     let Some(init) = const_tag_init(tag) else {
-        return Vec::new();
+        return OrderedNames::default();
     };
     collect_reactive_dependencies(init)
 }
@@ -5981,305 +5490,324 @@ fn find_first_call_named(node: &EstreeNode, expected_name: &str) -> Option<(usiz
 fn detect_bind_invalid_value_in_fragment(
     source: &str,
     fragment: &Fragment,
-    scope: &mut Names,
+    scope: &mut NameStack,
 ) -> Option<CompileError> {
-    let mark = scope.mark();
-
-    for node in &fragment.nodes {
-        match node {
-            Node::RegularElement(element) => {
-                if let Some(error) =
-                    detect_bind_invalid_value_in_attributes(source, &element.attributes, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &element.fragment, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::Component(component) => {
-                if let Some(error) =
-                    detect_bind_invalid_value_in_attributes(source, &component.attributes, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &component.fragment, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::SlotElement(slot) => {
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &slot.fragment, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::IfBlock(block) => {
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &block.consequent, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(alternate) = block.alternate.as_deref() {
-                    let result = match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_bind_invalid_value_in_fragment(source, fragment, scope)
+    scope.with_frame(
+        |_| {},
+        |scope| {
+            for node in &fragment.nodes {
+                match node {
+                    Node::RegularElement(element) => {
+                        if let Some(error) = detect_bind_invalid_value_in_attributes(
+                            source,
+                            &element.attributes,
+                            scope,
+                        ) {
+                            return Some(error);
                         }
-                        Alternate::IfBlock(block) => {
-                            detect_bind_invalid_value_in_fragment(source, &block.consequent, scope)
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_bind_invalid_value_in_fragment(source, fragment, scope)
+                            },
+                        ) {
+                            return Some(error);
                         }
-                    };
-                    if result.is_some() {
-                        return result;
                     }
-                }
-            }
-            Node::EachBlock(block) => {
-                let mark = scope.mark();
-                if let Some(context) = block.context.as_ref() {
-                    scope.extend(expression_binding_names(context));
-                }
-                if let Some(index) = block.index.as_ref() {
-                    scope.push(index.clone());
-                }
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &block.body, scope)
-                {
-                    return Some(error);
-                }
-                scope.reset(mark);
-                if let Some(fallback) = block.fallback.as_ref()
-                    && let Some(error) =
-                        detect_bind_invalid_value_in_fragment(source, fallback, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::AwaitBlock(block) => {
-                if let Some(pending) = block.pending.as_ref()
-                    && let Some(error) =
-                        detect_bind_invalid_value_in_fragment(source, pending, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(then) = block.then.as_ref() {
-                    let mark = scope.mark();
-                    if let Some(value) = block.value.as_ref() {
-                        scope.extend(expression_binding_names(value));
+                    Node::Component(component) => {
+                        if let Some(error) = detect_bind_invalid_value_in_attributes(
+                            source,
+                            &component.attributes,
+                            scope,
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_bind_invalid_value_in_fragment(source, fragment, scope)
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    if let Some(error) = detect_bind_invalid_value_in_fragment(source, then, scope)
-                    {
-                        return Some(error);
+                    Node::SlotElement(_) => {
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_bind_invalid_value_in_fragment(source, fragment, scope)
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    scope.reset(mark);
-                }
-                if let Some(catch) = block.catch.as_ref() {
-                    let mark = scope.mark();
-                    if let Some(error_binding) = block.error.as_ref() {
-                        scope.extend(expression_binding_names(error_binding));
+                    Node::IfBlock(_) => {
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_bind_invalid_value_in_fragment(source, fragment, scope)
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    if let Some(error) = detect_bind_invalid_value_in_fragment(source, catch, scope)
-                    {
-                        return Some(error);
+                    Node::EachBlock(block) => {
+                        if let Some(error) = scope.with_frame(
+                            |scope| scope.extend_each_block_bindings(block),
+                            |scope| {
+                                detect_bind_invalid_value_in_fragment(source, &block.body, scope)
+                            },
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(fallback) = block.fallback.as_ref()
+                            && let Some(error) =
+                                detect_bind_invalid_value_in_fragment(source, fallback, scope)
+                        {
+                            return Some(error);
+                        }
                     }
-                    scope.reset(mark);
+                    Node::AwaitBlock(block) => {
+                        if let Some(pending) = block.pending.as_ref()
+                            && let Some(error) =
+                                detect_bind_invalid_value_in_fragment(source, pending, scope)
+                        {
+                            return Some(error);
+                        }
+                        if let Some(then) = block.then.as_ref()
+                            && let Some(error) = scope.with_frame(
+                                |scope| {
+                                    scope.extend_optional_expression_bindings(block.value.as_ref());
+                                },
+                                |scope| detect_bind_invalid_value_in_fragment(source, then, scope),
+                            )
+                        {
+                            return Some(error);
+                        }
+                        if let Some(catch) = block.catch.as_ref()
+                            && let Some(error) = scope.with_frame(
+                                |scope| {
+                                    scope.extend_optional_expression_bindings(block.error.as_ref());
+                                },
+                                |scope| detect_bind_invalid_value_in_fragment(source, catch, scope),
+                            )
+                        {
+                            return Some(error);
+                        }
+                    }
+                    Node::SnippetBlock(block) => {
+                        if let Some(error) = scope.with_frame(
+                            |scope| scope.extend_snippet_parameters(block),
+                            |scope| {
+                                detect_bind_invalid_value_in_fragment(source, &block.body, scope)
+                            },
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::KeyBlock(block) => {
+                        if let Some(error) =
+                            detect_bind_invalid_value_in_fragment(source, &block.fragment, scope)
+                        {
+                            return Some(error);
+                        }
+                    }
+                    Node::ConstTag(tag) => {
+                        scope.extend_const_tag_identifiers(tag);
+                    }
+                    _ => {}
                 }
             }
-            Node::SnippetBlock(block) => {
-                let mark = scope.mark();
-                for parameter in &block.parameters {
-                    scope.extend(expression_binding_names(parameter));
-                }
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &block.body, scope)
-                {
-                    return Some(error);
-                }
-                scope.reset(mark);
-            }
-            Node::KeyBlock(block) => {
-                if let Some(error) =
-                    detect_bind_invalid_value_in_fragment(source, &block.fragment, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::ConstTag(tag) => {
-                scope.extend(const_tag_declared_identifiers(tag));
-            }
-            _ => {}
-        }
-    }
 
-    scope.reset(mark);
-    None
+            None
+        },
+    )
 }
 
 fn detect_constant_binding_in_fragment(
     source: &str,
     fragment: &Fragment,
-    immutable: &Names,
-    scope: &mut Names,
+    immutable: &NameStack,
+    scope: &mut NameStack,
 ) -> Option<CompileError> {
-    let mark = scope.mark();
-
-    for node in &fragment.nodes {
-        match node {
-            Node::RegularElement(element) => {
-                if let Some(error) = detect_constant_binding_in_attributes(
-                    source,
-                    &element.attributes,
-                    immutable,
-                    scope,
-                ) {
-                    return Some(error);
-                }
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &element.fragment, immutable, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::Component(component) => {
-                if let Some(error) = detect_constant_binding_in_attributes(
-                    source,
-                    &component.attributes,
-                    immutable,
-                    &scope,
-                ) {
-                    return Some(error);
-                }
-                if let Some(error) = detect_constant_binding_in_fragment(
-                    source,
-                    &component.fragment,
-                    immutable,
-                    scope,
-                ) {
-                    return Some(error);
-                }
-            }
-            Node::SlotElement(slot) => {
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &slot.fragment, immutable, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::IfBlock(block) => {
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &block.consequent, immutable, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(alternate) = block.alternate.as_deref() {
-                    let result = match alternate {
-                        Alternate::Fragment(fragment) => {
-                            detect_constant_binding_in_fragment(source, fragment, immutable, scope)
-                        }
-                        Alternate::IfBlock(block) => detect_constant_binding_in_fragment(
+    scope.with_frame(
+        |_| {},
+        |scope| {
+            for node in &fragment.nodes {
+                match node {
+                    Node::RegularElement(element) => {
+                        if let Some(error) = detect_constant_binding_in_attributes(
                             source,
-                            &block.consequent,
+                            &element.attributes,
                             immutable,
                             scope,
-                        ),
-                    };
-                    if result.is_some() {
-                        return result;
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_constant_binding_in_fragment(
+                                    source, fragment, immutable, scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                }
-            }
-            Node::EachBlock(block) => {
-                let mark = scope.mark();
-                if let Some(context) = block.context.as_ref() {
-                    scope.extend(expression_binding_names(context));
-                }
-                if let Some(index) = block.index.as_ref() {
-                    scope.push(index.clone());
-                }
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &block.body, immutable, scope)
-                {
-                    return Some(error);
-                }
-                scope.reset(mark);
-                if let Some(fallback) = block.fallback.as_ref()
-                    && let Some(error) =
-                        detect_constant_binding_in_fragment(source, fallback, immutable, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::AwaitBlock(block) => {
-                if let Some(pending) = block.pending.as_ref()
-                    && let Some(error) =
-                        detect_constant_binding_in_fragment(source, pending, immutable, scope)
-                {
-                    return Some(error);
-                }
-                if let Some(then) = block.then.as_ref() {
-                    let mark = scope.mark();
-                    if let Some(value) = block.value.as_ref() {
-                        scope.extend(expression_binding_names(value));
+                    Node::Component(component) => {
+                        if let Some(error) = detect_constant_binding_in_attributes(
+                            source,
+                            &component.attributes,
+                            immutable,
+                            scope,
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_constant_binding_in_fragment(
+                                    source, fragment, immutable, scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    if let Some(error) =
-                        detect_constant_binding_in_fragment(source, then, immutable, scope)
-                    {
-                        return Some(error);
+                    Node::SlotElement(_) => {
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_constant_binding_in_fragment(
+                                    source, fragment, immutable, scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    scope.reset(mark);
-                }
-                if let Some(catch) = block.catch.as_ref() {
-                    let mark = scope.mark();
-                    if let Some(error_binding) = block.error.as_ref() {
-                        scope.extend(expression_binding_names(error_binding));
+                    Node::IfBlock(_) => {
+                        if let Some(error) = find_error_in_child_fragments_with_scope(
+                            node,
+                            scope,
+                            |fragment, scope| {
+                                detect_constant_binding_in_fragment(
+                                    source, fragment, immutable, scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
                     }
-                    if let Some(error) =
-                        detect_constant_binding_in_fragment(source, catch, immutable, scope)
-                    {
-                        return Some(error);
+                    Node::EachBlock(block) => {
+                        if let Some(error) = scope.with_frame(
+                            |scope| scope.extend_each_block_bindings(block),
+                            |scope| {
+                                detect_constant_binding_in_fragment(
+                                    source,
+                                    &block.body,
+                                    immutable,
+                                    scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
+                        if let Some(fallback) = block.fallback.as_ref()
+                            && let Some(error) = detect_constant_binding_in_fragment(
+                                source, fallback, immutable, scope,
+                            )
+                        {
+                            return Some(error);
+                        }
                     }
-                    scope.reset(mark);
+                    Node::AwaitBlock(block) => {
+                        if let Some(pending) = block.pending.as_ref()
+                            && let Some(error) = detect_constant_binding_in_fragment(
+                                source, pending, immutable, scope,
+                            )
+                        {
+                            return Some(error);
+                        }
+                        if let Some(then) = block.then.as_ref()
+                            && let Some(error) = scope.with_frame(
+                                |scope| {
+                                    scope.extend_optional_expression_bindings(block.value.as_ref());
+                                },
+                                |scope| {
+                                    detect_constant_binding_in_fragment(
+                                        source, then, immutable, scope,
+                                    )
+                                },
+                            )
+                        {
+                            return Some(error);
+                        }
+                        if let Some(catch) = block.catch.as_ref()
+                            && let Some(error) = scope.with_frame(
+                                |scope| {
+                                    scope.extend_optional_expression_bindings(block.error.as_ref());
+                                },
+                                |scope| {
+                                    detect_constant_binding_in_fragment(
+                                        source, catch, immutable, scope,
+                                    )
+                                },
+                            )
+                        {
+                            return Some(error);
+                        }
+                    }
+                    Node::SnippetBlock(block) => {
+                        if let Some(error) = scope.with_frame(
+                            |scope| scope.extend_snippet_parameters(block),
+                            |scope| {
+                                detect_constant_binding_in_fragment(
+                                    source,
+                                    &block.body,
+                                    immutable,
+                                    scope,
+                                )
+                            },
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::KeyBlock(block) => {
+                        if let Some(error) = detect_constant_binding_in_fragment(
+                            source,
+                            &block.fragment,
+                            immutable,
+                            scope,
+                        ) {
+                            return Some(error);
+                        }
+                    }
+                    Node::ConstTag(tag) => {
+                        scope.extend_const_tag_identifiers(tag);
+                    }
+                    _ => {}
                 }
             }
-            Node::SnippetBlock(block) => {
-                let mark = scope.mark();
-                for parameter in &block.parameters {
-                    scope.extend(expression_binding_names(parameter));
-                }
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &block.body, immutable, scope)
-                {
-                    return Some(error);
-                }
-                scope.reset(mark);
-            }
-            Node::KeyBlock(block) => {
-                if let Some(error) =
-                    detect_constant_binding_in_fragment(source, &block.fragment, immutable, scope)
-                {
-                    return Some(error);
-                }
-            }
-            Node::ConstTag(tag) => {
-                scope.extend(const_tag_declared_identifiers(tag));
-            }
-            _ => {}
-        }
-    }
 
-    scope.reset(mark);
-    None
+            None
+        },
+    )
 }
 
 fn detect_constant_binding_in_attributes(
     source: &str,
     attributes: &[Attribute],
-    immutable: &Names,
-    scope: &Names,
+    immutable: &NameStack,
+    scope: &NameStack,
 ) -> Option<CompileError> {
     for attribute in attributes {
         let Attribute::BindDirective(directive) = attribute else {
@@ -6316,7 +5844,7 @@ fn detect_constant_binding_in_attributes(
 fn detect_bind_invalid_value_in_attributes(
     source: &str,
     attributes: &[Attribute],
-    scope: &Names,
+    scope: &NameStack,
 ) -> Option<CompileError> {
     for attribute in attributes {
         let Attribute::BindDirective(directive) = attribute else {
@@ -6637,8 +6165,8 @@ fn static_attribute_text(attribute: &NamedAttribute) -> Option<&str> {
     }
 }
 
-fn collect_imported_bindings(root: &Root) -> HashSet<String> {
-    let mut bindings = HashSet::new();
+fn collect_imported_bindings(root: &Root) -> NameSet {
+    let mut bindings = NameSet::default();
 
     if let Some(script) = root.module.as_ref() {
         collect_imported_bindings_in_program(&script.content, &mut bindings);
@@ -6650,8 +6178,8 @@ fn collect_imported_bindings(root: &Root) -> HashSet<String> {
     bindings
 }
 
-fn collect_bindable_bindings(root: &Root, runes_mode: bool) -> HashSet<String> {
-    let mut bindings = HashSet::new();
+fn collect_bindable_bindings(root: &Root, runes_mode: bool) -> NameSet {
+    let mut bindings = NameSet::default();
 
     if let Some(script) = root.instance.as_ref() {
         collect_bindable_bindings_in_program(&script.content, runes_mode, &mut bindings);
@@ -6660,18 +6188,18 @@ fn collect_bindable_bindings(root: &Root, runes_mode: bool) -> HashSet<String> {
     bindings
 }
 
-fn collect_script_constant_bindings(root: &Root) -> Vec<Arc<str>> {
-    let mut bindings = Vec::<Arc<str>>::new();
+fn collect_script_constant_bindings(root: &Root) -> Box<[Arc<str>]> {
+    let mut bindings = OrderedNames::default();
     if let Some(script) = root.module.as_ref() {
         collect_script_constant_bindings_in_program(&script.content, &mut bindings);
     }
     if let Some(script) = root.instance.as_ref() {
         collect_script_constant_bindings_in_program(&script.content, &mut bindings);
     }
-    bindings
+    bindings.into_boxed_slice()
 }
 
-fn collect_script_constant_bindings_in_program(program: &EstreeNode, out: &mut Vec<Arc<str>>) {
+fn collect_script_constant_bindings_in_program(program: &EstreeNode, out: &mut OrderedNames) {
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return;
     };
@@ -6701,11 +6229,7 @@ fn collect_script_constant_bindings_in_program(program: &EstreeNode, out: &mut V
     }
 }
 
-fn collect_bindable_bindings_in_program(
-    program: &EstreeNode,
-    runes_mode: bool,
-    out: &mut HashSet<String>,
-) {
+fn collect_bindable_bindings_in_program(program: &EstreeNode, runes_mode: bool, out: &mut NameSet) {
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return;
     };
@@ -6734,7 +6258,7 @@ fn collect_bindable_bindings_in_program(
 fn collect_bindable_bindings_from_declaration(
     declaration: &EstreeNode,
     runes_mode: bool,
-    out: &mut HashSet<String>,
+    out: &mut NameSet,
 ) {
     let kind = estree_node_field_str(declaration, RawField::Kind);
     let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
@@ -6753,7 +6277,7 @@ fn collect_bindable_bindings_from_declaration(
             || (runes_mode
                 && estree_node_field_object(declarator, RawField::Init)
                     .and_then(call_name_for_initializer)
-                    .is_some_and(|name| matches!(name.as_str(), "$state" | "$state.raw")));
+                    .is_some_and(|name| matches!(name.as_ref(), "$state" | "$state.raw")));
 
         if is_bindable {
             insert_pattern_binding_names(id, out);
@@ -6761,7 +6285,7 @@ fn collect_bindable_bindings_from_declaration(
     }
 }
 
-fn call_name_for_initializer(node: &EstreeNode) -> Option<String> {
+fn call_name_for_initializer(node: &EstreeNode) -> Option<Arc<str>> {
     if estree_node_type(node) != Some("CallExpression") {
         return None;
     }
@@ -6769,7 +6293,7 @@ fn call_name_for_initializer(node: &EstreeNode) -> Option<String> {
     raw_callee_name(callee)
 }
 
-fn collect_bindings_from_variable_declaration(declaration: &EstreeNode, out: &mut Vec<Arc<str>>) {
+fn collect_bindings_from_variable_declaration(declaration: &EstreeNode, out: &mut OrderedNames) {
     let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
         return;
     };
@@ -6788,13 +6312,13 @@ fn find_assignment_violation_in_template_expression(
     expression: &Expression,
     context: &ValidationContext,
 ) -> Option<AssignmentViolation> {
-    let mut immutable = HashSet::new();
-    for name in &context.immutable.0 {
-        immutable.insert(name.to_string());
+    let mut immutable = NameSet::default();
+    for name in context.immutable.as_slice() {
+        immutable.insert(name.clone());
     }
     if context.runes {
-        for name in &context.each.0 {
-            immutable.insert(name.to_string());
+        for name in context.each.as_slice() {
+            immutable.insert(name.clone());
         }
     }
     let (start, end) =
@@ -6808,9 +6332,9 @@ fn assignment_kind_for_expression_span(
     span: (usize, usize),
     context: &ValidationContext,
 ) -> AssignmentKind {
-    let mut kind = AssignmentKind::ConstantAssignment;
+    let mut kind = AssignmentKind::Constant;
     walk_estree_node(root, &mut |node| {
-        if !matches!(kind, AssignmentKind::ConstantAssignment) {
+        if !matches!(kind, AssignmentKind::Constant) {
             return;
         }
 
@@ -6830,81 +6354,19 @@ fn assignment_kind_for_expression_span(
             return;
         };
 
-        let mut names = Vec::<Arc<str>>::new();
-        collect_assignment_target_base_identifiers(target, &mut names);
-        if context.runes
-            && names
-                .iter()
-                .any(|name| context.each.contains(name.as_ref()))
-        {
-            kind = AssignmentKind::EachItemInvalidAssignment;
+        let Some(name) = raw_identifier_name(target) else {
+            return;
+        };
+        if context.runes && context.each.contains(name.as_ref()) {
+            kind = AssignmentKind::EachItemInvalid;
             return;
         }
-        if names
-            .iter()
-            .any(|name| context.snippets.contains(name.as_ref()))
-        {
-            kind = AssignmentKind::SnippetParameterAssignment;
+        if context.snippets.contains(name.as_ref()) {
+            kind = AssignmentKind::SnippetParameter;
         }
     });
 
     kind
-}
-
-fn collect_assignment_target_base_identifiers(target: &EstreeNode, out: &mut Vec<Arc<str>>) {
-    match estree_node_type(target) {
-        Some("Identifier") | Some("MemberExpression") => {
-            if let Some(name) = raw_base_identifier_name(target) {
-                out.push(name);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(target, RawField::Left) {
-                collect_assignment_target_base_identifiers(left, out);
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(target, RawField::Argument) {
-                collect_assignment_target_base_identifiers(argument, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(target, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_assignment_target_base_identifiers(element, out);
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(target, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_assignment_target_base_identifiers(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_assignment_target_base_identifiers(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn estree_node_span(node: &EstreeNode) -> Option<(usize, usize)> {
@@ -6914,7 +6376,7 @@ fn estree_node_span(node: &EstreeNode) -> Option<(usize, usize)> {
     ))
 }
 
-fn collect_imported_bindings_in_program(program: &EstreeNode, bindings: &mut HashSet<String>) {
+fn collect_imported_bindings_in_program(program: &EstreeNode, bindings: &mut NameSet) {
     walk_estree_node(program, &mut |node| {
         if estree_node_type(node) != Some("ImportDeclaration") {
             return;
@@ -6933,71 +6395,18 @@ fn collect_imported_bindings_in_program(program: &EstreeNode, bindings: &mut Has
                 continue;
             }
             if let Some(name) = estree_node_field_str(local, RawField::Name) {
-                bindings.insert(name.to_string());
+                bindings.insert(Arc::from(name));
             }
         }
     });
 }
 
 fn binding_base_identifier_name(expression: &Expression) -> Option<Arc<str>> {
-    raw_base_identifier_name(&expression.0)
+    estree_raw_base_identifier_name(unwrap_typescript_expression(&expression.0))
 }
 
-fn raw_base_identifier_name(node: &EstreeNode) -> Option<Arc<str>> {
-    let node = unwrap_typescript_expression(node);
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(Arc::from),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            raw_base_identifier_name(object)
-        }
-        _ => None,
-    }
-}
-
-fn raw_callee_name(node: &EstreeNode) -> Option<String> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(ToString::to_string),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            let property = estree_node_field_object(node, RawField::Property)?;
-            let object_name = estree_node_field_str(object, RawField::Name)?;
-            let property_name = estree_node_field_str(property, RawField::Name)?;
-            Some(format!("{object_name}.{property_name}"))
-        }
-        _ => None,
-    }
-}
-
-fn is_identifier_or_member_expression(expression: &Expression) -> bool {
-    matches!(
-        estree_node_type(unwrap_typescript_expression(&expression.0)),
-        Some("Identifier" | "MemberExpression")
-    )
-}
-
-fn unwrap_typescript_expression(mut node: &EstreeNode) -> &EstreeNode {
-    loop {
-        match estree_node_type(node) {
-            Some(
-                "ParenthesizedExpression"
-                | "TSAsExpression"
-                | "TSSatisfiesExpression"
-                | "TSNonNullExpression"
-                | "TSTypeAssertion",
-            ) => {
-                let Some(expression) = estree_node_field_object(node, RawField::Expression) else {
-                    return node;
-                };
-                node = expression;
-            }
-            _ => return node,
-        }
-    }
-}
-
-fn const_tag_declared_identifiers(tag: &ConstTag) -> Vec<Arc<str>> {
-    let mut names = Vec::new();
+fn const_tag_declared_identifiers(tag: &ConstTag) -> Box<[Arc<str>]> {
+    let mut names = OrderedNames::default();
     let raw = &tag.declaration.0;
     match estree_node_type(raw) {
         Some("AssignmentExpression") => {
@@ -7007,7 +6416,7 @@ fn const_tag_declared_identifiers(tag: &ConstTag) -> Vec<Arc<str>> {
         }
         Some("VariableDeclaration") => {
             let Some(declarations) = estree_node_field_array(raw, RawField::Declarations) else {
-                return names;
+                return names.into_boxed_slice();
             };
             for declaration in declarations {
                 let EstreeValue::Object(declaration) = declaration else {
@@ -7021,7 +6430,7 @@ fn const_tag_declared_identifiers(tag: &ConstTag) -> Vec<Arc<str>> {
         }
         _ => {}
     }
-    names
+    names.into_boxed_slice()
 }
 
 fn const_tag_declared_bindings(tag: &ConstTag) -> Vec<(Arc<str>, usize, usize)> {
@@ -7052,82 +6461,18 @@ fn const_tag_declared_bindings(tag: &ConstTag) -> Vec<(Arc<str>, usize, usize)> 
     bindings
 }
 
-fn expression_binding_names(expression: &Expression) -> Vec<Arc<str>> {
-    let mut names = Vec::new();
+fn expression_binding_names(expression: &Expression) -> Box<[Arc<str>]> {
+    let mut names = OrderedNames::default();
     collect_pattern_binding_names(&expression.0, &mut names);
-    names
+    names.into_boxed_slice()
 }
 
-fn insert_expression_binding_names(expression: &Expression, out: &mut HashSet<String>) {
-    let mut names = Vec::new();
-    collect_pattern_binding_names(&expression.0, &mut names);
-    for name in names {
-        out.insert(name.to_string());
-    }
+fn insert_expression_binding_names(expression: &Expression, out: &mut NameSet) {
+    collect_pattern_binding_names(&expression.0, out);
 }
 
-fn insert_pattern_binding_names(pattern: &EstreeNode, out: &mut HashSet<String>) {
-    let mut names = Vec::new();
-    collect_pattern_binding_names(pattern, &mut names);
-    for name in names {
-        out.insert(name.to_string());
-    }
-}
-
-fn collect_pattern_binding_names(pattern: &EstreeNode, out: &mut Vec<Arc<str>>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.push(Arc::from(name));
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_pattern_binding_names(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_pattern_binding_names(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_pattern_binding_names(element, out);
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_pattern_binding_names(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_pattern_binding_names(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
+fn insert_pattern_binding_names(pattern: &EstreeNode, out: &mut NameSet) {
+    collect_pattern_binding_names(pattern, out);
 }
 
 fn collect_pattern_binding_spans(pattern: &EstreeNode, out: &mut Vec<(Arc<str>, usize, usize)>) {
@@ -7188,14 +6533,14 @@ fn collect_pattern_binding_spans(pattern: &EstreeNode, out: &mut Vec<(Arc<str>, 
     }
 }
 
-fn let_directive_binding_names(directive: &DirectiveAttribute) -> Vec<Arc<str>> {
+fn let_directive_binding_names(directive: &DirectiveAttribute) -> Box<[Arc<str>]> {
     if estree_node_type(&directive.expression.0) == Some("Identifier") {
         if let Some(name) = estree_node_field_str(&directive.expression.0, RawField::Name)
             && !name.is_empty()
         {
-            return vec![Arc::from(name)];
+            return Box::new([Arc::from(name)]);
         }
-        return vec![directive.name.clone()];
+        return Box::new([directive.name.clone()]);
     }
     expression_binding_names(&directive.expression)
 }
@@ -7564,6 +6909,7 @@ mod tests {
     fn rejects_unknown_svelte_meta_tags_from_ast() {
         let error = validate("<svelte:unknown />").expect("expected validation error");
         assert_eq!(error.code.as_ref(), "svelte_meta_invalid_tag");
+        assert_eq!(error_range(&error), Some((1, 15)));
     }
 
     #[test]
@@ -7900,6 +7246,15 @@ mod tests {
     fn rejects_invalid_component_names_from_ast() {
         let error = validate("<Components[1] />").expect("expected validation error");
         assert_eq!(error.code.as_ref(), "tag_invalid_name");
+        assert_eq!(error_range(&error), Some((1, 14)));
+    }
+
+    #[test]
+    fn rejects_invalid_svelte_meta_tag_full_name_range_from_ast() {
+        let error = validate("{#if x}\n\t<svelte:selfdestructive x=\"{x - 1}\"/>\n{/if}")
+            .expect("expected validation error");
+        assert_eq!(error.code.as_ref(), "svelte_meta_invalid_tag");
+        assert_eq!(error_range(&error), Some((10, 32)));
     }
 
     #[test]

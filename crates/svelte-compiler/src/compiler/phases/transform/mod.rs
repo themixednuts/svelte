@@ -5,19 +5,19 @@ pub(crate) mod sourcemap;
 
 use std::sync::Arc;
 
-use camino::Utf8Path;
-
 use crate::api::{
     CompileMetadata, CompileOptions, CompileResult, ModernPrintTarget, OutputArtifact, ParseMode,
     ParseOptions, PrintOptions, PrintedOutput,
 };
 use crate::ast::Document;
+use crate::compiler::phases::component::LoweredComponent;
 use crate::error::CompileError;
 use crate::printing::{
     print_document, print_modern_attribute, print_modern_comment, print_modern_css,
     print_modern_css_node, print_modern_fragment, print_modern_node, print_modern_options,
     print_modern_root, print_modern_script,
 };
+use crate::{SourceId, SourceText};
 
 pub(crate) fn print_component(
     ast: &Document,
@@ -29,17 +29,7 @@ pub(crate) fn print_component(
         Arc::from(print_document(ast, &options))
     };
 
-    let map = sourcemap::build_sparse_sourcemap(sourcemap::SparseMappingOptions {
-        output: &code,
-        output_filename: None,
-        sources: vec![sourcemap::SourceMapSource {
-            filename: Arc::from("input.svelte"),
-            code: ast.source(),
-        }],
-        hints: vec![],
-    });
-
-    Ok(PrintedOutput { code, map })
+    Ok(build_printed_output(ast.source(), code))
 }
 
 pub(crate) fn print_modern_target(
@@ -54,17 +44,7 @@ pub(crate) fn print_modern_target(
         Arc::from(render_modern_target(ast, &options))
     };
 
-    let map = sourcemap::build_sparse_sourcemap(sourcemap::SparseMappingOptions {
-        output: &code,
-        output_filename: None,
-        sources: vec![sourcemap::SourceMapSource {
-            filename: Arc::from("input.svelte"),
-            code: ast.source(),
-        }],
-        hints: vec![],
-    });
-
-    Ok(PrintedOutput { code, map })
+    Ok(build_printed_output(ast.source(), code))
 }
 
 fn render_modern_target(ast: ModernPrintTarget<'_>, options: &PrintOptions) -> String {
@@ -85,80 +65,51 @@ fn render_modern_target(ast: ModernPrintTarget<'_>, options: &PrintOptions) -> S
     }
 }
 
+fn build_printed_output(source: &str, code: Arc<str>) -> PrintedOutput {
+    let map =
+        output::OutputContext::new(SourceText::new(SourceId::new(0), source, None), None, None)
+            .build_sparse_sourcemap(&code, "input.svelte", vec![]);
+    PrintedOutput { code, map }
+}
+
 pub(crate) fn compile_component(
     source: &str,
     options: CompileOptions,
 ) -> Result<CompileResult, CompileError> {
-    let parsed_component = crate::compiler::phases::parse::parse_component_for_compile(source)?;
-    let ast = crate::compiler::phases::parse::parse_component(
-        source,
-        ParseOptions {
-            mode: if options.modern_ast {
-                ParseMode::Modern
-            } else {
-                ParseMode::Legacy
-            },
-            loose: false,
-            ..Default::default()
-        },
-    )?;
-    let component_analysis =
-        crate::compiler::phases::analyze::analyze_component(&parsed_component, &options)?;
-    let ir = crate::compiler::phases::lower::lower_component(&component_analysis);
-    crate::compiler::phases::emit::emit_component(
-        &ir,
-        &options,
-        Some(ast),
-        crate::api::infer_runes_mode(&options, parsed_component.root()),
-    )
+    let lowered = compile_internal_component(source, &options)
+        .map_err(|error| error.with_filename(options.filename.as_deref()))?;
+    let ast = parse_public_component_ast(source, &options)
+        .map_err(|error| error.with_filename(options.filename.as_deref()))?;
+    crate::compiler::phases::emit::emit_component(&lowered, Some(ast))
+        .map_err(|error| error.with_filename(options.filename.as_deref()))
 }
 
 pub(crate) fn compile_module(
     source: &str,
     options: CompileOptions,
 ) -> Result<CompileResult, CompileError> {
-    let normalized_source = source.replace('\r', "");
-    let source = normalized_source.as_str();
-
-    crate::compiler::phases::analyze::validate_module(source)?;
+    let source_text = SourceText::new(SourceId::new(0), source, options.filename.as_deref());
+    crate::compiler::phases::analyze::validate_module(source_text)
+        .map_err(|error| error.with_filename(options.filename.as_deref()))?;
     if !crate::compiler::phases::parse::can_parse_js_program(source) {
-        return Err(CompileError::internal(
-            "failed to parse module source with oxc parser",
-        ));
+        return Err(
+            CompileError::internal("failed to parse module source with oxc parser")
+                .with_filename(options.filename.as_deref()),
+        );
     }
 
     let js_code =
-        codegen::compile_module_js_code(source, options.generate, options.filename.as_deref())?;
-    let include_map = options.sourcemap.is_some()
-        || options.output_filename.is_some()
-        || options.css_output_filename.is_some();
-    let js_map = include_map.then(|| {
-        sourcemap::build_sparse_sourcemap(sourcemap::SparseMappingOptions {
-            output: &js_code,
-            output_filename: options.output_filename.as_deref(),
-            sources: vec![sourcemap::SourceMapSource {
-                filename: Arc::from(
-                    options
-                        .filename
-                        .as_deref()
-                        .map(Utf8Path::as_str)
-                        .unwrap_or("module.svelte.js"),
-                ),
-                code: source,
-            }],
-            hints: vec![],
-        })
-    });
-    let js_map = match (js_map, options.sourcemap.as_ref()) {
-        (Some(map), Some(input))
-            if !input.mappings.is_empty()
-                || !input.sources.is_empty()
-                || !input.names.is_empty() =>
-        {
-            Some(sourcemap::compose_sourcemaps(&map, input))
-        }
-        (map, _) => map,
-    };
+        codegen::compile_module_js_code(source, options.generate, options.filename.as_deref())
+            .map_err(|error| error.with_filename(options.filename.as_deref()))?;
+    let output_ctx = output::OutputContext::new(
+        source_text,
+        options.output_filename.as_deref(),
+        options.sourcemap.as_ref(),
+    );
+    let js_map = output_ctx
+        .include_map(options.css_output_filename.as_deref())
+        .then(|| output_ctx.build_sparse_sourcemap(&js_code, "module.svelte.js", vec![]));
+    let js_map = output_ctx.compose_input_map(js_map);
 
     Ok(CompileResult {
         js: OutputArtifact {
@@ -171,4 +122,34 @@ pub(crate) fn compile_module(
         metadata: CompileMetadata { runes: true },
         ast: None,
     })
+}
+
+fn compile_internal_component<'a>(
+    source: &'a str,
+    options: &'a CompileOptions,
+) -> Result<LoweredComponent<'a>, CompileError> {
+    let parsed_component = crate::compiler::phases::parse::parse_component_for_compile(source)?;
+    let component_analysis =
+        crate::compiler::phases::analyze::analyze_component(parsed_component, options)?;
+    Ok(crate::compiler::phases::lower::lower_component(
+        component_analysis,
+    ))
+}
+
+fn parse_public_component_ast(
+    source: &str,
+    options: &CompileOptions,
+) -> Result<Document, CompileError> {
+    crate::compiler::phases::parse::parse_component(
+        source,
+        ParseOptions {
+            mode: if options.modern_ast {
+                ParseMode::Modern
+            } else {
+                ParseMode::Legacy
+            },
+            loose: false,
+            ..Default::default()
+        },
+    )
 }

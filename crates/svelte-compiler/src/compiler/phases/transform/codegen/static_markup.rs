@@ -1,3 +1,4 @@
+use crate::api::modern::{modern_node_end, modern_node_start};
 use crate::api::{FragmentStrategy, GenerateTarget};
 use crate::ast::modern::{
     Attribute, AttributeValue, AttributeValueList, Fragment, Node, RegularElement, Root,
@@ -159,8 +160,8 @@ fn extract_static_markup_template_from_root(source: &str, root: &Root) -> Option
 
     let mut markup = String::new();
     for node in nodes {
-        let start = crate::api::modern_node_start(node);
-        let end = crate::api::modern_node_end(node);
+        let start = modern_node_start(node);
+        let end = modern_node_end(node);
         markup.push_str(source.get(start..end)?);
     }
     Some(markup)

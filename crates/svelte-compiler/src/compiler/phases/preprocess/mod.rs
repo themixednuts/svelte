@@ -22,30 +22,30 @@ pub(crate) fn preprocess(
     let mut map = None;
 
     for group in options.groups.iter() {
-        if let Some(markup) = &group.markup {
-            if let Some(output) = markup(PreprocessMarkup {
+        if let Some(markup) = &group.markup
+            && let Some(output) = markup(PreprocessMarkup {
                 content: &code,
                 filename,
-            })? {
-                dependencies.extend(output.dependencies.iter().cloned());
-                if output.map.is_some() {
-                    map = output.map;
-                }
-                code = output.code;
+            })?
+        {
+            dependencies.extend(output.dependencies.iter().cloned());
+            if output.map.is_some() {
+                map = output.map;
             }
+            code = output.code;
         }
 
-        if let Some(markup) = &group.markup_async {
-            if let Some(output) = run_preprocess_future(markup(PreprocessMarkup {
+        if let Some(markup) = &group.markup_async
+            && let Some(output) = run_preprocess_future(markup(PreprocessMarkup {
                 content: &code,
                 filename,
-            }))? {
-                dependencies.extend(output.dependencies.iter().cloned());
-                if output.map.is_some() {
-                    map = output.map;
-                }
-                code = output.code;
+            }))?
+        {
+            dependencies.extend(output.dependencies.iter().cloned());
+            if output.map.is_some() {
+                map = output.map;
             }
+            code = output.code;
         }
 
         if let Some(script) = &group.script {
@@ -312,19 +312,19 @@ fn parse_tag_block<'a>(source: &'a str, start: usize, tag_name: &str) -> Option<
     let open_tag = source.get(start..open_end)?;
     let attributes = parse_attributes(raw_attributes);
 
-    if let Some(slash_index) = slash_index {
-        if only_whitespace(source.get(slash_index + 1..tag_close)?) {
-            return Some(TagBlock {
-                start,
-                end: open_end,
-                name: actual_name,
-                content: "",
-                attributes,
-                open_tag: Cow::Borrowed(open_tag),
-                raw_attributes,
-                self_closing: true,
-            });
-        }
+    if let Some(slash_index) = slash_index
+        && only_whitespace(source.get(slash_index + 1..tag_close)?)
+    {
+        return Some(TagBlock {
+            start,
+            end: open_end,
+            name: actual_name,
+            content: "",
+            attributes,
+            open_tag: Cow::Borrowed(open_tag),
+            raw_attributes,
+            self_closing: true,
+        });
     }
 
     let closing = format!("</{tag_name}>");

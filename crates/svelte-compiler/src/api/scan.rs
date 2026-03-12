@@ -1,12 +1,13 @@
+use crate::names::OrderedNames;
 use std::sync::Arc;
 
-pub(crate) fn parse_svelte_ignores(comment_data: &str) -> Vec<Arc<str>> {
+pub(crate) fn parse_svelte_ignores(comment_data: &str) -> Box<[Arc<str>]> {
     let trimmed = comment_data.trim_start();
     let Some(rest) = trimmed.strip_prefix("svelte-ignore") else {
-        return Vec::new();
+        return Box::default();
     };
 
-    let mut ignores = Vec::new();
+    let mut ignores = OrderedNames::default();
     let mut token = String::new();
     for ch in rest.chars() {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '$' {
@@ -22,7 +23,7 @@ pub(crate) fn parse_svelte_ignores(comment_data: &str) -> Vec<Arc<str>> {
         push_ignore_code_variants(&token, &mut ignores);
     }
 
-    ignores
+    ignores.into_boxed_slice()
 }
 
 pub(crate) fn migrate_svelte_ignore(text: &str) -> Option<String> {
@@ -60,7 +61,7 @@ pub(crate) fn migrate_svelte_ignore(text: &str) -> Option<String> {
     Some(output)
 }
 
-fn push_ignore_code_variants(code: &str, ignores: &mut Vec<Arc<str>>) {
+fn push_ignore_code_variants(code: &str, ignores: &mut OrderedNames) {
     push_unique_ignore(code, ignores);
 
     if let Some(replacement) = legacy_ignore_replacement(code) {
@@ -89,11 +90,8 @@ fn legacy_ignore_replacement(code: &str) -> Option<&'static str> {
     }
 }
 
-fn push_unique_ignore(code: &str, ignores: &mut Vec<Arc<str>>) {
-    if ignores.iter().any(|existing| existing.as_ref() == code) {
-        return;
-    }
-    ignores.push(Arc::from(code));
+fn push_unique_ignore(code: &str, ignores: &mut OrderedNames) {
+    ignores.extend([Arc::from(code)]);
 }
 
 fn svelte_ignore_directive_prefix_len(text: &str) -> Option<usize> {
@@ -154,35 +152,6 @@ fn is_hyphenated_ignore_code(token: &str) -> bool {
 
 fn is_ignore_word_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-pub(crate) fn find_valid_legacy_closing_tag_start(
-    source: &str,
-    start: usize,
-    end: usize,
-    tag_name: &str,
-) -> Option<usize> {
-    if start >= end || tag_name.is_empty() {
-        return None;
-    }
-
-    let needle = format!("</{tag_name}");
-    let mut search_from = start;
-
-    while search_from < end {
-        let rel = source.get(search_from..end)?.find(&needle)?;
-        let candidate_start = search_from + rel;
-        let next = source
-            .as_bytes()
-            .get(candidate_start + needle.len())
-            .copied();
-        if next.is_none_or(|byte| matches!(byte, b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r')) {
-            return Some(candidate_start);
-        }
-        search_from = candidate_start.saturating_add(1);
-    }
-
-    None
 }
 
 pub(crate) fn find_matching_paren(source: &str, open_index: usize) -> Option<usize> {

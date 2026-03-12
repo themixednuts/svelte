@@ -1,48 +1,61 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use camino::Utf8Path;
-use camino::Utf8PathBuf;
-use html_escape::decode_html_entities as decode_html_entities_cow;
-use lightningcss::stylesheet::ParserOptions as LightningParserOptions;
-use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Point};
-
 use crate::ast::common::Span;
-use crate::ast::modern::{EstreeNode, RootCommentType};
+use crate::ast::modern::EstreeNode;
 use crate::ast::{CssAst, Document};
 use crate::error::SourcePosition;
 use crate::{CompileError, SourceLocation};
+use camino::Utf8Path;
+use camino::Utf8PathBuf;
+use lightningcss::stylesheet::ParserOptions as LightningParserOptions;
+use serde::{Deserialize, Serialize};
 
-mod elements;
-mod legacy;
 pub(crate) mod modern;
 mod runes_mode;
 pub(crate) mod scan;
 pub(crate) mod validation;
-pub(crate) use elements::*;
-pub(crate) use legacy::parse_root as parse_legacy_root_from_cst;
-pub(crate) use legacy::{
-    find_first_named_child, legacy_expression_from_raw_node, parse_identifier_name,
-    parse_modern_attributes, source_location_from_point, text_for_node,
-};
-pub(crate) use modern::parse_root as parse_root_from_cst;
-pub(crate) use modern::{
-    attach_estree_comments_to_tree, attach_leading_comments_to_expression,
-    attach_trailing_comments_to_expression, estree_value_to_usize, expression_identifier_name,
-    find_matching_brace_close, legacy_expression_from_modern_expression, line_column_at_offset,
-    modern_empty_identifier_expression, modern_node_end, modern_node_span, modern_node_start,
-    named_children_vec, normalize_estree_node, normalize_pattern_template_elements,
-    parse_all_comment_nodes, parse_leading_comment_nodes, parse_modern_expression_from_text,
-    parse_modern_expression_tag, position_raw_node,
-};
 pub(crate) use runes_mode::*;
 pub(crate) use scan::*;
+pub(crate) use svelte_syntax::{
+    ElementKind, SvelteElementKind, classify_element_name, is_custom_element_name,
+    is_valid_component_name, is_valid_element_name, is_void_element_name,
+};
 
 pub static VERSION: &str = "5.53.9";
+
+macro_rules! impl_enum_text_traits {
+    ($ty:ty { $($text:literal => $variant:path),+ $(,)? }) => {
+        impl $ty {
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $($variant => $text),+
+                }
+            }
+        }
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $ty {
+            type Err = ();
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($text => Ok($variant),)+
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
 
 #[derive(Clone, Copy)]
 pub struct CssHashInput<'a> {
@@ -66,6 +79,7 @@ impl fmt::Debug for CssHashInput<'_> {
 pub struct WarningFilterCallback(Arc<dyn Fn(&Warning) -> bool + 'static>);
 
 impl WarningFilterCallback {
+    #[must_use]
     pub fn new<F>(callback: F) -> Self
     where
         F: Fn(&Warning) -> bool + 'static,
@@ -88,11 +102,13 @@ impl fmt::Debug for WarningFilterCallback {
 pub struct CssHashGetterCallback(Arc<dyn for<'a> Fn(CssHashInput<'a>) -> Arc<str> + 'static>);
 
 impl CssHashGetterCallback {
-    pub fn new<F>(callback: F) -> Self
+    #[must_use]
+    pub fn new<F, S>(callback: F) -> Self
     where
-        F: for<'a> Fn(CssHashInput<'a>) -> Arc<str> + 'static,
+        F: for<'a> Fn(CssHashInput<'a>) -> S + 'static,
+        S: Into<Arc<str>>,
     {
-        Self(Arc::new(callback))
+        Self(Arc::new(move |input| callback(input).into()))
     }
 
     pub(crate) fn call(&self, input: CssHashInput<'_>) -> Arc<str> {
@@ -114,6 +130,11 @@ pub enum ParseMode {
     Modern,
 }
 
+impl_enum_text_traits!(ParseMode {
+    "legacy" => ParseMode::Legacy,
+    "modern" => ParseMode::Modern,
+});
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ParseOptions {
@@ -125,6 +146,7 @@ pub struct ParseOptions {
 }
 
 impl ParseOptions {
+    #[must_use]
     pub fn effective_mode(&self) -> ParseMode {
         match self.modern {
             Some(true) => ParseMode::Modern,
@@ -134,15 +156,19 @@ impl ParseOptions {
     }
 }
 
+type PrintCommentGetter = dyn Fn(&EstreeNode) -> Box<[EstreeNode]> + 'static;
+
 #[derive(Clone)]
-pub struct PrintCommentGetterCallback(Arc<dyn Fn(&EstreeNode) -> Box<[EstreeNode]> + 'static>);
+pub struct PrintCommentGetterCallback(Arc<PrintCommentGetter>);
 
 impl PrintCommentGetterCallback {
-    pub fn new<F>(callback: F) -> Self
+    #[must_use]
+    pub fn new<F, C>(callback: F) -> Self
     where
-        F: Fn(&EstreeNode) -> Box<[EstreeNode]> + 'static,
+        F: Fn(&EstreeNode) -> C + 'static,
+        C: Into<Box<[EstreeNode]>>,
     {
-        Self(Arc::new(callback))
+        Self(Arc::new(move |node| callback(node).into()))
     }
 
     pub(crate) fn call(&self, node: &EstreeNode) -> Box<[EstreeNode]> {
@@ -315,6 +341,12 @@ pub enum Namespace {
     Mathml,
 }
 
+impl_enum_text_traits!(Namespace {
+    "html" => Namespace::Html,
+    "svg" => Namespace::Svg,
+    "mathml" => Namespace::Mathml,
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CssOutputMode {
@@ -322,6 +354,11 @@ pub enum CssOutputMode {
     #[default]
     External,
 }
+
+impl_enum_text_traits!(CssOutputMode {
+    "injected" => CssOutputMode::Injected,
+    "external" => CssOutputMode::External,
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CompatibilityComponentApi {
@@ -331,6 +368,11 @@ pub enum CompatibilityComponentApi {
     #[serde(rename = "5")]
     V5,
 }
+
+impl_enum_text_traits!(CompatibilityComponentApi {
+    "4" => CompatibilityComponentApi::V4,
+    "5" => CompatibilityComponentApi::V5,
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CompatibilityOptions {
@@ -346,6 +388,12 @@ pub enum GenerateTarget {
     Server,
 }
 
+impl_enum_text_traits!(GenerateTarget {
+    "none" => GenerateTarget::None,
+    "client" => GenerateTarget::Client,
+    "server" => GenerateTarget::Server,
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FragmentStrategy {
@@ -354,6 +402,11 @@ pub enum FragmentStrategy {
     Tree,
 }
 
+impl_enum_text_traits!(FragmentStrategy {
+    "html" => FragmentStrategy::Html,
+    "tree" => FragmentStrategy::Tree,
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ErrorMode {
@@ -361,6 +414,11 @@ pub enum ErrorMode {
     Error,
     Warn,
 }
+
+impl_enum_text_traits!(ErrorMode {
+    "error" => ErrorMode::Error,
+    "warn" => ErrorMode::Warn,
+});
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -587,6 +645,7 @@ impl fmt::Debug for PreprocessorGroup {
 }
 
 impl PreprocessorGroup {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -623,6 +682,7 @@ pub struct MigrateResult {
 pub struct Compiler;
 
 impl Compiler {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -672,7 +732,7 @@ impl Compiler {
         source: &str,
         options: PreprocessOptions,
     ) -> Result<PreprocessResult, CompileError> {
-        crate::compiler::preprocess(source, options)
+        crate::compiler::phases::preprocess::preprocess(source, options)
     }
 
     pub fn migrate(
@@ -680,7 +740,7 @@ impl Compiler {
         source: &str,
         options: MigrateOptions,
     ) -> Result<MigrateResult, CompileError> {
-        crate::compiler::migrate(source, options)
+        crate::compiler::phases::migrate::migrate(source, options)
     }
 }
 

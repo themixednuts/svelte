@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
+use rustc_hash::FxHashMap;
 
 use crate::api::SourceMap;
 
@@ -33,6 +34,42 @@ struct GeneratedSegment {
     priority: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ArcInterner {
+    values: Vec<Arc<str>>,
+    lookup: FxHashMap<Arc<str>, usize>,
+}
+
+impl ArcInterner {
+    fn with_values(values: Vec<Arc<str>>) -> Self {
+        let lookup = values
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, value)| (value, index))
+            .collect();
+        Self { values, lookup }
+    }
+
+    fn intern_arc(&mut self, value: Arc<str>) -> usize {
+        if let Some(index) = self.lookup.get(&value).copied() {
+            return index;
+        }
+        let index = self.values.len();
+        self.values.push(value.clone());
+        self.lookup.insert(value, index);
+        index
+    }
+
+    fn intern_str(&mut self, value: &str) -> usize {
+        self.intern_arc(Arc::from(value))
+    }
+
+    fn into_boxed_slice(self) -> Box<[Arc<str>]> {
+        self.values.into_boxed_slice()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SourceMapSource<'a> {
     pub filename: Arc<str>,
@@ -61,8 +98,7 @@ pub(crate) fn build_sparse_sourcemap(options: SparseMappingOptions<'_>) -> Sourc
         .map(|source| relativize_source_path(options.output_filename, source.filename.as_ref()))
         .collect::<Vec<_>>();
 
-    let mut names = Vec::<Arc<str>>::new();
-    let mut name_index_by_value = BTreeMap::<Arc<str>, usize>::new();
+    let mut names = ArcInterner::default();
     let mut segments_by_generated = BTreeMap::<usize, GeneratedSegment>::new();
 
     for (source_index, source) in options.sources.iter().enumerate() {
@@ -72,7 +108,6 @@ pub(crate) fn build_sparse_sourcemap(options: SparseMappingOptions<'_>) -> Sourc
             source_index,
             &mut segments_by_generated,
             &mut names,
-            &mut name_index_by_value,
         );
     }
 
@@ -85,7 +120,6 @@ pub(crate) fn build_sparse_sourcemap(options: SparseMappingOptions<'_>) -> Sourc
                 hint,
                 &mut segments_by_generated,
                 &mut names,
-                &mut name_index_by_value,
             );
         }
     }
@@ -239,21 +273,8 @@ pub(crate) fn compose_sourcemaps(outer: &SourceMap, inner: &SourceMap) -> Source
     let decoded_outer = decode_mappings(outer.mappings.as_ref());
     let decoded_inner = decode_mappings(inner.mappings.as_ref());
 
-    let mut names = inner.names.iter().cloned().collect::<Vec<_>>();
-    let mut name_lookup = names
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect::<BTreeMap<Arc<str>, usize>>();
-
-    let mut sources = inner.sources.iter().cloned().collect::<Vec<_>>();
-    let mut source_lookup = sources
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect::<BTreeMap<Arc<str>, usize>>();
+    let mut names = ArcInterner::with_values(inner.names.to_vec());
+    let mut sources = ArcInterner::with_values(inner.sources.to_vec());
 
     let mut composed_lines = Vec::<Vec<DecodedSegment>>::with_capacity(decoded_outer.len());
 
@@ -275,12 +296,12 @@ pub(crate) fn compose_sourcemaps(outer: &SourceMap, inner: &SourceMap) -> Source
             let Some(source) = source else {
                 continue;
             };
-            let source_index = intern_arc(&mut sources, &mut source_lookup, source);
+            let source_index = sources.intern_arc(source);
 
             let name_index = traced
                 .name_index
                 .and_then(|index| inner.names.get(index).cloned())
-                .map(|name| intern_arc(&mut names, &mut name_lookup, name));
+                .map(|name| names.intern_arc(name));
 
             composed_line.push(DecodedSegment {
                 generated_column: segment.generated_column,
@@ -311,21 +332,8 @@ pub(crate) fn merge_sourcemaps(base: &SourceMap, overlay: &SourceMap) -> SourceM
     let base_decoded = decode_mappings(base.mappings.as_ref());
     let overlay_decoded = decode_mappings(overlay.mappings.as_ref());
 
-    let mut sources = base.sources.iter().cloned().collect::<Vec<_>>();
-    let mut source_lookup = sources
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect::<BTreeMap<Arc<str>, usize>>();
-
-    let mut names = base.names.iter().cloned().collect::<Vec<_>>();
-    let mut name_lookup = names
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect::<BTreeMap<Arc<str>, usize>>();
+    let mut sources = ArcInterner::with_values(base.sources.to_vec());
+    let mut names = ArcInterner::with_values(base.names.to_vec());
 
     let max_len = base_decoded.len().max(overlay_decoded.len());
     let mut merged = Vec::with_capacity(max_len);
@@ -339,11 +347,11 @@ pub(crate) fn merge_sourcemaps(base: &SourceMap, overlay: &SourceMap) -> SourceM
                 let Some(source) = source else {
                     continue;
                 };
-                let source_index = intern_arc(&mut sources, &mut source_lookup, source);
+                let source_index = sources.intern_arc(source);
                 let name_index = segment
                     .name_index
                     .and_then(|index| base.names.get(index).cloned())
-                    .map(|name| intern_arc(&mut names, &mut name_lookup, name));
+                    .map(|name| names.intern_arc(name));
                 line.insert(
                     segment.generated_column,
                     DecodedSegment {
@@ -363,11 +371,11 @@ pub(crate) fn merge_sourcemaps(base: &SourceMap, overlay: &SourceMap) -> SourceM
                 let Some(source) = source else {
                     continue;
                 };
-                let source_index = intern_arc(&mut sources, &mut source_lookup, source);
+                let source_index = sources.intern_arc(source);
                 let name_index = segment
                     .name_index
                     .and_then(|index| overlay.names.get(index).cloned())
-                    .map(|name| intern_arc(&mut names, &mut name_lookup, name));
+                    .map(|name| names.intern_arc(name));
                 line.insert(
                     segment.generated_column,
                     DecodedSegment {
@@ -400,21 +408,23 @@ fn add_sparse_identity_matches(
     source: &str,
     source_index: usize,
     segments_by_generated: &mut BTreeMap<usize, GeneratedSegment>,
-    names: &mut Vec<Arc<str>>,
-    name_index_by_value: &mut BTreeMap<Arc<str>, usize>,
+    names: &mut ArcInterner,
 ) {
     let candidates = extract_sparse_candidates(source);
     for candidate in candidates {
         add_sparse_pair_matches(
-            output,
-            source,
-            source_index,
-            &candidate,
-            &candidate,
-            None,
-            segments_by_generated,
-            names,
-            name_index_by_value,
+            SparseMatchInput {
+                output,
+                source,
+                source_index,
+                original: &candidate,
+                generated: &candidate,
+                name: None,
+            },
+            SparseMatchRegistry {
+                segments_by_generated,
+                names,
+            },
         );
     }
 }
@@ -425,34 +435,51 @@ fn add_sparse_hint_matches(
     source_index: usize,
     hint: &SparseMappingHint<'_>,
     segments_by_generated: &mut BTreeMap<usize, GeneratedSegment>,
-    names: &mut Vec<Arc<str>>,
-    name_index_by_value: &mut BTreeMap<Arc<str>, usize>,
+    names: &mut ArcInterner,
 ) {
     add_sparse_pair_matches(
-        output,
-        source,
-        source_index,
-        hint.original,
-        hint.generated,
-        hint.name,
-        segments_by_generated,
-        names,
-        name_index_by_value,
+        SparseMatchInput {
+            output,
+            source,
+            source_index,
+            original: hint.original,
+            generated: hint.generated,
+            name: hint.name,
+        },
+        SparseMatchRegistry {
+            segments_by_generated,
+            names,
+        },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn add_sparse_pair_matches(
-    output: &str,
-    source: &str,
+struct SparseMatchInput<'a> {
+    output: &'a str,
+    source: &'a str,
     source_index: usize,
-    original: &str,
-    generated: &str,
-    name: Option<&str>,
-    segments_by_generated: &mut BTreeMap<usize, GeneratedSegment>,
-    names: &mut Vec<Arc<str>>,
-    name_index_by_value: &mut BTreeMap<Arc<str>, usize>,
-) {
+    original: &'a str,
+    generated: &'a str,
+    name: Option<&'a str>,
+}
+
+struct SparseMatchRegistry<'a> {
+    segments_by_generated: &'a mut BTreeMap<usize, GeneratedSegment>,
+    names: &'a mut ArcInterner,
+}
+
+fn add_sparse_pair_matches(input: SparseMatchInput<'_>, registry: SparseMatchRegistry<'_>) {
+    let SparseMatchInput {
+        output,
+        source,
+        source_index,
+        original,
+        generated,
+        name,
+    } = input;
+    let SparseMatchRegistry {
+        segments_by_generated,
+        names,
+    } = registry;
     if original.is_empty() || generated.is_empty() {
         return;
     }
@@ -465,7 +492,7 @@ fn add_sparse_pair_matches(
     }
 
     let priority = generated.len().max(original.len());
-    let name_index = name.map(|value| intern_name(value, names, name_index_by_value));
+    let name_index = name.map(|value| names.intern_str(value));
 
     for index in 0..shared {
         let original_offset = original_offsets[index];
@@ -649,21 +676,6 @@ fn find_all_occurrences(haystack: &str, needle: &str) -> Vec<usize> {
     out
 }
 
-fn intern_name(
-    value: &str,
-    names: &mut Vec<Arc<str>>,
-    name_index_by_value: &mut BTreeMap<Arc<str>, usize>,
-) -> usize {
-    let key: Arc<str> = Arc::from(value);
-    if let Some(index) = name_index_by_value.get(&key).copied() {
-        return index;
-    }
-    let index = names.len();
-    names.push(key.clone());
-    name_index_by_value.insert(key, index);
-    index
-}
-
 fn encode_segments(
     mut segments: Vec<GeneratedSegment>,
     output_lines: &LineIndex,
@@ -781,20 +793,6 @@ fn from_vlq_signed(value: i64) -> i64 {
     let negative = (value & 1) == 1;
     let shifted = value >> 1;
     if negative { -shifted } else { shifted }
-}
-
-fn intern_arc(
-    values: &mut Vec<Arc<str>>,
-    lookup: &mut BTreeMap<Arc<str>, usize>,
-    value: Arc<str>,
-) -> usize {
-    if let Some(index) = lookup.get(&value).copied() {
-        return index;
-    }
-    let index = values.len();
-    values.push(value.clone());
-    lookup.insert(value, index);
-    index
 }
 
 fn relativize_source_path(output_filename: Option<&Utf8Path>, source_filename: &str) -> Arc<str> {

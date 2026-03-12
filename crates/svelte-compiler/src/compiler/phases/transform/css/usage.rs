@@ -1,6 +1,8 @@
 //! CSS usage context built from AST traversal.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{collections::BTreeMap, sync::Arc};
+
+use rustc_hash::FxHashSet;
 
 use crate::api::modern::{
     RawField, estree_node_field, estree_node_field_array, estree_node_field_object,
@@ -10,17 +12,20 @@ use crate::ast::modern::{
     Attribute, AttributeValue, AttributeValueList, Expression, Fragment, Node, Root,
 };
 
-#[derive(Debug, Default)]
+type CssName = Arc<str>;
+type CssNameSet = FxHashSet<CssName>;
+type CssAttributeMap = BTreeMap<CssName, CssName>;
+
+#[derive(Debug)]
 pub(crate) struct CssUsageContext {
-    pub(crate) classes: HashSet<String>,
-    pub(crate) ids: HashSet<String>,
-    pub(crate) tags: HashSet<String>,
-    pub(crate) dynamic_attributes: HashSet<String>,
+    pub(crate) classes: CssNameSet,
+    pub(crate) ids: CssNameSet,
+    pub(crate) tags: CssNameSet,
+    pub(crate) dynamic_attributes: CssNameSet,
     pub(crate) class_name_unbounded: bool,
-    pub(crate) render_parent_elements: HashSet<usize>,
+    pub(crate) render_parent_elements: FxHashSet<usize>,
     pub(crate) root_has_render: bool,
     pub(crate) has_render_tags: bool,
-    pub(crate) has_spread_attributes: bool,
     pub(crate) allow_pruning: bool,
     pub(crate) has_dynamic_svelte_element: bool,
     pub(crate) has_dynamic_markup: bool,
@@ -29,21 +34,83 @@ pub(crate) struct CssUsageContext {
     pub(crate) has_slot_tags: bool,
     pub(crate) has_component_like_elements: bool,
     pub(crate) dev: bool,
-    pub(crate) each_first_tags: HashSet<String>,
-    pub(crate) each_first_classes: HashSet<String>,
-    pub(crate) each_last_tags: HashSet<String>,
-    pub(crate) each_last_classes: HashSet<String>,
-    pub(crate) each_before_tags: HashSet<String>,
-    pub(crate) each_before_classes: HashSet<String>,
-    pub(crate) each_after_tags: HashSet<String>,
-    pub(crate) each_after_classes: HashSet<String>,
-    pub(crate) elements: Vec<CssElementUsage>,
+    pub(crate) each_first_tags: CssNameSet,
+    pub(crate) each_first_classes: CssNameSet,
+    pub(crate) each_last_tags: CssNameSet,
+    pub(crate) each_last_classes: CssNameSet,
+    pub(crate) each_before_tags: CssNameSet,
+    pub(crate) each_before_classes: CssNameSet,
+    pub(crate) each_after_tags: CssNameSet,
+    pub(crate) each_after_classes: CssNameSet,
+    pub(crate) elements: Box<[CssElementUsage]>,
+}
+
+#[derive(Debug, Default)]
+struct CssUsageBuilder {
+    classes: CssNameSet,
+    ids: CssNameSet,
+    tags: CssNameSet,
+    dynamic_attributes: CssNameSet,
+    class_name_unbounded: bool,
+    render_parent_elements: FxHashSet<usize>,
+    root_has_render: bool,
+    has_render_tags: bool,
+    has_spread_attributes: bool,
+    allow_pruning: bool,
+    has_dynamic_svelte_element: bool,
+    has_dynamic_markup: bool,
+    has_each_blocks: bool,
+    has_non_each_dynamic_markup: bool,
+    has_slot_tags: bool,
+    has_component_like_elements: bool,
+    dev: bool,
+    each_first_tags: CssNameSet,
+    each_first_classes: CssNameSet,
+    each_last_tags: CssNameSet,
+    each_last_classes: CssNameSet,
+    each_before_tags: CssNameSet,
+    each_before_classes: CssNameSet,
+    each_after_tags: CssNameSet,
+    each_after_classes: CssNameSet,
+    elements: Vec<CssElementUsage>,
+}
+
+impl CssUsageBuilder {
+    fn finish(self) -> CssUsageContext {
+        CssUsageContext {
+            classes: self.classes,
+            ids: self.ids,
+            tags: self.tags,
+            dynamic_attributes: self.dynamic_attributes,
+            class_name_unbounded: self.class_name_unbounded,
+            render_parent_elements: self.render_parent_elements,
+            root_has_render: self.root_has_render,
+            has_render_tags: self.has_render_tags,
+            allow_pruning: self.allow_pruning,
+            has_dynamic_svelte_element: self.has_dynamic_svelte_element,
+            has_dynamic_markup: self.has_dynamic_markup,
+            has_each_blocks: self.has_each_blocks,
+            has_non_each_dynamic_markup: self.has_non_each_dynamic_markup,
+            has_slot_tags: self.has_slot_tags,
+            has_component_like_elements: self.has_component_like_elements,
+            dev: self.dev,
+            each_first_tags: self.each_first_tags,
+            each_first_classes: self.each_first_classes,
+            each_last_tags: self.each_last_tags,
+            each_last_classes: self.each_last_classes,
+            each_before_tags: self.each_before_tags,
+            each_before_classes: self.each_before_classes,
+            each_after_tags: self.each_after_tags,
+            each_after_classes: self.each_after_classes,
+            elements: self.elements.into_boxed_slice(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CssElementUsage {
-    pub(crate) tag: String,
-    pub(crate) attributes: BTreeMap<String, String>,
+    pub(crate) tag: CssName,
+    pub(crate) attributes: CssAttributeMap,
     pub(crate) parent: Option<usize>,
     pub(crate) depth: usize,
     pub(crate) component_depth: Option<usize>,
@@ -52,8 +119,8 @@ pub(crate) struct CssElementUsage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CssAttributeFilter {
-    pub(crate) name: String,
-    pub(crate) value: String,
+    pub(crate) name: CssName,
+    pub(crate) value: CssName,
     pub(crate) case_insensitive: bool,
     pub(crate) match_kind: CssAttributeMatchKind,
 }
@@ -78,8 +145,8 @@ pub(crate) enum EachBoundaryKind {
 
 #[derive(Clone, Copy)]
 pub(crate) struct BoundaryCandidates<'a> {
-    pub(crate) tags: &'a HashSet<String>,
-    pub(crate) classes: &'a HashSet<String>,
+    pub(crate) tags: &'a CssNameSet,
+    pub(crate) classes: &'a CssNameSet,
 }
 
 impl CssUsageContext {
@@ -132,7 +199,7 @@ const MAX_CLASS_VALUE_VARIANTS: usize = 128;
 
 #[derive(Default)]
 struct ClassValueAnalysis {
-    tokens: HashSet<String>,
+    tokens: CssNameSet,
     unbounded: bool,
 }
 
@@ -144,7 +211,7 @@ fn analyze_class_expression(expression: &Expression) -> ClassValueAnalysis {
         };
     }
 
-    let mut tokens = HashSet::new();
+    let mut tokens = CssNameSet::default();
     let bounded = collect_class_candidates_from_raw(&expression.0, &mut tokens);
     ClassValueAnalysis {
         tokens,
@@ -154,7 +221,7 @@ fn analyze_class_expression(expression: &Expression) -> ClassValueAnalysis {
 
 fn collect_class_candidates_from_raw(
     raw: &crate::ast::modern::EstreeNode,
-    classes: &mut HashSet<String>,
+    classes: &mut CssNameSet,
 ) -> bool {
     let ty = match estree_node_type(raw) {
         Some(t) => t,
@@ -287,7 +354,7 @@ fn estree_value_to_object(
 
 fn extract_string_tokens_from_raw_value(
     val: &crate::ast::modern::EstreeValue,
-    classes: &mut HashSet<String>,
+    classes: &mut CssNameSet,
 ) {
     if let crate::ast::modern::EstreeValue::String(s) = val {
         add_class_tokens_from_string(s, classes);
@@ -296,12 +363,12 @@ fn extract_string_tokens_from_raw_value(
 
 fn extract_object_property_key_tokens(
     node: &crate::ast::modern::EstreeNode,
-    classes: &mut HashSet<String>,
+    classes: &mut CssNameSet,
 ) -> bool {
     match estree_node_type(node) {
         Some("Identifier") => {
             if let Some(name) = estree_node_field_str(node, RawField::Name) {
-                classes.insert(name.to_string());
+                classes.insert(shared_name(name));
             }
             true
         }
@@ -315,16 +382,16 @@ fn extract_object_property_key_tokens(
     }
 }
 
-fn add_class_tokens_from_string(value: &str, classes: &mut HashSet<String>) {
+fn add_class_tokens_from_string(value: &str, classes: &mut CssNameSet) {
     for token in value.split_ascii_whitespace() {
         if !token.is_empty() {
-            classes.insert(token.to_string());
+            classes.insert(shared_name(token));
         }
     }
 }
 
-fn class_tokens_from_variants(variants: &[String]) -> HashSet<String> {
-    let mut tokens = HashSet::new();
+fn class_tokens_from_variants(variants: &[String]) -> CssNameSet {
+    let mut tokens = CssNameSet::default();
     for value in variants {
         add_class_tokens_from_string(value, &mut tokens);
     }
@@ -516,7 +583,7 @@ fn static_attribute_text_from_raw(raw: &crate::ast::modern::EstreeNode) -> Optio
 
 /// Build CSS usage context by walking the AST instead of scanning source.
 pub(crate) fn build_css_usage_context(root: &Root, dev: bool) -> CssUsageContext {
-    let mut context = CssUsageContext {
+    let mut context = CssUsageBuilder {
         dev,
         ..Default::default()
     };
@@ -540,7 +607,7 @@ pub(crate) fn build_css_usage_context(root: &Root, dev: bool) -> CssUsageContext
     context.allow_pruning =
         !context.has_spread_attributes && !has_unprunable_class_expression_from_ast(&root.fragment);
 
-    context
+    context.finish()
 }
 
 fn has_spread_attributes_from_ast(fragment: &Fragment) -> bool {
@@ -640,7 +707,7 @@ fn has_spread_attributes_from_ast(fragment: &Fragment) -> bool {
     false
 }
 
-fn collect_ast_flags_and_ranges(fragment: &Fragment, context: &mut CssUsageContext) {
+fn collect_ast_flags_and_ranges(fragment: &Fragment, context: &mut CssUsageBuilder) {
     for node in fragment.nodes.iter() {
         match node {
             Node::EachBlock(block) => {
@@ -921,7 +988,7 @@ fn class_string_variants_from_parts(values: &[AttributeValue]) -> Option<Vec<Str
 
 fn collect_element_usages_from_fragment(
     fragment: &Fragment,
-    context: &mut CssUsageContext,
+    context: &mut CssUsageBuilder,
     parent: Option<usize>,
     depth: usize,
     component_depth: Option<usize>,
@@ -940,12 +1007,14 @@ fn collect_element_usages_from_fragment(
                 process_element(
                     el.name.as_ref(),
                     el.attributes.as_ref(),
-                    false,
-                    regular_element_is_optional(el),
                     context,
-                    parent,
-                    depth,
-                    component_depth,
+                    ElementVisit {
+                        is_component_like: false,
+                        optional: regular_element_is_optional(el),
+                        parent,
+                        depth,
+                        component_depth,
+                    },
                 );
                 if !is_void_element(el.name.as_ref()) {
                     let child_component_depth =
@@ -973,12 +1042,14 @@ fn collect_element_usages_from_fragment(
                 process_element(
                     el.name.as_ref(),
                     el.attributes.as_ref(),
-                    false,
-                    false,
                     context,
-                    parent,
-                    depth,
-                    component_depth,
+                    ElementVisit {
+                        is_component_like: false,
+                        optional: false,
+                        parent,
+                        depth,
+                        component_depth,
+                    },
                 );
                 let child_component_depth = component_depth.map(|value| value.saturating_add(1));
                 collect_element_usages_from_fragment(
@@ -990,16 +1061,17 @@ fn collect_element_usages_from_fragment(
                 );
             }
             Node::SvelteElement(el) => {
-                let optional = el.expression.is_some();
                 process_element(
                     el.name.as_ref(),
                     el.attributes.as_ref(),
-                    false,
-                    optional,
                     context,
-                    parent,
-                    depth,
-                    component_depth,
+                    ElementVisit {
+                        is_component_like: false,
+                        optional: el.expression.is_some(),
+                        parent,
+                        depth,
+                        component_depth,
+                    },
                 );
                 let child_component_depth = component_depth.map(|value| value.saturating_add(1));
                 collect_element_usages_from_fragment(
@@ -1130,38 +1202,47 @@ fn collect_element_usages_from_fragment(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process_element(
-    name: &str,
-    attributes: &[Attribute],
+fn shared_name(value: impl Into<Arc<str>>) -> CssName {
+    value.into()
+}
+
+#[derive(Clone, Copy)]
+struct ElementVisit {
     is_component_like: bool,
     optional: bool,
-    context: &mut CssUsageContext,
     parent: Option<usize>,
     depth: usize,
     component_depth: Option<usize>,
+}
+
+fn process_element(
+    name: &str,
+    attributes: &[Attribute],
+    context: &mut CssUsageBuilder,
+    visit: ElementVisit,
 ) {
-    let tag = name.to_ascii_lowercase();
-    if is_component_like {
+    let tag = shared_name(name.to_ascii_lowercase());
+    if visit.is_component_like {
         context.has_component_like_elements = true;
     }
-    context.tags.insert(tag.clone());
+    context.tags.insert(Arc::clone(&tag));
 
-    let mut attrs = BTreeMap::new();
+    let mut attrs = CssAttributeMap::new();
     for attr in attributes {
         match attr {
             Attribute::Attribute(named) => {
-                let key = named.name.as_ref().to_ascii_lowercase();
+                let key = shared_name(named.name.as_ref().to_ascii_lowercase());
                 let static_value = static_attribute_text_from_value(&named.value);
-                if key == "class" {
+                if key.as_ref() == "class" {
                     let analysis = analyze_class_attribute_value(&named.value);
                     context.classes.extend(analysis.tokens);
                     context.class_name_unbounded |= analysis.unbounded;
-                } else if key == "id"
+                } else if key.as_ref() == "id"
                     && let Some(value) = static_value.as_ref()
                 {
-                    context.ids.insert(value.clone());
-                    attrs.insert(key.clone(), value.clone());
+                    let value = shared_name(value.clone());
+                    context.ids.insert(Arc::clone(&value));
+                    attrs.insert(Arc::clone(&key), value);
                 }
                 if static_value.is_none()
                     && (matches!(named.value, AttributeValueList::ExpressionTag(_))
@@ -1171,10 +1252,10 @@ fn process_element(
                                 if values.iter().any(|value| matches!(value, AttributeValue::ExpressionTag(_)))
                         ))
                 {
-                    context.dynamic_attributes.insert(key.clone());
+                    context.dynamic_attributes.insert(Arc::clone(&key));
                 }
                 if let Some(value) = static_value {
-                    attrs.insert(key, value);
+                    attrs.insert(key, shared_name(value));
                 }
             }
             Attribute::ClassDirective(directive) => {
@@ -1186,7 +1267,7 @@ fn process_element(
                     .unwrap_or("")
                     .trim();
                 if !name_str.is_empty() {
-                    context.classes.insert(name_str.to_string());
+                    context.classes.insert(shared_name(name_str));
                 }
             }
             _ => {}
@@ -1195,19 +1276,19 @@ fn process_element(
 
     let _element_index = context.elements.len();
     context.elements.push(CssElementUsage {
-        tag: tag.clone(),
+        tag,
         attributes: attrs,
-        parent,
-        depth,
-        component_depth,
-        optional,
+        parent: visit.parent,
+        depth: visit.depth,
+        component_depth: visit.component_depth,
+        optional: visit.optional,
     });
 }
 
 fn add_each_candidate_sets(
-    context: &mut CssUsageContext,
-    tags: &HashSet<String>,
-    classes: &HashSet<String>,
+    context: &mut CssUsageBuilder,
+    tags: &CssNameSet,
+    classes: &CssNameSet,
     kind: EachBoundaryKind,
 ) {
     let (tag_set, class_set) = match kind {
@@ -1258,8 +1339,8 @@ fn svelte_element_has_dynamic_this(attributes: &[Attribute]) -> bool {
 
 #[derive(Default, Clone)]
 struct BoundaryTokenSet {
-    tags: HashSet<String>,
-    classes: HashSet<String>,
+    tags: CssNameSet,
+    classes: CssNameSet,
 }
 
 impl BoundaryTokenSet {
@@ -1276,13 +1357,13 @@ struct RenderSummary {
     can_be_empty: bool,
 }
 
-fn collect_each_boundary_candidates_from_ast(fragment: &Fragment, context: &mut CssUsageContext) {
+fn collect_each_boundary_candidates_from_ast(fragment: &Fragment, context: &mut CssUsageBuilder) {
     collect_each_boundary_candidates_in_fragment(fragment, context);
 }
 
 fn collect_each_boundary_candidates_in_fragment(
     fragment: &Fragment,
-    context: &mut CssUsageContext,
+    context: &mut CssUsageBuilder,
 ) {
     let nodes = fragment.nodes.as_ref();
 
@@ -1323,58 +1404,10 @@ fn collect_each_boundary_candidates_in_fragment(
     }
 }
 
-fn recurse_collect_each_candidates(node: &Node, context: &mut CssUsageContext) {
-    match node {
-        Node::RegularElement(element) => {
-            collect_each_boundary_candidates_in_fragment(&element.fragment, context);
-        }
-        Node::Component(element) => {
-            collect_each_boundary_candidates_in_fragment(&element.fragment, context);
-        }
-        Node::SlotElement(element) => {
-            collect_each_boundary_candidates_in_fragment(&element.fragment, context);
-        }
-        Node::EachBlock(block) => {
-            collect_each_boundary_candidates_in_fragment(&block.body, context);
-            if let Some(ref fallback) = block.fallback {
-                collect_each_boundary_candidates_in_fragment(fallback, context);
-            }
-        }
-        Node::IfBlock(block) => {
-            collect_each_boundary_candidates_in_fragment(&block.consequent, context);
-            if let Some(ref alternate) = block.alternate {
-                match alternate.as_ref() {
-                    crate::ast::modern::Alternate::Fragment(fragment) => {
-                        collect_each_boundary_candidates_in_fragment(fragment, context);
-                    }
-                    crate::ast::modern::Alternate::IfBlock(block) => {
-                        collect_each_boundary_candidates_in_fragment(&block.consequent, context);
-                    }
-                }
-            }
-        }
-        Node::KeyBlock(block) => {
-            collect_each_boundary_candidates_in_fragment(&block.fragment, context);
-        }
-        Node::AwaitBlock(block) => {
-            if let Some(ref pending) = block.pending {
-                collect_each_boundary_candidates_in_fragment(pending, context);
-            }
-            if let Some(ref then) = block.then {
-                collect_each_boundary_candidates_in_fragment(then, context);
-            }
-            if let Some(ref catch) = block.catch {
-                collect_each_boundary_candidates_in_fragment(catch, context);
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_each_boundary_candidates_in_fragment(&block.body, context);
-        }
-        Node::SvelteElement(element) => {
-            collect_each_boundary_candidates_in_fragment(&element.fragment, context);
-        }
-        _ => {}
-    }
+fn recurse_collect_each_candidates(node: &Node, context: &mut CssUsageBuilder) {
+    node.for_each_child_fragment(|fragment| {
+        collect_each_boundary_candidates_in_fragment(fragment, context);
+    });
 }
 
 fn summarize_previous_sibling_boundary(nodes: &[Node]) -> BoundaryTokenSet {
@@ -1512,7 +1545,7 @@ fn summarize_regular_or_slot_element(
     void: bool,
 ) -> RenderSummary {
     let mut current = BoundaryTokenSet::default();
-    current.tags.insert(name.to_ascii_lowercase());
+    current.tags.insert(shared_name(name.to_ascii_lowercase()));
     current.extend(&boundary_classes_from_attributes(attributes));
 
     if void {
@@ -1583,7 +1616,7 @@ fn boundary_classes_from_attributes(attributes: &[Attribute]) -> BoundaryTokenSe
                     .unwrap_or("")
                     .trim();
                 if !name.is_empty() {
-                    out.classes.insert(name.to_string());
+                    out.classes.insert(shared_name(name));
                 }
             }
             _ => {}

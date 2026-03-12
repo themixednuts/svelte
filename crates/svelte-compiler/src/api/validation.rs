@@ -1,18 +1,27 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 pub(super) use super::modern::{
     RawField, estree_node_field, estree_node_field_array, estree_node_field_object,
-    estree_node_field_str, estree_node_type, walk_estree_node,
+    estree_node_field_str, estree_node_type, estree_value_to_usize, expression_identifier_name,
+    walk_estree_node,
 };
 use super::*;
 use crate::ast::modern::Root;
 use crate::error::CompilerDiagnosticKind;
+use crate::{SourceId, SourceText};
 
 mod css;
 mod imports;
 mod runes;
+mod scope;
 mod snippet;
 mod template;
+
+pub(super) use self::scope::{
+    ScopeStack, extend_name_set_with_optional_name, extend_name_set_with_pattern_bindings,
+    pattern_binds_name, scope_frame_for_each_block, scope_frame_for_snippet_block,
+};
+pub(super) use crate::names::{NameMark, NameSet, NameStack, OrderedNames};
 
 pub(super) fn compile_error_with_range(
     source: &str,
@@ -20,7 +29,7 @@ pub(super) fn compile_error_with_range(
     start: usize,
     end: usize,
 ) -> CompileError {
-    kind.to_compile_error(source, start, end)
+    kind.to_compile_error_in(SourceText::new(SourceId::new(0), source, None), start, end)
 }
 
 fn is_error_mode_warn(options: &CompileOptions) -> bool {
@@ -95,10 +104,9 @@ pub(crate) fn validate_component_template(
 
     if let Some(error) =
         template::detect_template_directive_errors_from_root(source, root, runes_mode)
+        && !(is_error_mode_warn(options) && error.code.as_ref() == "constant_binding")
     {
-        if !(is_error_mode_warn(options) && error.code.as_ref() == "constant_binding") {
-            return Some(error);
-        }
+        return Some(error);
     }
     if let Some(error) = template::detect_script_duplicate_from_root(source, root) {
         return Some(error);
@@ -367,7 +375,7 @@ pub(crate) fn validate_module_program(source: &str) -> Option<CompileError> {
         imports::detect_export_rules(
             source,
             &program,
-            &HashSet::new(),
+            &NameSet::default(),
             imports::ExportMode::Module,
         ),
     ])
@@ -506,6 +514,24 @@ mod tests {
         let error = validate_component(
             "<script>import { writable } from 'svelte/store'; let snippet = writable(hello);</script>{#snippet hello()}<p>hello world</p>{/snippet}{@render $snippet()}",
             true,
+        );
+        assert!(error.is_none(), "unexpected validation error: {error:?}");
+    }
+
+    #[test]
+    fn runes_allows_each_item_member_binding() {
+        let error = validate_component(
+            "<script>let items = $state([{ value: '' }]);</script>{#each items as item}<input bind:value={item.value} />{/each}",
+            true,
+        );
+        assert!(error.is_none(), "unexpected validation error: {error:?}");
+    }
+
+    #[test]
+    fn allows_destructuring_assignment_to_member_expressions() {
+        let error = validate_component(
+            "<script>const arr = [1, 2]; [arr[0], arr[1] = arr] = [arr[1], arr[0]];</script>{arr}",
+            false,
         );
         assert!(error.is_none(), "unexpected validation error: {error:?}");
     }

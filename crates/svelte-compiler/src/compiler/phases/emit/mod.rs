@@ -4,21 +4,19 @@ use crate::api::{
     CompileMetadata, CompileOptions, CompileResult, CssHashInput, GenerateTarget, OutputArtifact,
 };
 use crate::ast::{Document, modern::Root};
-use crate::compiler::phases::lower::TransformState;
+use crate::compiler::phases::component::LoweredComponent;
 
 pub(crate) fn emit_component(
-    transform_state: &TransformState<'_>,
-    options: &CompileOptions,
+    component: &LoweredComponent<'_>,
     ast: Option<Document>,
-    runes: bool,
 ) -> Result<CompileResult, crate::CompileError> {
     let warnings = crate::compiler::phases::analyze::collect_compile_warnings(
-        transform_state.source(),
-        options,
-        transform_state.root(),
+        component.source_text(),
+        component.options(),
+        component.root(),
     );
 
-    if options.generate == GenerateTarget::None {
+    if component.options().generate == GenerateTarget::None {
         return Ok(CompileResult {
             // `generate: false` in JS skips template codegen.
             js: OutputArtifact {
@@ -28,19 +26,21 @@ pub(crate) fn emit_component(
             },
             css: None,
             warnings,
-            metadata: CompileMetadata { runes },
+            metadata: CompileMetadata {
+                runes: component.runes(),
+            },
             ast,
         });
     }
 
     let Some(js_code) = crate::compiler::phases::transform::codegen::compile_component_js_code(
-        transform_state.source(),
-        options.generate,
-        options.fragments,
-        transform_state.root(),
-        crate::api::infer_runes_mode(options, transform_state.root()),
-        options.hmr,
-        options.filename.as_deref(),
+        component.source(),
+        component.options().generate,
+        component.options().fragments,
+        component.root(),
+        component.runes(),
+        component.options().hmr,
+        component.options().filename.as_deref(),
     )
     .map(Arc::<str>::from) else {
         // Strict mode for the port: never emit placeholder output for unsupported component shapes.
@@ -50,25 +50,25 @@ pub(crate) fn emit_component(
     };
 
     let resolved_css_hash =
-        resolve_css_hash(transform_state.source(), transform_state.root(), options);
+        resolve_css_hash(component.source(), component.root(), component.options());
 
     Ok(
         crate::compiler::phases::transform::output::build_compile_result(
-            transform_state.source(),
-            transform_state.root(),
-            ast,
-            js_code,
-            options.filename.as_deref(),
-            options.output_filename.as_deref(),
-            resolved_css_hash.as_deref(),
-            options.dev,
-            runes,
-            options.sourcemap.as_ref(),
-            options.sourcemap.is_some()
-                || options.output_filename.is_some()
-                || options.css_output_filename.is_some(),
-            options.css_output_filename.as_deref(),
-            warnings,
+            crate::compiler::phases::transform::output::BuildCompileResultArgs {
+                ctx: crate::compiler::phases::transform::output::OutputContext::new(
+                    component.source_text(),
+                    component.options().output_filename.as_deref(),
+                    component.options().sourcemap.as_ref(),
+                ),
+                root: component.root(),
+                ast,
+                js_code,
+                css_hash: resolved_css_hash.as_deref(),
+                dev: component.options().dev,
+                runes: component.runes(),
+                css_output_filename: component.options().css_output_filename.as_deref(),
+                warnings,
+            },
         ),
     )
 }
@@ -99,7 +99,6 @@ fn resolve_css_hash(source: &str, root: &Root, options: &CompileOptions) -> Opti
                     .filename
                     .as_deref()
                     .and_then(|path| path.file_stem())
-                    .map(Into::into)
             })
             .unwrap_or("Component");
         return Some(getter.call(CssHashInput {

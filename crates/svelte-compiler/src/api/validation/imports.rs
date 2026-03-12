@@ -1,6 +1,9 @@
 use super::*;
-use crate::ast::modern::{Alternate, EstreeNode, EstreeValue, Fragment, Node};
-use std::collections::{BTreeMap, HashSet};
+use crate::ast::modern::{EstreeNode, EstreeValue, Fragment, Node};
+use crate::estree::{export_specifier_exported_name, raw_callee_name, raw_identifier_name};
+use crate::{SourceId, SourceText};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExportMode {
@@ -57,7 +60,7 @@ pub(super) fn detect_export_rules_in_module_scripts(
     }
 
     let module = root.module.as_ref()?;
-    let mut exportable_snippets = HashSet::<String>::new();
+    let mut exportable_snippets = NameSet::default();
     collect_exportable_snippet_names(&root.fragment, &mut exportable_snippets);
     detect_export_rules(
         source,
@@ -98,7 +101,7 @@ enum RuneDeclKind {
 #[derive(Clone)]
 struct RuneDecl {
     kind: RuneDeclKind,
-    name: String,
+    name: Arc<str>,
     statement_start: usize,
     statement_end: usize,
     exported_direct: bool,
@@ -107,7 +110,7 @@ struct RuneDecl {
 pub(super) fn detect_export_rules(
     source: &str,
     program: &EstreeNode,
-    additional_exportables: &HashSet<String>,
+    additional_exportables: &NameSet,
     mode: ExportMode,
 ) -> Option<CompileError> {
     let body = estree_node_field_array(program, RawField::Body)?;
@@ -136,7 +139,7 @@ pub(super) fn detect_export_rules(
                 decl.statement_end,
             ));
         }
-        if let Some((start, end)) = find_export_default_of(body, decl.name.as_str()) {
+        if let Some((start, end)) = find_export_default_of(body, decl.name.as_ref()) {
             return Some(compile_error_with_range(
                 source,
                 CompilerDiagnosticKind::DerivedInvalidExport,
@@ -144,7 +147,7 @@ pub(super) fn detect_export_rules(
                 end,
             ));
         }
-        if let Some((start, end)) = find_export_list_name(body, decl.name.as_str()) {
+        if let Some((start, end)) = find_export_list_name(body, decl.name.as_ref()) {
             return Some(compile_error_with_range(
                 source,
                 CompilerDiagnosticKind::DerivedInvalidExport,
@@ -159,7 +162,7 @@ pub(super) fn detect_export_rules(
         .filter(|decl| decl.kind == RuneDeclKind::State)
     {
         let reassigned = reassignments
-            .get(decl.name.as_str())
+            .get(decl.name.as_ref())
             .is_some_and(|(start, _)| *start > decl.statement_end);
         if !reassigned {
             continue;
@@ -173,7 +176,7 @@ pub(super) fn detect_export_rules(
                 decl.statement_end,
             ));
         }
-        if let Some((start, end)) = find_export_default_of(body, decl.name.as_str()) {
+        if let Some((start, end)) = find_export_default_of(body, decl.name.as_ref()) {
             return Some(compile_error_with_range(
                 source,
                 CompilerDiagnosticKind::StateInvalidExport,
@@ -181,7 +184,7 @@ pub(super) fn detect_export_rules(
                 end,
             ));
         }
-        if let Some((start, end)) = find_export_list_name(body, decl.name.as_str()) {
+        if let Some((start, end)) = find_export_list_name(body, decl.name.as_ref()) {
             return Some(compile_error_with_range(
                 source,
                 CompilerDiagnosticKind::StateInvalidExport,
@@ -194,9 +197,7 @@ pub(super) fn detect_export_rules(
     if let Some((name, start, end)) = find_undefined_export_name(body, additional_exportables) {
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::ExportUndefined {
-                name: Arc::from(name.as_str()),
-            },
+            CompilerDiagnosticKind::ExportUndefined { name },
             start,
             end,
         ));
@@ -318,8 +319,8 @@ fn collect_rune_decls_from_variable_declaration(
     }
 }
 
-fn collect_reassignments(program: &EstreeNode) -> BTreeMap<String, (usize, usize)> {
-    let mut out = BTreeMap::<String, (usize, usize)>::new();
+fn collect_reassignments(program: &EstreeNode) -> BTreeMap<Arc<str>, (usize, usize)> {
+    let mut out = BTreeMap::<Arc<str>, (usize, usize)>::new();
     walk_estree_node(program, &mut |node| match estree_node_type(node) {
         Some("AssignmentExpression") => {
             let Some(left) = estree_node_field_object(node, RawField::Left) else {
@@ -394,7 +395,7 @@ fn find_illegal_default_export_in_body(body: &[EstreeValue]) -> Option<(usize, u
                     let EstreeValue::Object(specifier) = specifier else {
                         return false;
                     };
-                    specifier_exported_name(specifier).as_deref() == Some("default")
+                    export_specifier_exported_name(specifier).as_deref() == Some("default")
                 });
                 if exports_default {
                     return estree_node_span(statement);
@@ -405,24 +406,6 @@ fn find_illegal_default_export_in_body(body: &[EstreeValue]) -> Option<(usize, u
     }
 
     None
-}
-
-fn specifier_exported_name(specifier: &EstreeNode) -> Option<String> {
-    let value = specifier.fields.get("exported")?;
-    let EstreeValue::Object(exported) = value else {
-        return None;
-    };
-
-    match estree_node_type(exported) {
-        Some("Identifier") => {
-            estree_node_field_str(exported, RawField::Name).map(ToString::to_string)
-        }
-        Some("Literal") => match estree_node_field(exported, RawField::Value) {
-            Some(EstreeValue::String(value)) => Some(value.to_string()),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn find_export_list_name(body: &[EstreeValue], name: &str) -> Option<(usize, usize)> {
@@ -453,8 +436,8 @@ fn find_export_list_name(body: &[EstreeValue], name: &str) -> Option<(usize, usi
 
 fn find_undefined_export_name(
     body: &[EstreeValue],
-    additional_exportables: &HashSet<String>,
-) -> Option<(String, usize, usize)> {
+    additional_exportables: &NameSet,
+) -> Option<(Arc<str>, usize, usize)> {
     let declared = collect_declared_names(body);
     for statement in body {
         let EstreeValue::Object(statement) = statement else {
@@ -478,7 +461,7 @@ fn find_undefined_export_name(
             let Some(name) = raw_identifier_name(local) else {
                 continue;
             };
-            if declared.contains(name.as_str()) || additional_exportables.contains(name.as_str()) {
+            if declared.contains(name.as_ref()) || additional_exportables.contains(name.as_ref()) {
                 continue;
             }
             let (start, end) = estree_node_span(local).or_else(|| estree_node_span(specifier))?;
@@ -488,53 +471,19 @@ fn find_undefined_export_name(
     None
 }
 
-fn collect_exportable_snippet_names(fragment: &Fragment, out: &mut HashSet<String>) {
+fn collect_exportable_snippet_names(fragment: &Fragment, out: &mut NameSet) {
     for node in fragment.nodes.iter() {
         collect_exportable_snippet_names_in_node(node, out);
+        node.for_each_child_fragment(|child| collect_exportable_snippet_names(child, out));
     }
 }
 
-fn collect_exportable_snippet_names_in_node(node: &Node, out: &mut HashSet<String>) {
+fn collect_exportable_snippet_names_in_node(node: &Node, out: &mut NameSet) {
     match node {
         Node::SnippetBlock(block) => {
             if let Some(name) = expression_identifier_name(&block.expression) {
-                out.insert(name.to_string());
+                out.insert(name);
             }
-            collect_exportable_snippet_names(&block.body, out);
-        }
-        Node::IfBlock(block) => {
-            collect_exportable_snippet_names(&block.consequent, out);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_exportable_snippet_names(fragment, out);
-                    }
-                    Alternate::IfBlock(block) => {
-                        collect_exportable_snippet_names(&block.consequent, out);
-                    }
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_exportable_snippet_names(&block.body, out);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_exportable_snippet_names(fallback, out);
-            }
-        }
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                collect_exportable_snippet_names(fragment, out);
-            }
-        }
-        Node::KeyBlock(block) => {
-            collect_exportable_snippet_names(&block.fragment, out);
         }
         Node::Text(_)
         | Node::Comment(_)
@@ -542,16 +491,17 @@ fn collect_exportable_snippet_names_in_node(node: &Node, out: &mut HashSet<Strin
         | Node::RenderTag(_)
         | Node::HtmlTag(_)
         | Node::DebugTag(_)
-        | Node::ConstTag(_) => {}
-        _ => {
-            let Some(el) = node.as_element() else { return };
-            collect_exportable_snippet_names(el.fragment(), out);
-        }
+        | Node::ConstTag(_)
+        | Node::IfBlock(_)
+        | Node::EachBlock(_)
+        | Node::AwaitBlock(_)
+        | Node::KeyBlock(_) => {}
+        _ => {}
     }
 }
 
-fn collect_declared_names(body: &[EstreeValue]) -> HashSet<String> {
-    let mut declared = HashSet::<String>::new();
+fn collect_declared_names(body: &[EstreeValue]) -> NameSet {
+    let mut declared = NameSet::default();
     for statement in body {
         let EstreeValue::Object(statement) = statement else {
             continue;
@@ -635,7 +585,7 @@ fn collect_declared_names(body: &[EstreeValue]) -> HashSet<String> {
     declared
 }
 
-fn collect_declared_names_from_variable(declaration: &EstreeNode, declared: &mut HashSet<String>) {
+fn collect_declared_names_from_variable(declaration: &EstreeNode, declared: &mut NameSet) {
     let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
         return;
     };
@@ -646,68 +596,12 @@ fn collect_declared_names_from_variable(declaration: &EstreeNode, declared: &mut
         let Some(id) = estree_node_field_object(declarator, RawField::Id) else {
             continue;
         };
-        collect_binding_names(id, declared);
+        extend_name_set_with_pattern_bindings(declared, id);
     }
 }
 
-fn collect_binding_names(pattern: &EstreeNode, out: &mut HashSet<String>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.insert(name.to_string());
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_binding_names(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_binding_names(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_binding_names(element, out);
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_binding_names(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_binding_names(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_module_import_local_names(program: &EstreeNode) -> HashSet<String> {
-    let mut names = HashSet::new();
+fn collect_module_import_local_names(program: &EstreeNode) -> NameSet {
+    let mut names = NameSet::default();
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return names;
     };
@@ -741,7 +635,7 @@ fn collect_module_import_local_names(program: &EstreeNode) -> HashSet<String> {
 
 fn find_duplicate_module_import_declaration(
     program: &EstreeNode,
-    imported: &HashSet<String>,
+    imported: &NameSet,
 ) -> Option<(usize, usize)> {
     let body = estree_node_field_array(program, RawField::Body)?;
 
@@ -773,7 +667,7 @@ fn find_duplicate_module_import_declaration(
 
 fn find_duplicate_import_binding_span(
     pattern: &EstreeNode,
-    imported: &HashSet<String>,
+    imported: &NameSet,
 ) -> Option<(usize, usize)> {
     match estree_node_type(pattern) {
         Some("Identifier") => {
@@ -844,33 +738,12 @@ fn estree_node_span(node: &EstreeNode) -> Option<(usize, usize)> {
     ))
 }
 
-fn raw_identifier_name(node: &EstreeNode) -> Option<String> {
-    if estree_node_type(node) == Some("Identifier") {
-        return estree_node_field_str(node, RawField::Name).map(ToString::to_string);
-    }
-    None
-}
-
 fn estree_node_literal_string(node: &EstreeNode) -> Option<String> {
     if estree_node_type(node) != Some("Literal") {
         return None;
     }
     match estree_node_field(node, RawField::Value) {
         Some(EstreeValue::String(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn raw_callee_name(node: &EstreeNode) -> Option<String> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(ToString::to_string),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            let property = estree_node_field_object(node, RawField::Property)?;
-            let object_name = raw_identifier_name(object)?;
-            let property_name = raw_identifier_name(property)?;
-            Some(format!("{object_name}.{property_name}"))
-        }
         _ => None,
     }
 }
@@ -882,23 +755,19 @@ fn compile_error_custom_imports(
     start: usize,
     end: usize,
 ) -> CompileError {
-    let (start_line, start_column) = line_column_at_offset(source, start);
-    let (end_line, end_column) = line_column_at_offset(source, end);
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
 
     CompileError {
         code: Arc::from(code),
         message: message.into(),
-        position: Some(Box::new(SourcePosition { start, end })),
-        start: Some(Box::new(SourceLocation {
-            line: start_line,
-            column: start_column,
-            character: start,
+        position: Some(Box::new(SourcePosition {
+            start: start_location.character,
+            end: end_location.character,
         })),
-        end: Some(Box::new(SourceLocation {
-            line: end_line,
-            column: end_column,
-            character: end,
-        })),
+        start: Some(Box::new(start_location)),
+        end: Some(Box::new(end_location)),
         filename: None,
     }
 }

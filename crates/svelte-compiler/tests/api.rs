@@ -4,9 +4,9 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use svelte_compiler::{
     CompileOptions, CssHashGetterCallback, GenerateTarget, MigrateOptions, ModernPrintTarget,
-    PreprocessAttributeValue, PreprocessOptions, PreprocessOutput, PreprocessorGroup, PrintOptions,
-    SourceMap, VERSION, WarningFilterCallback, compile, compile_module, migrate, parse, preprocess,
-    print, print_modern, walk,
+    ParseOptions, PreprocessAttributeValue, PreprocessOptions, PreprocessOutput, PreprocessorGroup,
+    PrintOptions, SourceMap, VERSION, WarningFilterCallback, compile, compile_module, migrate,
+    parse, preprocess, print, print_modern, walk,
 };
 
 #[test]
@@ -240,7 +240,7 @@ fn compile_component_applies_warning_filter_callback() {
 
 #[test]
 fn print_returns_sourcemap() {
-    let ast = parse("<h1>Hello</h1>", Default::default()).expect("parse succeeds");
+    let ast = parse("<h1>Hello</h1>", ParseOptions::default()).expect("parse succeeds");
     let printed = print(&ast, PrintOptions::default()).expect("print succeeds");
     assert_eq!(printed.code.as_ref(), "<h1>Hello</h1>");
     assert_eq!(printed.map.sources.as_ref(), &[Arc::from("input.svelte")]);

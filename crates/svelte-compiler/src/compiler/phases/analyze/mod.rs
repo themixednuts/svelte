@@ -1,140 +1,72 @@
 mod validation;
 mod warnings;
 
-use crate::api::CompileOptions;
-use crate::ast::modern::Root;
+use crate::api::{CompileOptions, infer_runes_mode};
+use crate::compiler::phases::component::{ComponentAnalysis, ComponentContext};
 use crate::compiler::phases::parse::ParsedComponent;
 use crate::error::CompileError;
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Analysis<'a> {
-    pub source: &'a str,
-    pub options: &'a CompileOptions,
-}
-
-impl Analysis<'_> {
-    pub(crate) fn source(&self) -> &str {
-        self.source
-    }
-
-    pub(crate) fn options(&self) -> &CompileOptions {
-        self.options
-    }
-}
-
-impl AsRef<str> for Analysis<'_> {
-    fn as_ref(&self) -> &str {
-        self.source()
-    }
-}
-
-impl AsRef<CompileOptions> for Analysis<'_> {
-    fn as_ref(&self) -> &CompileOptions {
-        self.options()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ComponentAnalysis<'a> {
-    pub analysis: Analysis<'a>,
-    pub root: &'a Root,
-}
-
-impl ComponentAnalysis<'_> {
-    pub(crate) fn source(&self) -> &str {
-        self.analysis.source()
-    }
-
-    pub(crate) fn options(&self) -> &CompileOptions {
-        self.analysis.options()
-    }
-
-    pub(crate) fn root(&self) -> &Root {
-        self.root
-    }
-}
-
-impl AsRef<str> for ComponentAnalysis<'_> {
-    fn as_ref(&self) -> &str {
-        self.source()
-    }
-}
-
-impl AsRef<CompileOptions> for ComponentAnalysis<'_> {
-    fn as_ref(&self) -> &CompileOptions {
-        self.options()
-    }
-}
-
-impl AsRef<Root> for ComponentAnalysis<'_> {
-    fn as_ref(&self) -> &Root {
-        self.root()
-    }
-}
-
-impl<'a> From<&ComponentAnalysis<'a>> for Analysis<'a> {
-    fn from(value: &ComponentAnalysis<'a>) -> Self {
-        value.analysis
-    }
-}
+use crate::source::SourceText;
 
 pub(crate) fn analyze_component<'a>(
-    parsed: &'a ParsedComponent,
+    parsed: ParsedComponent,
     options: &'a CompileOptions,
 ) -> Result<ComponentAnalysis<'a>, CompileError> {
     validate_component(parsed.as_ref(), options, parsed.root())?;
-    Ok(ComponentAnalysis {
-        analysis: Analysis {
-            source: parsed.as_ref(),
-            options,
-        },
-        root: parsed.root(),
-    })
+    let runes = infer_runes_mode(options, parsed.root());
+    Ok(ComponentAnalysis::from_context(
+        ComponentContext::new(parsed, options),
+        runes,
+    ))
 }
 
 pub(crate) fn validate_component(
     source: &str,
     options: &CompileOptions,
-    root: &Root,
+    root: &crate::ast::modern::Root,
 ) -> Result<(), CompileError> {
     if let Some(error) = validation::validate_component_source(source, options, root) {
-        return Err(error);
+        return Err(error.with_filename(options.filename.as_deref()));
     }
     Ok(())
 }
 
-pub(crate) fn validate_module(source: &str) -> Result<(), CompileError> {
-    if let Some(error) = validation::validate_module_source(source) {
-        return Err(error);
+pub(crate) fn validate_module(source: SourceText<'_>) -> Result<(), CompileError> {
+    if let Some(error) = validation::validate_module_source(source.text) {
+        return Err(error.with_source_text(source));
     }
     Ok(())
 }
 
 pub(crate) fn collect_compile_warnings(
-    source: &str,
+    source: SourceText<'_>,
     options: &CompileOptions,
-    root: &Root,
+    root: &crate::ast::modern::Root,
 ) -> Box<[crate::Warning]> {
     warnings::collect_compile_warnings(source, options, root).into_boxed_slice()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{CompileOptions, ast::modern::Root};
+    use crate::{
+        CompileOptions, SourceId,
+        ast::modern::Root,
+        compiler::phases::component::{ComponentAnalysis, LoweredComponent},
+        source::SourceText,
+    };
 
     #[test]
     fn analyze_component_produces_typed_component_analysis() {
         let parsed = crate::compiler::phases::parse::parse_component_for_compile("<p>ok</p>")
             .expect("parse component");
         let options = CompileOptions::default();
-        let analysis: super::ComponentAnalysis<'_> =
-            super::analyze_component(&parsed, &options).expect("analyze component");
+        let analysis: ComponentAnalysis<'_> =
+            super::analyze_component(parsed, &options).expect("analyze component");
 
-        fn source<'a, T: AsRef<str>>(value: &'a T) -> &'a str {
+        fn source<T: AsRef<str>>(value: &T) -> &str {
             value.as_ref()
         }
 
-        fn as_options<'a, T: AsRef<CompileOptions>>(value: &'a T) -> &'a CompileOptions {
+        fn as_options<T: AsRef<CompileOptions>>(value: &T) -> &CompileOptions {
             value.as_ref()
         }
 
@@ -144,16 +76,18 @@ mod tests {
 
         assert_eq!(source(&analysis), "<p>ok</p>");
         assert!(std::ptr::eq(as_options(&analysis), &options));
-        assert!(std::ptr::eq(root(&analysis), parsed.root()));
+        assert_eq!(root(&analysis).start, 0);
+        assert!(!analysis.runes());
 
-        let common: super::Analysis<'_> = (&analysis).into();
-        assert_eq!(source(&common), "<p>ok</p>");
+        let lowered: LoweredComponent<'_> = analysis.lower();
+        assert_eq!(source(&lowered), "<p>ok</p>");
+        assert_eq!(root(&lowered).start, 0);
     }
 
     fn analyze_error(source: &str) -> crate::error::CompileError {
         let parsed =
             crate::compiler::phases::parse::parse_component_for_compile(source).expect("parse");
-        super::analyze_component(&parsed, &CompileOptions::default()).expect_err("analyze error")
+        super::analyze_component(parsed, &CompileOptions::default()).expect_err("analyze error")
     }
 
     #[test]
@@ -172,5 +106,26 @@ mod tests {
     fn analyze_rejects_else_after_open_element() {
         let error = analyze_error("<li>\n{:else}");
         assert_eq!(error.code.as_ref(), "block_invalid_continuation_placement");
+    }
+
+    #[test]
+    fn collect_compile_warnings_counts_else_if_test_as_export_usage() {
+        let source = "<script>export let foo;</script>{#if ok}{:else if foo}<p>{foo}</p>{/if}";
+        let parsed = crate::compiler::phases::parse::parse_component_for_compile(source)
+            .expect("parse component");
+        let options = CompileOptions::default();
+
+        let warnings = super::collect_compile_warnings(
+            SourceText::new(SourceId::new(0), source, None),
+            &options,
+            parsed.root(),
+        );
+
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.code.as_ref() == "export_let_unused"),
+            "else-if test should count as using `foo`: {warnings:?}"
+        );
     }
 }

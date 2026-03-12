@@ -1259,10 +1259,12 @@ fn script_expression_rune_name(callee: &crate::ast::modern::EstreeNode) -> Optio
     Some(format!("{object_name}.{property_name}"))
 }
 
+type ExportedLetDeclarators = Vec<(String, Option<String>)>;
+
 fn extract_exported_let_declarators(
     source: &str,
     declaration: &crate::ast::modern::EstreeNode,
-) -> Option<Option<Vec<(String, Option<String>)>>> {
+) -> Option<Option<ExportedLetDeclarators>> {
     if estree_node_type(declaration) != Some("VariableDeclaration")
         || estree_node_field_str(declaration, RawField::Kind) != Some("let")
     {
@@ -1894,9 +1896,7 @@ fn match_structural_complex_css_pattern(
     source: &str,
     root: &Root,
 ) -> Option<StructuralComplexCssPattern> {
-    if root.css.is_none() {
-        return None;
-    }
+    root.css.as_ref()?;
     let script_parts = collect_structural_script_parts(source, root.instance.as_ref())?;
     let mut context = StructuralSerializeContext::default();
     let markup = serialize_structural_fragment(source, &root.fragment, &mut context)?;
@@ -2384,10 +2384,7 @@ fn serialize_top_level_directive_element(
     if let Some(class_directives_expr) = class_directives_expr.as_ref() {
         let token = format!("__SVELTE_DIRECTIVE_{replacement_index}__");
         *replacement_index += 1;
-        let class_server_value = class_value_expr
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or("void 0");
+        let class_server_value = class_value_expr.as_deref().unwrap_or("void 0");
         let call = format!("$.attr_class({class_server_value}, void 0, {class_directives_expr})");
         server_replacements.push((token.clone(), call));
         server_open.push_str(&token);
@@ -2395,10 +2392,7 @@ fn serialize_top_level_directive_element(
     if let Some(style_directives_expr) = style_directives_expr.as_ref() {
         let token = format!("__SVELTE_DIRECTIVE_{replacement_index}__");
         *replacement_index += 1;
-        let style_server_value = style_value_expr
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or("''");
+        let style_server_value = style_value_expr.as_deref().unwrap_or("''");
         let call = format!("$.attr_style({style_server_value}, {style_directives_expr})");
         server_replacements.push((token.clone(), call));
         server_open.push_str(&token);
@@ -3809,7 +3803,7 @@ fn match_function_prop_no_getter_pattern(
     let Node::ExpressionTag(expression_tag) = children[1] else {
         return None;
     };
-    let leading_trimmed = text.data.trim_start_matches(['\r', '\n', '\t', ' ']);
+    let leading_trimmed = text.data.trim_start_matches(char::is_whitespace);
     if leading_trimmed != "clicks: "
         || expression_identifier_name(&expression_tag.expression) != Some(count_name.as_str())
     {

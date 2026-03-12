@@ -1,13 +1,18 @@
-use crate::SourceLocation;
 use crate::api::modern::{
     RawField, estree_node_field, estree_node_field_array, estree_node_field_object,
     estree_node_field_str, estree_node_type, estree_value_to_usize, walk_estree_node,
 };
 use crate::api::{CompileOptions, GenerateTarget, Warning};
 use crate::ast::modern::{
-    Attribute, AttributeValue, AttributeValueList, EstreeNode, EstreeValue, Fragment, Node,
-    RegularElement, Root,
+    Alternate, Attribute, AttributeValue, AttributeValueList, DirectiveAttribute, EachBlock,
+    EstreeNode, EstreeValue, Expression, Fragment, Node, RegularElement, Root, SnippetBlock,
 };
+use crate::estree::{
+    PathStep, collect_pattern_binding_names, path_has_function_scope, raw_base_identifier_name,
+    raw_callee_name, walk_reference_identifiers_with_path,
+};
+use crate::names::{Name, NameSet, OrderedNames};
+use crate::source::SourceText;
 use aria_query::{
     AriaAbstractRole as QueryAriaAbstractRole, AriaProperty as QueryAriaProperty,
     AriaRoleDefinition as QueryRoleDefinition, AriaRoleDefinitionKey as QueryRoleKey,
@@ -40,6 +45,20 @@ struct ScriptWalkContext {
     is_module: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ScriptWarningEnv<'a> {
+    source: &'a str,
+    options: &'a CompileOptions,
+    runes_mode: bool,
+    imported_default_svelte_components: &'a NameSet,
+}
+
+#[derive(Clone, Copy)]
+struct ScriptWarningState<'a> {
+    context: ScriptWalkContext,
+    active_ignores: &'a [Arc<str>],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstanceBindingKind {
     Normal,
@@ -61,7 +80,7 @@ struct InstanceBindingInfo {
 
 #[derive(Debug, Clone)]
 struct PatternBinding {
-    name: String,
+    name: Arc<str>,
     start: usize,
     end: usize,
     is_rest: bool,
@@ -69,10 +88,137 @@ struct PatternBinding {
 
 #[derive(Debug, Clone)]
 struct ExportedMutableBinding {
-    name: String,
+    name: Arc<str>,
     start: usize,
     end: usize,
     ignore_codes: Box<[Arc<str>]>,
+}
+
+#[derive(Clone, Default)]
+struct NameScope {
+    names: NameSet,
+}
+
+impl NameScope {
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn with_pattern_bindings(&self, pattern: &EstreeNode) -> Self {
+        let mut scope = self.clone();
+        scope.extend_pattern_bindings(pattern);
+        scope
+    }
+
+    fn with_optional_name(&self, name: Option<&Name>) -> Self {
+        let mut scope = self.clone();
+        scope.extend_optional_name(name);
+        scope
+    }
+
+    fn with_let_directives(&self, attributes: &[Attribute]) -> Self {
+        let mut scope = self.clone();
+        scope.extend_let_directives(attributes);
+        scope
+    }
+
+    fn with_expression_bindings(&self, binding: Option<&Expression>) -> Self {
+        binding.map_or_else(
+            || self.clone(),
+            |binding| self.with_pattern_bindings(&binding.0),
+        )
+    }
+
+    fn with_each_block(&self, block: &EachBlock) -> Self {
+        self.with_expression_bindings(block.context.as_ref())
+            .with_optional_name(block.index.as_ref())
+    }
+
+    fn with_snippet_block(&self, block: &SnippetBlock) -> Self {
+        block
+            .parameters
+            .iter()
+            .fold(self.clone(), |scope, parameter| {
+                scope.with_pattern_bindings(&parameter.0)
+            })
+    }
+
+    fn child_scope_for(&self, node: &Node) -> Self {
+        match node {
+            Node::EachBlock(block) => self.with_each_block(block),
+            Node::SnippetBlock(block) => self.with_snippet_block(block),
+            _ => {
+                if let Some(element) = node.as_element() {
+                    self.with_let_directives(element.attributes())
+                } else {
+                    self.clone()
+                }
+            }
+        }
+    }
+
+    fn extend_pattern_bindings(&mut self, pattern: &EstreeNode) {
+        collect_pattern_binding_names(pattern, &mut self.names);
+    }
+
+    fn extend_optional_name(&mut self, name: Option<&Name>) {
+        if let Some(name) = name {
+            self.names.insert(name.clone());
+        }
+    }
+
+    fn extend_let_directives(&mut self, attributes: &[Attribute]) {
+        for attribute in attributes {
+            if let Attribute::LetDirective(directive) = attribute {
+                self.extend_let_directive(directive);
+            }
+        }
+    }
+
+    fn extend_let_directive(&mut self, directive: &DirectiveAttribute) {
+        let before = self.names.len();
+        collect_pattern_binding_names(&directive.expression.0, &mut self.names);
+        if self.names.len() == before {
+            self.names.insert(directive.name.clone());
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct IgnoreCodes(OrderedNames);
+
+impl IgnoreCodes {
+    fn from_slice(ignore_codes: &[Arc<str>]) -> Self {
+        let mut codes = OrderedNames::default();
+        codes.extend(ignore_codes.iter().cloned());
+        Self(codes)
+    }
+
+    fn push_unique(&mut self, code: &str) {
+        self.0.extend([Arc::from(code)]);
+    }
+
+    fn extend_unique<I>(&mut self, codes: I)
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        for code in codes {
+            self.push_unique(code.as_ref());
+        }
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        self.0.extend(std::mem::take(&mut other.0));
+    }
+
+    fn as_slice(&self) -> &[Arc<str>] {
+        self.0.as_slice()
+    }
+
+    fn to_boxed_slice(&self) -> Box<[Arc<str>]> {
+        self.0.clone().into_boxed_slice()
+    }
 }
 const SVELTE_WARNING_CODES: &[&str] = &[
     "a11y_accesskey",
@@ -709,10 +855,12 @@ fn menuitem_redundant_implicit_role(element: &RegularElement) -> Option<&'static
 }
 
 pub(crate) fn collect_compile_warnings(
-    source: &str,
+    source: SourceText<'_>,
     options: &CompileOptions,
     root: &Root,
 ) -> Vec<Warning> {
+    let source_text = source;
+    let source = source_text.text;
     if options.generate != GenerateTarget::None {
         return Vec::new();
     }
@@ -721,7 +869,7 @@ pub(crate) fn collect_compile_warnings(
     for diagnostic in
         crate::api::validation::collect_error_mode_downgraded_warnings(source, options, root)
     {
-        warnings.push(warning_from_compile_error(options, diagnostic));
+        warnings.push(warning_from_compile_error(source_text, diagnostic));
     }
 
     let runes_mode = crate::api::infer_runes_mode(options, root);
@@ -763,20 +911,24 @@ pub(crate) fn collect_compile_warnings(
         &mut warnings,
     );
     collect_fragment_warnings(
-        source,
-        options,
-        root,
+        WarningEnv {
+            source,
+            options,
+            root,
+            runes_mode,
+            script_declared_names: &script_declared_names,
+            each_rest_bindings: &[],
+        },
         &root.fragment,
-        runes_mode,
-        false,
-        None,
-        false,
-        false,
-        root_in_svg_context,
-        root_in_mathml_context,
-        &script_declared_names,
-        &[],
-        &[],
+        WarningFragmentContext {
+            in_dialog: false,
+            parent_regular_tag: None,
+            parent_regular_has_end_tag: false,
+            inside_control_block: false,
+            in_svg_context: root_in_svg_context,
+            in_mathml_context: root_in_mathml_context,
+            inherited_ignores: &[],
+        },
         &mut warnings,
     );
     emit_css_slot_fallback_unused_selector_warnings(source, options, root, &mut warnings);
@@ -1002,7 +1154,7 @@ fn collect_script_warnings(
     options: &CompileOptions,
     root: &Root,
     runes_mode: bool,
-    _script_declared_names: &FxHashSet<Arc<str>>,
+    _script_declared_names: &NameSet,
     warnings: &mut Vec<Warning>,
 ) {
     for script in root_scripts(root) {
@@ -1124,8 +1276,8 @@ fn collect_script_warnings(
     }
 }
 
-fn collect_script_declared_names(root: &Root) -> FxHashSet<Arc<str>> {
-    let mut names = FxHashSet::<Arc<str>>::default();
+fn collect_script_declared_names(root: &Root) -> NameSet {
+    let mut names = NameSet::default();
     for script in root_scripts(root) {
         let Some(body) = estree_node_field_array(&script.content, RawField::Body) else {
             continue;
@@ -1210,25 +1362,51 @@ fn root_scripts(root: &Root) -> Vec<&crate::ast::modern::Script> {
     scripts
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_fragment_warnings(
-    source: &str,
-    options: &CompileOptions,
-    root: &Root,
-    fragment: &Fragment,
+#[derive(Clone, Copy)]
+struct WarningEnv<'a> {
+    source: &'a str,
+    options: &'a CompileOptions,
+    root: &'a Root,
     runes_mode: bool,
+    script_declared_names: &'a NameSet,
+    each_rest_bindings: &'a [RestBindingWarning],
+}
+
+#[derive(Clone, Copy)]
+struct WarningFragmentContext<'a> {
     in_dialog: bool,
-    parent_regular_tag: Option<&str>,
+    parent_regular_tag: Option<&'a str>,
     parent_regular_has_end_tag: bool,
     inside_control_block: bool,
     in_svg_context: bool,
     in_mathml_context: bool,
-    script_declared_names: &FxHashSet<Arc<str>>,
-    each_rest_bindings: &[RestBindingWarning],
-    inherited_ignores: &[Arc<str>],
+    inherited_ignores: &'a [Arc<str>],
+}
+
+fn collect_fragment_warnings(
+    env: WarningEnv<'_>,
+    fragment: &Fragment,
+    context: WarningFragmentContext<'_>,
     warnings: &mut Vec<Warning>,
 ) {
-    let mut pending_ignores: Vec<Arc<str>> = Vec::new();
+    let WarningEnv {
+        source,
+        options,
+        root,
+        runes_mode,
+        each_rest_bindings,
+        ..
+    } = env;
+    let WarningFragmentContext {
+        in_dialog,
+        parent_regular_tag,
+        parent_regular_has_end_tag,
+        in_svg_context,
+        in_mathml_context,
+        inherited_ignores,
+        ..
+    } = context;
+    let mut pending_ignores = IgnoreCodes::default();
     for (node_index, node) in fragment.nodes.iter().enumerate() {
         if let Node::Comment(comment) = node {
             let parsed = parse_svelte_ignore_directive(
@@ -1236,7 +1414,7 @@ fn collect_fragment_warnings(
                 &comment.data,
                 runes_mode,
             );
-            pending_ignores.extend(parsed.ignores);
+            pending_ignores.extend_unique(parsed.ignores.iter());
             for diagnostic in parsed.diagnostics {
                 warnings.push(make_warning(
                     source,
@@ -1256,32 +1434,17 @@ fn collect_fragment_warnings(
             continue;
         }
 
-        let mut node_ignores = inherited_ignores.to_vec();
+        let mut node_ignores = IgnoreCodes::from_slice(inherited_ignores);
         node_ignores.append(&mut pending_ignores);
 
         match node {
             Node::Text(text) => {
                 let warning_start = warnings.len();
                 emit_bidirectional_warnings_in_text(source, options, text, warnings);
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
             }
             Node::RegularElement(element) => {
-                collect_element_warnings(
-                    source,
-                    options,
-                    element,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
-                    warnings,
-                );
+                collect_element_warnings(env, element, context, node_ignores.as_slice(), warnings);
                 let implicit_warning_start = warnings.len();
                 if !element.self_closing
                     && !element.has_end_tag
@@ -1321,7 +1484,11 @@ fn collect_fragment_warnings(
                         ));
                     }
                 }
-                filter_recent_ignored_warnings(warnings, implicit_warning_start, &node_ignores);
+                filter_recent_ignored_warnings(
+                    warnings,
+                    implicit_warning_start,
+                    node_ignores.as_slice(),
+                );
                 let child_in_dialog =
                     in_dialog || element.name.as_ref().eq_ignore_ascii_case("dialog");
                 let child_parent_regular_tag = if is_void_element_tag(element.name.as_ref()) {
@@ -1334,20 +1501,17 @@ fn collect_fragment_warnings(
                 let child_in_mathml_context =
                     in_mathml_context || element.name.as_ref().eq_ignore_ascii_case("math");
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &element.fragment,
-                    runes_mode,
-                    child_in_dialog,
-                    child_parent_regular_tag,
-                    element.has_end_tag,
-                    false,
-                    child_in_svg_context,
-                    child_in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        in_dialog: child_in_dialog,
+                        parent_regular_tag: child_parent_regular_tag,
+                        parent_regular_has_end_tag: element.has_end_tag,
+                        inside_control_block: false,
+                        in_svg_context: child_in_svg_context,
+                        in_mathml_context: child_in_mathml_context,
+                        inherited_ignores: node_ignores.as_slice(),
+                    },
                     warnings,
                 );
             }
@@ -1361,22 +1525,14 @@ fn collect_fragment_warnings(
                     each_rest_bindings,
                     warnings,
                 );
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &component.fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 );
             }
@@ -1392,22 +1548,14 @@ fn collect_fragment_warnings(
                         slot.end,
                     ));
                 }
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &slot.fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 );
             }
@@ -1419,61 +1567,23 @@ fn collect_fragment_warnings(
                 {
                     warn_if_block_empty_fragment(source, options, Some(fragment), warnings);
                 }
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
-                collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
-                    &block.consequent,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    true,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
-                    warnings,
-                );
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
+                let branch_context = WarningFragmentContext {
+                    inside_control_block: true,
+                    inherited_ignores: node_ignores.as_slice(),
+                    ..context
+                };
+                collect_fragment_warnings(env, &block.consequent, branch_context, warnings);
                 if let Some(alternate) = &block.alternate {
                     match alternate.as_ref() {
                         crate::ast::modern::Alternate::Fragment(fragment) => {
-                            collect_fragment_warnings(
-                                source,
-                                options,
-                                root,
-                                fragment,
-                                runes_mode,
-                                in_dialog,
-                                parent_regular_tag,
-                                parent_regular_has_end_tag,
-                                true,
-                                in_svg_context,
-                                in_mathml_context,
-                                script_declared_names,
-                                each_rest_bindings,
-                                &node_ignores,
-                                warnings,
-                            )
+                            collect_fragment_warnings(env, fragment, branch_context, warnings)
                         }
                         crate::ast::modern::Alternate::IfBlock(elseif) => {
                             collect_fragment_warnings(
-                                source,
-                                options,
-                                root,
+                                env,
                                 &elseif.consequent,
-                                runes_mode,
-                                in_dialog,
-                                parent_regular_tag,
-                                parent_regular_has_end_tag,
-                                true,
-                                in_svg_context,
-                                in_mathml_context,
-                                script_declared_names,
-                                each_rest_bindings,
-                                &node_ignores,
+                                branch_context,
                                 warnings,
                             )
                         }
@@ -1484,69 +1594,43 @@ fn collect_fragment_warnings(
                 let warning_start = warnings.len();
                 warn_if_block_empty_fragment(source, options, Some(&block.body), warnings);
                 warn_if_block_empty_fragment(source, options, block.fallback.as_ref(), warnings);
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
 
                 let mut child_rest_bindings = each_rest_bindings.to_vec();
                 if let Some(context_pattern) = block.context.as_ref() {
                     collect_rest_pattern_identifiers(&context_pattern.0, &mut child_rest_bindings);
                 }
+                let branch_context = WarningFragmentContext {
+                    inside_control_block: true,
+                    inherited_ignores: node_ignores.as_slice(),
+                    ..context
+                };
 
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    WarningEnv {
+                        each_rest_bindings: &child_rest_bindings,
+                        ..env
+                    },
                     &block.body,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    true,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    &child_rest_bindings,
-                    &node_ignores,
+                    branch_context,
                     warnings,
                 );
                 if let Some(fallback) = &block.fallback {
-                    collect_fragment_warnings(
-                        source,
-                        options,
-                        root,
-                        fallback,
-                        runes_mode,
-                        in_dialog,
-                        parent_regular_tag,
-                        parent_regular_has_end_tag,
-                        true,
-                        in_svg_context,
-                        in_mathml_context,
-                        script_declared_names,
-                        each_rest_bindings,
-                        &node_ignores,
-                        warnings,
-                    );
+                    collect_fragment_warnings(env, fallback, branch_context, warnings);
                 }
             }
             Node::KeyBlock(block) => {
                 let warning_start = warnings.len();
                 warn_if_block_empty_fragment(source, options, Some(&block.fragment), warnings);
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &block.fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    true,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inside_control_block: true,
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 )
             }
@@ -1555,84 +1639,34 @@ fn collect_fragment_warnings(
                 warn_if_block_empty_fragment(source, options, block.pending.as_ref(), warnings);
                 warn_if_block_empty_fragment(source, options, block.then.as_ref(), warnings);
                 warn_if_block_empty_fragment(source, options, block.catch.as_ref(), warnings);
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
+                let branch_context = WarningFragmentContext {
+                    inside_control_block: true,
+                    inherited_ignores: node_ignores.as_slice(),
+                    ..context
+                };
                 if let Some(pending) = &block.pending {
-                    collect_fragment_warnings(
-                        source,
-                        options,
-                        root,
-                        pending,
-                        runes_mode,
-                        in_dialog,
-                        parent_regular_tag,
-                        parent_regular_has_end_tag,
-                        true,
-                        in_svg_context,
-                        in_mathml_context,
-                        script_declared_names,
-                        each_rest_bindings,
-                        &node_ignores,
-                        warnings,
-                    );
+                    collect_fragment_warnings(env, pending, branch_context, warnings);
                 }
                 if let Some(then) = &block.then {
-                    collect_fragment_warnings(
-                        source,
-                        options,
-                        root,
-                        then,
-                        runes_mode,
-                        in_dialog,
-                        parent_regular_tag,
-                        parent_regular_has_end_tag,
-                        true,
-                        in_svg_context,
-                        in_mathml_context,
-                        script_declared_names,
-                        each_rest_bindings,
-                        &node_ignores,
-                        warnings,
-                    );
+                    collect_fragment_warnings(env, then, branch_context, warnings);
                 }
                 if let Some(catch) = &block.catch {
-                    collect_fragment_warnings(
-                        source,
-                        options,
-                        root,
-                        catch,
-                        runes_mode,
-                        in_dialog,
-                        parent_regular_tag,
-                        parent_regular_has_end_tag,
-                        true,
-                        in_svg_context,
-                        in_mathml_context,
-                        script_declared_names,
-                        each_rest_bindings,
-                        &node_ignores,
-                        warnings,
-                    );
+                    collect_fragment_warnings(env, catch, branch_context, warnings);
                 }
             }
             Node::SnippetBlock(block) => {
                 let warning_start = warnings.len();
                 warn_if_block_empty_fragment(source, options, Some(&block.body), warnings);
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &block.body,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    true,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inside_control_block: true,
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 )
             }
@@ -1654,22 +1688,14 @@ fn collect_fragment_warnings(
                     el.start,
                     el.end,
                 ));
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &el.fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 );
             }
@@ -1693,22 +1719,14 @@ fn collect_fragment_warnings(
                     each_rest_bindings,
                     warnings,
                 );
-                filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+                filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     &el.fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 );
             }
@@ -1722,20 +1740,12 @@ fn collect_fragment_warnings(
             | Node::TitleElement(_) => {
                 let fragment = node.as_element().unwrap().fragment();
                 collect_fragment_warnings(
-                    source,
-                    options,
-                    root,
+                    env,
                     fragment,
-                    runes_mode,
-                    in_dialog,
-                    parent_regular_tag,
-                    parent_regular_has_end_tag,
-                    inside_control_block,
-                    in_svg_context,
-                    in_mathml_context,
-                    script_declared_names,
-                    each_rest_bindings,
-                    &node_ignores,
+                    WarningFragmentContext {
+                        inherited_ignores: node_ignores.as_slice(),
+                        ..context
+                    },
                     warnings,
                 );
             }
@@ -1744,23 +1754,29 @@ fn collect_fragment_warnings(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn collect_element_warnings(
-    source: &str,
-    options: &CompileOptions,
+    env: WarningEnv<'_>,
     element: &RegularElement,
-    runes_mode: bool,
-    in_dialog: bool,
-    parent_regular_tag: Option<&str>,
-    _parent_regular_has_end_tag: bool,
-    inside_control_block: bool,
-    in_svg_context: bool,
-    in_mathml_context: bool,
-    script_declared_names: &FxHashSet<Arc<str>>,
-    each_rest_bindings: &[RestBindingWarning],
+    context: WarningFragmentContext<'_>,
     active_ignores: &[Arc<str>],
     warnings: &mut Vec<Warning>,
 ) {
+    let WarningEnv {
+        source,
+        options,
+        runes_mode,
+        script_declared_names,
+        each_rest_bindings,
+        ..
+    } = env;
+    let WarningFragmentContext {
+        in_dialog,
+        parent_regular_tag,
+        inside_control_block,
+        in_svg_context,
+        in_mathml_context,
+        ..
+    } = context;
     let warning_start = warnings.len();
     let raw_tag = element.name.as_ref();
     let tag = raw_tag.to_ascii_lowercase();
@@ -1898,7 +1914,7 @@ fn collect_element_warnings(
         };
 
         for rest_binding in each_rest_bindings {
-            if rest_binding.name.as_ref() != binding_name {
+            if rest_binding.name.as_ref() != binding_name.as_ref() {
                 continue;
             }
             warnings.push(make_warning(
@@ -2850,7 +2866,7 @@ fn collect_component_attribute_warnings(
             continue;
         };
         for rest_binding in each_rest_bindings {
-            if rest_binding.name.as_ref() != binding_name {
+            if rest_binding.name.as_ref() != binding_name.as_ref() {
                 continue;
             }
             warnings.push(make_warning(
@@ -2885,13 +2901,17 @@ fn emit_script_estree_warnings(
         is_module: script.context == crate::ast::modern::ScriptContext::Module,
     };
     walk_script_warning_node(
-        source,
-        options,
+        ScriptWarningEnv {
+            source,
+            options,
+            runes_mode,
+            imported_default_svelte_components: &imported_default_svelte_components,
+        },
         &script.content,
-        script_context,
-        runes_mode,
-        &imported_default_svelte_components,
-        &[],
+        ScriptWarningState {
+            context: script_context,
+            active_ignores: &[],
+        },
         warnings,
     );
 
@@ -2932,17 +2952,22 @@ fn emit_script_estree_warnings(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_script_warning_node(
-    source: &str,
-    options: &CompileOptions,
+    env: ScriptWarningEnv<'_>,
     node: &EstreeNode,
-    context: ScriptWalkContext,
-    runes_mode: bool,
-    imported_default_svelte_components: &FxHashSet<String>,
-    active_ignores: &[Arc<str>],
+    state: ScriptWarningState<'_>,
     warnings: &mut Vec<Warning>,
 ) {
+    let ScriptWarningEnv {
+        source,
+        options,
+        runes_mode,
+        imported_default_svelte_components,
+    } = env;
+    let ScriptWarningState {
+        context,
+        active_ignores,
+    } = state;
     let node_ignores = collect_script_node_ignores(node, runes_mode, active_ignores);
     let warning_start = warnings.len();
     match estree_node_type(node) {
@@ -3013,7 +3038,7 @@ fn walk_script_warning_node(
         }
         _ => {}
     }
-    filter_recent_ignored_warnings(warnings, warning_start, &node_ignores);
+    filter_recent_ignored_warnings(warnings, warning_start, node_ignores.as_slice());
 
     let mut child_context = context;
     if matches!(
@@ -3025,52 +3050,28 @@ fn walk_script_warning_node(
 
     for value in node.fields.values() {
         walk_script_warning_value(
-            source,
-            options,
+            env,
             value,
-            child_context,
-            runes_mode,
-            imported_default_svelte_components,
-            &node_ignores,
+            ScriptWarningState {
+                context: child_context,
+                active_ignores: node_ignores.as_slice(),
+            },
             warnings,
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn walk_script_warning_value(
-    source: &str,
-    options: &CompileOptions,
+    env: ScriptWarningEnv<'_>,
     value: &EstreeValue,
-    context: ScriptWalkContext,
-    runes_mode: bool,
-    imported_default_svelte_components: &FxHashSet<String>,
-    active_ignores: &[Arc<str>],
+    state: ScriptWarningState<'_>,
     warnings: &mut Vec<Warning>,
 ) {
     match value {
-        EstreeValue::Object(node) => walk_script_warning_node(
-            source,
-            options,
-            node,
-            context,
-            runes_mode,
-            imported_default_svelte_components,
-            active_ignores,
-            warnings,
-        ),
+        EstreeValue::Object(node) => walk_script_warning_node(env, node, state, warnings),
         EstreeValue::Array(items) => {
             for item in items.iter() {
-                walk_script_warning_value(
-                    source,
-                    options,
-                    item,
-                    context,
-                    runes_mode,
-                    imported_default_svelte_components,
-                    active_ignores,
-                    warnings,
-                );
+                walk_script_warning_value(env, item, state, warnings);
             }
         }
         EstreeValue::String(_)
@@ -3086,8 +3087,8 @@ fn collect_script_node_ignores(
     node: &EstreeNode,
     runes_mode: bool,
     inherited_ignores: &[Arc<str>],
-) -> Vec<Arc<str>> {
-    let mut ignores = inherited_ignores.to_vec();
+) -> IgnoreCodes {
+    let mut ignores = IgnoreCodes::from_slice(inherited_ignores);
     let Some(comments) = estree_node_field_array(node, RawField::LeadingComments) else {
         return ignores;
     };
@@ -3106,9 +3107,7 @@ fn collect_script_node_ignores(
             comment_data,
             runes_mode,
         );
-        for ignore in parsed.ignores {
-            push_ignore_unique(&mut ignores, ignore.as_ref());
-        }
+        ignores.extend_unique(parsed.ignores.iter());
     }
 
     ignores
@@ -3116,7 +3115,7 @@ fn collect_script_node_ignores(
 
 fn expression_is_legacy_component_creation(
     expression: &EstreeNode,
-    imported_default_svelte_components: &FxHashSet<String>,
+    imported_default_svelte_components: &NameSet,
 ) -> bool {
     if estree_node_type(expression) != Some("NewExpression") {
         return false;
@@ -3233,8 +3232,8 @@ fn emit_reactive_module_script_dependency_warnings(
     }
 }
 
-fn collect_declared_names_in_program(program: &EstreeNode) -> FxHashSet<String> {
-    let mut names = FxHashSet::<String>::default();
+fn collect_declared_names_in_program(program: &EstreeNode) -> NameSet {
+    let mut names = FxHashSet::<Arc<str>>::default();
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return names;
     };
@@ -3244,14 +3243,14 @@ fn collect_declared_names_in_program(program: &EstreeNode) -> FxHashSet<String> 
         };
         match estree_node_type(statement) {
             Some("VariableDeclaration") => {
-                collect_declared_names_from_variable_declaration_string(statement, &mut names);
+                collect_declared_names_from_variable_declaration(statement, &mut names);
             }
             Some("FunctionDeclaration") | Some("ClassDeclaration") => {
                 if let Some(id) = estree_node_field_object(statement, RawField::Id)
                     && estree_node_type(id) == Some("Identifier")
                     && let Some(name) = estree_node_field_str(id, RawField::Name)
                 {
-                    names.insert(name.to_string());
+                    names.insert(Arc::from(name));
                 }
             }
             Some("ExportNamedDeclaration") => {
@@ -3260,7 +3259,7 @@ fn collect_declared_names_in_program(program: &EstreeNode) -> FxHashSet<String> 
                 {
                     match estree_node_type(declaration) {
                         Some("VariableDeclaration") => {
-                            collect_declared_names_from_variable_declaration_string(
+                            collect_declared_names_from_variable_declaration(
                                 declaration,
                                 &mut names,
                             );
@@ -3270,7 +3269,7 @@ fn collect_declared_names_in_program(program: &EstreeNode) -> FxHashSet<String> 
                                 && estree_node_type(id) == Some("Identifier")
                                 && let Some(name) = estree_node_field_str(id, RawField::Name)
                             {
-                                names.insert(name.to_string());
+                                names.insert(Arc::from(name));
                             }
                         }
                         _ => {}
@@ -3283,88 +3282,15 @@ fn collect_declared_names_in_program(program: &EstreeNode) -> FxHashSet<String> 
     names
 }
 
-fn collect_declared_names_from_variable_declaration_string(
-    declaration: &EstreeNode,
-    out: &mut FxHashSet<String>,
-) {
-    let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
-        return;
-    };
-    for declarator in declarations {
-        let EstreeValue::Object(declarator) = declarator else {
-            continue;
-        };
-        let Some(id) = estree_node_field_object(declarator, RawField::Id) else {
-            continue;
-        };
-        collect_pattern_binding_names_string(id, out);
-    }
-}
-
-fn collect_pattern_binding_names_string(pattern: &EstreeNode, out: &mut FxHashSet<String>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.insert(name.to_string());
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_pattern_binding_names_string(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_pattern_binding_names_string(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    if let EstreeValue::Object(element) = element {
-                        collect_pattern_binding_names_string(element, out);
-                    }
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_pattern_binding_names_string(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_pattern_binding_names_string(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_reassigned_identifier_names(program: &EstreeNode) -> FxHashSet<String> {
-    let mut names = FxHashSet::<String>::default();
+fn collect_reassigned_identifier_names(program: &EstreeNode) -> NameSet {
+    let mut names = FxHashSet::<Arc<str>>::default();
     walk_estree_node(program, &mut |node| match estree_node_type(node) {
         Some("AssignmentExpression") => {
             if let Some(left) = estree_node_field_object(node, RawField::Left)
                 && estree_node_type(left) == Some("Identifier")
                 && let Some(name) = estree_node_field_str(left, RawField::Name)
             {
-                names.insert(name.to_string());
+                names.insert(Arc::from(name));
             }
         }
         Some("UpdateExpression") => {
@@ -3372,7 +3298,7 @@ fn collect_reassigned_identifier_names(program: &EstreeNode) -> FxHashSet<String
                 && estree_node_type(argument) == Some("Identifier")
                 && let Some(name) = estree_node_field_str(argument, RawField::Name)
             {
-                names.insert(name.to_string());
+                names.insert(Arc::from(name));
             }
         }
         _ => {}
@@ -3386,10 +3312,7 @@ fn emit_store_rune_conflict_warnings(
     root: &Root,
     warnings: &mut Vec<Warning>,
 ) {
-    let declared = collect_script_declared_names(root)
-        .into_iter()
-        .map(|name| name.to_string())
-        .collect::<FxHashSet<_>>();
+    let declared = collect_script_declared_names(root);
     if declared.is_empty() {
         return;
     }
@@ -3461,12 +3384,12 @@ fn emit_non_reactive_update_warnings(
     }
     let bindings = collect_instance_bindings(root, true);
 
-    let candidate_names = candidates.keys().cloned().collect::<FxHashSet<String>>();
-    let mut referenced = FxHashSet::<String>::default();
+    let candidate_names = candidates.keys().cloned().collect::<FxHashSet<_>>();
+    let mut referenced = FxHashSet::<Arc<str>>::default();
     collect_non_reactive_template_references(&root.fragment, 0, &candidate_names, &mut referenced);
 
     for (name, (start, end)) in candidates {
-        if !referenced.contains(name.as_str()) {
+        if !referenced.contains(name.as_ref()) {
             continue;
         }
         if let Some(binding) = bindings.get(&name)
@@ -3491,7 +3414,7 @@ fn emit_non_reactive_update_warnings(
 fn collect_reassigned_normal_bindings(
     root: &Root,
     runes_mode: bool,
-) -> FxHashMap<String, (usize, usize)> {
+) -> FxHashMap<Arc<str>, (usize, usize)> {
     let mut bindings = collect_instance_bindings(root, runes_mode)
         .into_iter()
         .filter_map(|(name, info)| {
@@ -3503,7 +3426,7 @@ fn collect_reassigned_normal_bindings(
         return bindings;
     }
 
-    let mut reassigned = FxHashSet::<String>::default();
+    let mut reassigned = FxHashSet::<Arc<str>>::default();
     if let Some(instance_script) = instance_script(root) {
         reassigned.extend(collect_reassigned_identifier_names(
             &instance_script.content,
@@ -3511,7 +3434,7 @@ fn collect_reassigned_normal_bindings(
     }
     collect_template_reassigned_names(&root.fragment, &mut reassigned);
 
-    bindings.retain(|name, _| reassigned.contains(name));
+    bindings.retain(|name, _| reassigned.contains(name.as_ref()));
     bindings
 }
 
@@ -3527,7 +3450,7 @@ fn instance_script(root: &Root) -> Option<&crate::ast::modern::Script> {
 fn collect_instance_bindings(
     root: &Root,
     runes_mode: bool,
-) -> FxHashMap<String, InstanceBindingInfo> {
+) -> FxHashMap<Arc<str>, InstanceBindingInfo> {
     let Some(instance_script) = instance_script(root) else {
         return FxHashMap::default();
     };
@@ -3535,7 +3458,7 @@ fn collect_instance_bindings(
         return FxHashMap::default();
     };
 
-    let mut bindings = FxHashMap::<String, InstanceBindingInfo>::default();
+    let mut bindings = FxHashMap::<Arc<str>, InstanceBindingInfo>::default();
 
     for statement in body {
         let EstreeValue::Object(statement) = statement else {
@@ -3547,7 +3470,7 @@ fn collect_instance_bindings(
             Some("VariableDeclaration") => {
                 collect_bindings_from_variable_declaration(
                     statement,
-                    &statement_ignores,
+                    statement_ignores.as_slice(),
                     &mut bindings,
                 );
             }
@@ -3559,7 +3482,7 @@ fn collect_instance_bindings(
                 if estree_node_type(declaration) == Some("VariableDeclaration") {
                     collect_bindings_from_variable_declaration(
                         declaration,
-                        &statement_ignores,
+                        statement_ignores.as_slice(),
                         &mut bindings,
                     );
                 }
@@ -3574,7 +3497,7 @@ fn collect_instance_bindings(
 fn collect_bindings_from_variable_declaration(
     declaration: &EstreeNode,
     ignore_codes: &[Arc<str>],
-    out: &mut FxHashMap<String, InstanceBindingInfo>,
+    out: &mut FxHashMap<Arc<str>, InstanceBindingInfo>,
 ) {
     let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
         return;
@@ -3645,7 +3568,7 @@ fn collect_pattern_bindings_inner(
                 return;
             };
             out.push(PatternBinding {
-                name: name.to_string(),
+                name: Arc::from(name),
                 start,
                 end,
                 is_rest: inside_rest,
@@ -3699,14 +3622,14 @@ fn collect_pattern_bindings_inner(
     }
 }
 
-fn raw_rune_callee_name(node: &EstreeNode) -> Option<String> {
+fn raw_rune_callee_name(node: &EstreeNode) -> Option<Arc<str>> {
     if estree_node_type(node) != Some("CallExpression") {
         return None;
     }
     let callee = estree_node_field_object(node, RawField::Callee)?;
     let callee_name = raw_callee_name(callee)?;
     matches!(
-        callee_name.as_str(),
+        callee_name.as_ref(),
         "$state" | "$state.raw" | "$derived" | "$derived.by" | "$props"
     )
     .then_some(callee_name)
@@ -3731,82 +3654,74 @@ fn state_like_argument_proxyable(call_expression: &EstreeNode) -> bool {
     )
 }
 
-fn collect_template_reassigned_names(fragment: &Fragment, out: &mut FxHashSet<String>) {
+fn collect_template_reassigned_names(fragment: &Fragment, out: &mut NameSet) {
     for node in fragment.nodes.iter() {
-        match node {
-            Node::Text(_) | Node::Comment(_) | Node::DebugTag(_) => {}
-            Node::ExpressionTag(tag) => {
-                collect_template_reassigned_from_expression(&tag.expression, out)
+        collect_template_reassigned_in_node(node, out);
+        if let Some(error_branches) = template_reassigned_alternate(node) {
+            collect_template_reassigned_in_alternate(error_branches, out);
+            continue;
+        }
+        node.for_each_child_fragment(|child| collect_template_reassigned_names(child, out));
+    }
+}
+
+fn collect_template_reassigned_in_node(node: &Node, out: &mut NameSet) {
+    match node {
+        Node::Text(_) | Node::Comment(_) | Node::DebugTag(_) | Node::SnippetBlock(_) => {}
+        Node::ExpressionTag(tag) => {
+            collect_template_reassigned_from_expression(&tag.expression, out)
+        }
+        Node::RenderTag(tag) => collect_template_reassigned_from_expression(&tag.expression, out),
+        Node::HtmlTag(tag) => collect_template_reassigned_from_expression(&tag.expression, out),
+        Node::ConstTag(tag) => collect_template_reassigned_from_expression(&tag.declaration, out),
+        Node::IfBlock(block) => collect_template_reassigned_from_expression(&block.test, out),
+        Node::EachBlock(block) => {
+            collect_template_reassigned_from_expression(&block.expression, out);
+            if let Some(key) = block.key.as_ref() {
+                collect_template_reassigned_from_expression(key, out);
             }
-            Node::RenderTag(tag) => {
-                collect_template_reassigned_from_expression(&tag.expression, out)
+        }
+        Node::KeyBlock(block) => {
+            collect_template_reassigned_from_expression(&block.expression, out);
+        }
+        Node::AwaitBlock(block) => {
+            collect_template_reassigned_from_expression(&block.expression, out);
+            if let Some(value) = block.value.as_ref() {
+                collect_template_reassigned_from_expression(value, out);
             }
-            Node::HtmlTag(tag) => collect_template_reassigned_from_expression(&tag.expression, out),
-            Node::ConstTag(tag) => {
-                collect_template_reassigned_from_expression(&tag.declaration, out)
+            if let Some(error) = block.error.as_ref() {
+                collect_template_reassigned_from_expression(error, out);
             }
-            Node::IfBlock(block) => {
-                collect_template_reassigned_from_expression(&block.test, out);
-                collect_template_reassigned_names(&block.consequent, out);
-                match block.alternate.as_deref() {
-                    Some(crate::ast::modern::Alternate::Fragment(fragment)) => {
-                        collect_template_reassigned_names(fragment, out);
-                    }
-                    Some(crate::ast::modern::Alternate::IfBlock(elseif)) => {
-                        collect_template_reassigned_names(&elseif.consequent, out);
-                    }
-                    None => {}
-                }
-            }
-            Node::EachBlock(block) => {
-                collect_template_reassigned_from_expression(&block.expression, out);
-                if let Some(key) = block.key.as_ref() {
-                    collect_template_reassigned_from_expression(key, out);
-                }
-                collect_template_reassigned_names(&block.body, out);
-                if let Some(fallback) = block.fallback.as_ref() {
-                    collect_template_reassigned_names(fallback, out);
-                }
-            }
-            Node::KeyBlock(block) => {
-                collect_template_reassigned_from_expression(&block.expression, out);
-                collect_template_reassigned_names(&block.fragment, out);
-            }
-            Node::AwaitBlock(block) => {
-                collect_template_reassigned_from_expression(&block.expression, out);
-                if let Some(value) = block.value.as_ref() {
-                    collect_template_reassigned_from_expression(value, out);
-                }
-                if let Some(error) = block.error.as_ref() {
-                    collect_template_reassigned_from_expression(error, out);
-                }
-                for fragment in [
-                    block.pending.as_ref(),
-                    block.then.as_ref(),
-                    block.catch.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    collect_template_reassigned_names(fragment, out);
-                }
-            }
-            Node::SnippetBlock(block) => {
-                collect_template_reassigned_names(&block.body, out);
-            }
-            _ => {
-                let Some(el) = node.as_element() else { return };
-                collect_template_reassigned_from_attributes(el.attributes(), out);
-                collect_template_reassigned_names(el.fragment(), out);
+        }
+        _ => {
+            if let Some(element) = node.as_element() {
+                collect_template_reassigned_from_attributes(element.attributes(), out);
             }
         }
     }
 }
 
-fn collect_template_reassigned_from_attributes(
-    attributes: &[Attribute],
-    out: &mut FxHashSet<String>,
-) {
+fn template_reassigned_alternate(node: &Node) -> Option<&Alternate> {
+    match node {
+        Node::IfBlock(block) => block.alternate.as_deref(),
+        _ => None,
+    }
+}
+
+fn collect_template_reassigned_in_alternate(alternate: &Alternate, out: &mut NameSet) {
+    match alternate {
+        Alternate::Fragment(fragment) => collect_template_reassigned_names(fragment, out),
+        Alternate::IfBlock(block) => {
+            collect_template_reassigned_from_expression(&block.test, out);
+            collect_template_reassigned_names(&block.consequent, out);
+            if let Some(alternate) = block.alternate.as_deref() {
+                collect_template_reassigned_in_alternate(alternate, out);
+            }
+        }
+    }
+}
+
+fn collect_template_reassigned_from_attributes(attributes: &[Attribute], out: &mut NameSet) {
     for attribute in attributes {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
@@ -3865,7 +3780,7 @@ fn collect_template_reassigned_from_attributes(
 
 fn collect_template_reassigned_from_expression(
     expression: &crate::ast::modern::Expression,
-    out: &mut FxHashSet<String>,
+    out: &mut NameSet,
 ) {
     walk_estree_node(&expression.0, &mut |node| match estree_node_type(node) {
         Some("AssignmentExpression") => {
@@ -3873,7 +3788,7 @@ fn collect_template_reassigned_from_expression(
                 && estree_node_type(left) == Some("Identifier")
                 && let Some(name) = estree_node_field_str(left, RawField::Name)
             {
-                out.insert(name.to_string());
+                out.insert(name.into());
             }
         }
         Some("UpdateExpression") => {
@@ -3881,7 +3796,7 @@ fn collect_template_reassigned_from_expression(
                 && estree_node_type(argument) == Some("Identifier")
                 && let Some(name) = estree_node_field_str(argument, RawField::Name)
             {
-                out.insert(name.to_string());
+                out.insert(name.into());
             }
         }
         _ => {}
@@ -3916,25 +3831,16 @@ fn emit_state_referenced_locally_warnings(
 
     let reassigned = collect_reassigned_identifier_names(&instance_script.content);
 
-    walk_estree_node_with_path(
+    walk_reference_identifiers_with_path(
         &instance_script.content,
         &mut Vec::new(),
-        &mut |node, path| {
-            if estree_node_type(node) != Some("Identifier") {
-                return;
-            }
-            if is_ignored_identifier_context(path)
-                || is_type_identifier_context(path)
-                || is_write_identifier_context(path)
+        &mut |node, name, path| {
+            if is_write_identifier_context(path)
                 || is_props_destructure_identifier(path)
                 || is_reference_inside_derived_constructor(path)
             {
                 return;
             }
-
-            let Some(name) = estree_node_field_str(node, RawField::Name) else {
-                return;
-            };
             let Some(binding) = bindings.get(name) else {
                 return;
             };
@@ -4011,18 +3917,18 @@ fn emit_export_let_unused_warnings(
         .iter()
         .map(|entry| entry.name.clone())
         .collect::<FxHashSet<_>>();
-    let mut used = FxHashSet::<String>::default();
+    let mut used = FxHashSet::<Arc<str>>::default();
     collect_script_export_uses(&instance_script.content, &export_names, &mut used);
     collect_template_export_uses(
         &root.fragment,
         &export_names,
-        &FxHashSet::default(),
+        &NameScope::default(),
         &mut used,
     );
 
     exports.sort_by_key(|entry| entry.start);
     for export in exports {
-        if used.contains(export.name.as_str()) {
+        if used.contains(export.name.as_ref()) {
             continue;
         }
         if warning_is_ignored("export_let_unused", &export.ignore_codes) {
@@ -4082,7 +3988,7 @@ fn collect_instance_mutable_exports(
                         name: binding.name,
                         start: binding.start,
                         end: binding.end,
-                        ignore_codes: statement_ignores.to_vec().into_boxed_slice(),
+                        ignore_codes: statement_ignores.to_boxed_slice(),
                     }));
                 }
             }
@@ -4115,26 +4021,26 @@ fn collect_instance_mutable_exports(
                 continue;
             };
             out.push(ExportedMutableBinding {
-                name: name.to_string(),
+                name: Arc::from(name),
                 start,
                 end,
-                ignore_codes: statement_ignores.to_vec().into_boxed_slice(),
+                ignore_codes: statement_ignores.to_boxed_slice(),
             });
         }
     }
 
-    let mut deduped = FxHashMap::<String, ExportedMutableBinding>::default();
+    let mut deduped = FxHashMap::<Arc<str>, ExportedMutableBinding>::default();
     for binding in out {
         deduped.entry(binding.name.clone()).or_insert(binding);
     }
     deduped.into_values().collect()
 }
 
-fn collect_program_mutable_bindings(program: &EstreeNode) -> FxHashMap<String, (usize, usize)> {
+fn collect_program_mutable_bindings(program: &EstreeNode) -> FxHashMap<Arc<str>, (usize, usize)> {
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return FxHashMap::default();
     };
-    let mut out = FxHashMap::<String, (usize, usize)>::default();
+    let mut out = FxHashMap::<Arc<str>, (usize, usize)>::default();
 
     for statement in body {
         let EstreeValue::Object(statement) = statement else {
@@ -4202,21 +4108,8 @@ fn collect_program_mutable_bindings(program: &EstreeNode) -> FxHashMap<String, (
     out
 }
 
-fn collect_script_export_uses(
-    program: &EstreeNode,
-    export_names: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
-) {
-    walk_estree_node_with_path(program, &mut Vec::new(), &mut |node, path| {
-        if estree_node_type(node) != Some("Identifier")
-            || is_ignored_identifier_context(path)
-            || is_type_identifier_context(path)
-        {
-            return;
-        }
-        let Some(name) = estree_node_field_str(node, RawField::Name) else {
-            return;
-        };
+fn collect_script_export_uses(program: &EstreeNode, export_names: &NameSet, out: &mut NameSet) {
+    walk_reference_identifiers_with_path(program, &mut Vec::new(), &mut |_node, name, _path| {
         if let Some(mapped) = mapped_export_name(name, export_names) {
             out.insert(mapped);
         }
@@ -4225,112 +4118,110 @@ fn collect_script_export_uses(
 
 fn collect_template_export_uses(
     fragment: &Fragment,
-    export_names: &FxHashSet<String>,
-    scope: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
 ) {
     for node in fragment.nodes.iter() {
-        match node {
-            Node::Text(_) | Node::Comment(_) | Node::DebugTag(_) => {}
-            Node::ExpressionTag(tag) => {
-                collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
-            }
-            Node::RenderTag(tag) => {
-                collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
-            }
-            Node::HtmlTag(tag) => {
-                collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
-            }
-            Node::ConstTag(tag) => {
-                collect_export_uses_from_expression(&tag.declaration, export_names, scope, out);
-            }
-            Node::IfBlock(block) => {
-                collect_export_uses_from_expression(&block.test, export_names, scope, out);
-                collect_template_export_uses(&block.consequent, export_names, scope, out);
-                match block.alternate.as_deref() {
-                    Some(crate::ast::modern::Alternate::Fragment(fragment)) => {
-                        collect_template_export_uses(fragment, export_names, scope, out);
-                    }
-                    Some(crate::ast::modern::Alternate::IfBlock(elseif)) => {
-                        collect_template_export_uses(&elseif.consequent, export_names, scope, out);
-                    }
-                    None => {}
-                }
-            }
-            Node::EachBlock(block) => {
-                collect_export_uses_from_expression(&block.expression, export_names, scope, out);
-                if let Some(key) = block.key.as_ref() {
-                    collect_export_uses_from_expression(key, export_names, scope, out);
-                }
-                if let Some(context) = block.context.as_ref() {
-                    collect_export_uses_from_pattern_defaults(&context.0, export_names, scope, out);
-                }
+        collect_template_export_uses_in_node(node, export_names, scope, out);
 
-                let mut child_scope = scope.clone();
-                if let Some(context) = block.context.as_ref() {
-                    let mut names = FxHashSet::<String>::default();
-                    collect_pattern_binding_names_string(&context.0, &mut names);
-                    child_scope.extend(names);
-                }
-                if let Some(index) = block.index.as_ref() {
-                    child_scope.insert(index.to_string());
-                }
+        if let Node::AwaitBlock(block) = node {
+            if let Some(fragment) = block.pending.as_ref() {
+                collect_template_export_uses(fragment, export_names, scope, out);
+            }
+            if let Some(fragment) = block.then.as_ref() {
+                let then_scope = scope.with_expression_bindings(block.value.as_ref());
+                collect_template_export_uses(fragment, export_names, &then_scope, out);
+            }
+            if let Some(fragment) = block.catch.as_ref() {
+                let catch_scope = scope.with_expression_bindings(block.error.as_ref());
+                collect_template_export_uses(fragment, export_names, &catch_scope, out);
+            }
+            continue;
+        }
 
-                collect_template_export_uses(&block.body, export_names, &child_scope, out);
-                if let Some(fallback) = block.fallback.as_ref() {
-                    collect_template_export_uses(fallback, export_names, &child_scope, out);
+        let child_scope = scope.child_scope_for(node);
+        if let Some(alternate) = export_use_alternate(node) {
+            collect_template_export_uses_in_alternate(alternate, export_names, &child_scope, out);
+            continue;
+        }
+        node.for_each_child_fragment(|child| {
+            collect_template_export_uses(child, export_names, &child_scope, out);
+        });
+    }
+}
+
+fn collect_template_export_uses_in_node(
+    node: &Node,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
+) {
+    match node {
+        Node::Text(_) | Node::Comment(_) | Node::DebugTag(_) | Node::SnippetBlock(_) => {}
+        Node::ExpressionTag(tag) => {
+            collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
+        }
+        Node::RenderTag(tag) => {
+            collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
+        }
+        Node::HtmlTag(tag) => {
+            collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
+        }
+        Node::ConstTag(tag) => {
+            collect_export_uses_from_expression(&tag.declaration, export_names, scope, out);
+        }
+        Node::IfBlock(block) => {
+            collect_export_uses_from_expression(&block.test, export_names, scope, out);
+        }
+        Node::EachBlock(block) => {
+            collect_export_uses_from_expression(&block.expression, export_names, scope, out);
+            if let Some(key) = block.key.as_ref() {
+                collect_export_uses_from_expression(key, export_names, scope, out);
+            }
+            if let Some(context) = block.context.as_ref() {
+                collect_export_uses_from_pattern_defaults(&context.0, export_names, scope, out);
+            }
+        }
+        Node::KeyBlock(block) => {
+            collect_export_uses_from_expression(&block.expression, export_names, scope, out);
+        }
+        Node::AwaitBlock(block) => {
+            collect_export_uses_from_expression(&block.expression, export_names, scope, out);
+        }
+        _ => {
+            if let Some(element) = node.as_element() {
+                collect_export_uses_from_attributes(element.attributes(), export_names, scope, out);
+                if let Some(expression) = element.expression() {
+                    collect_export_uses_from_expression(expression, export_names, scope, out);
                 }
             }
-            Node::KeyBlock(block) => {
-                collect_export_uses_from_expression(&block.expression, export_names, scope, out);
-                collect_template_export_uses(&block.fragment, export_names, scope, out);
-            }
-            Node::AwaitBlock(block) => {
-                collect_export_uses_from_expression(&block.expression, export_names, scope, out);
-                if let Some(fragment) = block.pending.as_ref() {
-                    collect_template_export_uses(fragment, export_names, scope, out);
-                }
-                if let Some(fragment) = block.then.as_ref() {
-                    let mut then_scope = scope.clone();
-                    if let Some(value) = block.value.as_ref() {
-                        let mut names = FxHashSet::<String>::default();
-                        collect_pattern_binding_names_string(&value.0, &mut names);
-                        then_scope.extend(names);
-                    }
-                    collect_template_export_uses(fragment, export_names, &then_scope, out);
-                }
-                if let Some(fragment) = block.catch.as_ref() {
-                    let mut catch_scope = scope.clone();
-                    if let Some(error) = block.error.as_ref() {
-                        let mut names = FxHashSet::<String>::default();
-                        collect_pattern_binding_names_string(&error.0, &mut names);
-                        catch_scope.extend(names);
-                    }
-                    collect_template_export_uses(fragment, export_names, &catch_scope, out);
-                }
-            }
-            Node::SnippetBlock(block) => {
-                let mut child_scope = scope.clone();
-                for parameter in block.parameters.iter() {
-                    let mut names = FxHashSet::<String>::default();
-                    collect_pattern_binding_names_string(&parameter.0, &mut names);
-                    child_scope.extend(names);
-                }
-                collect_template_export_uses(&block.body, export_names, &child_scope, out);
-            }
-            _ => {
-                let Some(el) = node.as_element() else { return };
-                let mut child_scope = scope.clone();
-                for attribute in el.attributes().iter() {
-                    if let Attribute::LetDirective(directive) = attribute {
-                        child_scope.extend(let_directive_scope_names(directive));
-                    }
-                }
-                collect_export_uses_from_attributes(el.attributes(), export_names, scope, out);
-                if let Some(expr) = el.expression() {
-                    collect_export_uses_from_expression(expr, export_names, scope, out);
-                }
-                collect_template_export_uses(el.fragment(), export_names, &child_scope, out);
+        }
+    }
+}
+
+fn export_use_alternate(node: &Node) -> Option<&Alternate> {
+    match node {
+        Node::IfBlock(block) => block.alternate.as_deref(),
+        _ => None,
+    }
+}
+
+fn collect_template_export_uses_in_alternate(
+    alternate: &Alternate,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
+) {
+    match alternate {
+        Alternate::Fragment(fragment) => {
+            collect_template_export_uses(fragment, export_names, scope, out);
+        }
+        Alternate::IfBlock(block) => {
+            collect_export_uses_from_expression(&block.test, export_names, scope, out);
+            collect_template_export_uses(&block.consequent, export_names, scope, out);
+            if let Some(alternate) = block.alternate.as_deref() {
+                collect_template_export_uses_in_alternate(alternate, export_names, scope, out);
             }
         }
     }
@@ -4338,9 +4229,9 @@ fn collect_template_export_uses(
 
 fn collect_export_uses_from_attributes(
     attributes: &[Attribute],
-    export_names: &FxHashSet<String>,
-    scope: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
 ) {
     for attribute in attributes {
         match attribute {
@@ -4389,7 +4280,7 @@ fn collect_export_uses_from_attributes(
             Attribute::StyleDirective(style) => match &style.value {
                 AttributeValueList::Boolean(_) => {
                     if let Some(mapped) = mapped_export_name(style.name.as_ref(), export_names)
-                        && !scope.contains(mapped.as_str())
+                        && !scope.contains(mapped.as_ref())
                     {
                         out.insert(mapped);
                     }
@@ -4417,31 +4308,20 @@ fn collect_export_uses_from_attributes(
     }
 }
 
-fn let_directive_scope_names(
-    directive: &crate::ast::modern::DirectiveAttribute,
-) -> FxHashSet<String> {
-    let mut names = FxHashSet::<String>::default();
-    collect_pattern_binding_names_string(&directive.expression.0, &mut names);
-    if names.is_empty() {
-        names.insert(directive.name.to_string());
-    }
-    names
-}
-
 fn collect_export_uses_from_expression(
     expression: &crate::ast::modern::Expression,
-    export_names: &FxHashSet<String>,
-    scope: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
 ) {
     collect_export_uses_from_expression_node(&expression.0, export_names, scope, out);
 }
 
 fn collect_export_uses_from_pattern_defaults(
     pattern: &EstreeNode,
-    export_names: &FxHashSet<String>,
-    scope: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
 ) {
     match estree_node_type(pattern) {
         Some("Identifier") => {}
@@ -4515,45 +4395,27 @@ fn collect_export_uses_from_pattern_defaults(
 
 fn collect_export_uses_from_expression_node(
     expression: &EstreeNode,
-    export_names: &FxHashSet<String>,
-    scope: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    export_names: &NameSet,
+    scope: &NameScope,
+    out: &mut NameSet,
 ) {
-    walk_estree_node_with_path(expression, &mut Vec::new(), &mut |node, path| {
-        if estree_node_type(node) != Some("Identifier")
-            || is_ignored_identifier_context(path)
-            || is_type_identifier_context(path)
-        {
-            return;
-        }
-        let Some(name) = estree_node_field_str(node, RawField::Name) else {
-            return;
-        };
+    walk_reference_identifiers_with_path(expression, &mut Vec::new(), &mut |_node, name, _path| {
         let Some(mapped) = mapped_export_name(name, export_names) else {
             return;
         };
-        if scope.contains(mapped.as_str()) {
+        if scope.contains(mapped.as_ref()) {
             return;
         }
         out.insert(mapped);
     });
 }
 
-fn mapped_export_name(name: &str, export_names: &FxHashSet<String>) -> Option<String> {
+fn mapped_export_name(name: &str, export_names: &NameSet) -> Option<Arc<str>> {
     if export_names.contains(name) {
-        return Some(name.to_string());
+        return Some(name.into());
     }
     let stripped = name.strip_prefix('$')?;
-    export_names
-        .contains(stripped)
-        .then_some(stripped.to_string())
-}
-
-fn is_type_identifier_context(path: &[PathStep<'_>]) -> bool {
-    path.iter().any(|step| {
-        estree_node_type(step.parent)
-            .is_some_and(|kind| kind.starts_with("TS") || kind == "TSTypeAnnotation")
-    })
+    export_names.contains(stripped).then_some(stripped.into())
 }
 
 fn is_write_identifier_context(path: &[PathStep<'_>]) -> bool {
@@ -4640,212 +4502,197 @@ fn is_state_like_rune_call(node: &EstreeNode) -> bool {
         return false;
     };
     matches!(
-        callee_name.as_str(),
+        callee_name.as_ref(),
         "$state" | "$state.raw" | "$derived" | "$derived.by" | "$props"
     )
-}
-
-fn raw_callee_name(node: &EstreeNode) -> Option<String> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(ToString::to_string),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            let property = estree_node_field_object(node, RawField::Property)?;
-            let object_name = raw_callee_name(object)?;
-            let property_name = estree_node_field_str(property, RawField::Name)?;
-            Some(format!("{}.{}", object_name, property_name))
-        }
-        _ => None,
-    }
 }
 
 fn collect_non_reactive_template_references(
     fragment: &Fragment,
     block_depth: usize,
-    candidate_names: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    candidate_names: &NameSet,
+    out: &mut NameSet,
 ) {
     for node in fragment.nodes.iter() {
-        match node {
-            Node::Text(_) | Node::Comment(_) => {}
-            Node::ExpressionTag(tag) => {
+        collect_non_reactive_in_node(node, block_depth, candidate_names, out);
+        let child_block_depth = non_reactive_child_block_depth(node, block_depth);
+        if let Some(alternate) = non_reactive_alternate(node) {
+            collect_non_reactive_template_references_in_alternate(
+                alternate,
+                child_block_depth,
+                candidate_names,
+                out,
+            );
+            continue;
+        }
+        node.for_each_child_fragment(|child| {
+            collect_non_reactive_template_references(
+                child,
+                child_block_depth,
+                candidate_names,
+                out,
+            );
+        });
+    }
+}
+
+fn collect_non_reactive_in_node(
+    node: &Node,
+    block_depth: usize,
+    candidate_names: &NameSet,
+    out: &mut NameSet,
+) {
+    match node {
+        Node::Text(_) | Node::Comment(_) | Node::DebugTag(_) | Node::SnippetBlock(_) => {}
+        Node::ExpressionTag(tag) => {
+            collect_non_reactive_from_expression(
+                &tag.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::RenderTag(tag) => {
+            collect_non_reactive_from_expression(
+                &tag.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::HtmlTag(tag) => {
+            collect_non_reactive_from_expression(
+                &tag.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::ConstTag(tag) => {
+            collect_non_reactive_from_expression(
+                &tag.declaration,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::IfBlock(block) => {
+            collect_non_reactive_from_expression(
+                &block.test,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::EachBlock(block) => {
+            collect_non_reactive_from_expression(
+                &block.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+            if let Some(key) = block.key.as_ref() {
+                collect_non_reactive_from_expression(key, false, block_depth, candidate_names, out);
+            }
+        }
+        Node::KeyBlock(block) => {
+            collect_non_reactive_from_expression(
+                &block.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+        }
+        Node::AwaitBlock(block) => {
+            collect_non_reactive_from_expression(
+                &block.expression,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+            if let Some(value) = block.value.as_ref() {
                 collect_non_reactive_from_expression(
-                    &tag.expression,
+                    value,
                     false,
                     block_depth,
                     candidate_names,
                     out,
                 );
             }
-            Node::RenderTag(tag) => {
+            if let Some(error) = block.error.as_ref() {
                 collect_non_reactive_from_expression(
-                    &tag.expression,
+                    error,
                     false,
                     block_depth,
                     candidate_names,
                     out,
                 );
             }
-            Node::HtmlTag(tag) => {
-                collect_non_reactive_from_expression(
-                    &tag.expression,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-            }
-            Node::ConstTag(tag) => {
-                collect_non_reactive_from_expression(
-                    &tag.declaration,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-            }
-            Node::IfBlock(block) => {
-                collect_non_reactive_from_expression(
-                    &block.test,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-                collect_non_reactive_template_references(
-                    &block.consequent,
-                    block_depth + 1,
-                    candidate_names,
-                    out,
-                );
-                match block.alternate.as_deref() {
-                    Some(crate::ast::modern::Alternate::Fragment(fragment)) => {
-                        collect_non_reactive_template_references(
-                            fragment,
-                            block_depth + 1,
-                            candidate_names,
-                            out,
-                        );
-                    }
-                    Some(crate::ast::modern::Alternate::IfBlock(elseif)) => {
-                        collect_non_reactive_template_references(
-                            &elseif.consequent,
-                            block_depth + 1,
-                            candidate_names,
-                            out,
-                        );
-                    }
-                    None => {}
-                }
-            }
-            Node::EachBlock(block) => {
-                collect_non_reactive_from_expression(
-                    &block.expression,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-                if let Some(key) = block.key.as_ref() {
-                    collect_non_reactive_from_expression(
-                        key,
-                        false,
-                        block_depth,
-                        candidate_names,
-                        out,
-                    );
-                }
-                collect_non_reactive_template_references(
-                    &block.body,
-                    block_depth + 1,
-                    candidate_names,
-                    out,
-                );
-                if let Some(fallback) = block.fallback.as_ref() {
-                    collect_non_reactive_template_references(
-                        fallback,
-                        block_depth + 1,
-                        candidate_names,
-                        out,
-                    );
-                }
-            }
-            Node::KeyBlock(block) => {
-                collect_non_reactive_from_expression(
-                    &block.expression,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-                collect_non_reactive_template_references(
-                    &block.fragment,
-                    block_depth + 1,
-                    candidate_names,
-                    out,
-                );
-            }
-            Node::AwaitBlock(block) => {
-                collect_non_reactive_from_expression(
-                    &block.expression,
-                    false,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-                if let Some(value) = block.value.as_ref() {
-                    collect_non_reactive_from_expression(
-                        value,
-                        false,
-                        block_depth,
-                        candidate_names,
-                        out,
-                    );
-                }
-                if let Some(error) = block.error.as_ref() {
-                    collect_non_reactive_from_expression(
-                        error,
-                        false,
-                        block_depth,
-                        candidate_names,
-                        out,
-                    );
-                }
-                for fragment in [
-                    block.pending.as_ref(),
-                    block.then.as_ref(),
-                    block.catch.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    collect_non_reactive_template_references(
-                        fragment,
-                        block_depth + 1,
-                        candidate_names,
-                        out,
-                    );
-                }
-            }
-            Node::SnippetBlock(block) => {
-                collect_non_reactive_template_references(
-                    &block.body,
-                    block_depth,
-                    candidate_names,
-                    out,
-                );
-            }
-            Node::DebugTag(_) => {}
-            _ => {
-                let Some(el) = node.as_element() else { return };
+        }
+        _ => {
+            if let Some(element) = node.as_element() {
                 collect_non_reactive_from_attributes(
-                    el.attributes(),
+                    element.attributes(),
                     block_depth,
                     candidate_names,
                     out,
                 );
-                collect_non_reactive_template_references(
-                    el.fragment(),
+            }
+        }
+    }
+}
+
+fn non_reactive_child_block_depth(node: &Node, block_depth: usize) -> usize {
+    match node {
+        Node::IfBlock(_) | Node::EachBlock(_) | Node::KeyBlock(_) | Node::AwaitBlock(_) => {
+            block_depth + 1
+        }
+        _ => block_depth,
+    }
+}
+
+fn non_reactive_alternate(node: &Node) -> Option<&Alternate> {
+    match node {
+        Node::IfBlock(block) => block.alternate.as_deref(),
+        _ => None,
+    }
+}
+
+fn collect_non_reactive_template_references_in_alternate(
+    alternate: &Alternate,
+    block_depth: usize,
+    candidate_names: &NameSet,
+    out: &mut NameSet,
+) {
+    match alternate {
+        Alternate::Fragment(fragment) => {
+            collect_non_reactive_template_references(fragment, block_depth, candidate_names, out);
+        }
+        Alternate::IfBlock(block) => {
+            collect_non_reactive_from_expression(
+                &block.test,
+                false,
+                block_depth,
+                candidate_names,
+                out,
+            );
+            collect_non_reactive_template_references(
+                &block.consequent,
+                block_depth,
+                candidate_names,
+                out,
+            );
+            if let Some(alternate) = block.alternate.as_deref() {
+                collect_non_reactive_template_references_in_alternate(
+                    alternate,
                     block_depth,
                     candidate_names,
                     out,
@@ -4858,8 +4705,8 @@ fn collect_non_reactive_template_references(
 fn collect_non_reactive_from_attributes(
     attributes: &[Attribute],
     block_depth: usize,
-    candidate_names: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    candidate_names: &NameSet,
+    out: &mut NameSet,
 ) {
     for attribute in attributes {
         match attribute {
@@ -4970,31 +4817,29 @@ fn collect_non_reactive_from_expression(
     expression: &crate::ast::modern::Expression,
     bind_this: bool,
     block_depth: usize,
-    candidate_names: &FxHashSet<String>,
-    out: &mut FxHashSet<String>,
+    candidate_names: &NameSet,
+    out: &mut NameSet,
 ) {
-    walk_estree_node_with_path(&expression.0, &mut Vec::new(), &mut |node, path| {
-        if estree_node_type(node) != Some("Identifier") {
-            return;
-        }
-        if is_ignored_identifier_context(path) || path_has_function_scope(path) {
-            return;
-        }
-        let Some(name) = estree_node_field_str(node, RawField::Name) else {
-            return;
-        };
-        if !candidate_names.contains(name) {
-            return;
-        }
-        if bind_this && block_depth == 0 {
-            return;
-        }
-        out.insert(name.to_string());
-    });
+    walk_reference_identifiers_with_path(
+        &expression.0,
+        &mut Vec::new(),
+        &mut |_node, name, path| {
+            if path_has_function_scope(path) {
+                return;
+            }
+            if !candidate_names.contains(name) {
+                return;
+            }
+            if bind_this && block_depth == 0 {
+                return;
+            }
+            out.insert(name.into());
+        },
+    );
 }
 
-fn collect_default_svelte_imports(program: &EstreeNode) -> FxHashSet<String> {
-    let mut imported = FxHashSet::<String>::default();
+fn collect_default_svelte_imports(program: &EstreeNode) -> NameSet {
+    let mut imported = FxHashSet::<Arc<str>>::default();
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return imported;
     };
@@ -5031,7 +4876,7 @@ fn collect_default_svelte_imports(program: &EstreeNode) -> FxHashSet<String> {
                 && estree_node_type(local) == Some("Identifier")
                 && let Some(name) = estree_node_field_str(local, RawField::Name)
             {
-                imported.insert(name.to_string());
+                imported.insert(name.into());
             }
         }
     }
@@ -5149,10 +4994,7 @@ fn custom_element_has_props_option(root: &Root) -> bool {
     })
 }
 
-fn collect_declared_names_from_variable_declaration(
-    declaration: &EstreeNode,
-    out: &mut FxHashSet<Arc<str>>,
-) {
+fn collect_declared_names_from_variable_declaration(declaration: &EstreeNode, out: &mut NameSet) {
     let Some(declarations) = estree_node_field_array(declaration, RawField::Declarations) else {
         return;
     };
@@ -5164,61 +5006,6 @@ fn collect_declared_names_from_variable_declaration(
             continue;
         };
         collect_pattern_binding_names(id, out);
-    }
-}
-
-fn collect_pattern_binding_names(pattern: &EstreeNode, out: &mut FxHashSet<Arc<str>>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.insert(Arc::from(name));
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_pattern_binding_names(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_pattern_binding_names(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    if let EstreeValue::Object(element) = element {
-                        collect_pattern_binding_names(element, out);
-                    }
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_pattern_binding_names(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_pattern_binding_names(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -5392,17 +5179,8 @@ fn collect_rest_pattern_identifiers_inner(
     }
 }
 
-fn binding_base_identifier_name(expression: &EstreeNode) -> Option<String> {
-    match estree_node_type(expression) {
-        Some("Identifier") => {
-            estree_node_field_str(expression, RawField::Name).map(ToString::to_string)
-        }
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(expression, RawField::Object)?;
-            binding_base_identifier_name(object)
-        }
-        _ => None,
-    }
+fn binding_base_identifier_name(expression: &EstreeNode) -> Option<Arc<str>> {
+    raw_base_identifier_name(expression)
 }
 
 fn attribute_global_event_reference_name(
@@ -5446,93 +5224,6 @@ fn string_contains_bidirectional_controls(value: &str) -> bool {
     value.chars().any(is_bidirectional_control_char)
 }
 
-struct PathStep<'a> {
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-}
-
-fn walk_estree_node_with_path<'a>(
-    node: &'a EstreeNode,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    visitor(node, path);
-    for (key, value) in node.fields.iter() {
-        walk_estree_value_with_path(value, node, key.as_str(), path, visitor);
-    }
-}
-
-fn walk_estree_value_with_path<'a>(
-    value: &'a EstreeValue,
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    match value {
-        EstreeValue::Object(node) => {
-            path.push(PathStep { parent, via_key });
-            walk_estree_node_with_path(node, path, visitor);
-            path.pop();
-        }
-        EstreeValue::Array(values) => {
-            for item in values.iter() {
-                walk_estree_value_with_path(item, parent, via_key, path, visitor);
-            }
-        }
-        EstreeValue::String(_)
-        | EstreeValue::Int(_)
-        | EstreeValue::UInt(_)
-        | EstreeValue::Number(_)
-        | EstreeValue::Bool(_)
-        | EstreeValue::Null => {}
-    }
-}
-
-fn path_has_function_scope(path: &[PathStep<'_>]) -> bool {
-    path.iter().any(|step| {
-        matches!(
-            estree_node_type(step.parent),
-            Some("FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression")
-        )
-    })
-}
-
-fn is_ignored_identifier_context(path: &[PathStep<'_>]) -> bool {
-    let Some(step) = path.last() else {
-        return false;
-    };
-    let parent_type = estree_node_type(step.parent);
-    if matches!(
-        parent_type,
-        Some(
-            "VariableDeclarator"
-                | "FunctionDeclaration"
-                | "FunctionExpression"
-                | "ArrowFunctionExpression"
-                | "ClassDeclaration"
-                | "ImportSpecifier"
-                | "ImportDefaultSpecifier"
-                | "ImportNamespaceSpecifier"
-                | "CatchClause"
-                | "LabeledStatement"
-                | "ExportSpecifier"
-        )
-    ) && matches!(
-        step.via_key,
-        "id" | "params" | "local" | "exported" | "param" | "label"
-    ) {
-        return true;
-    }
-    if parent_type == Some("MemberExpression") && step.via_key == "property" {
-        return true;
-    }
-    if parent_type == Some("Property") && step.via_key == "key" {
-        return true;
-    }
-    false
-}
-
 fn make_warning(
     source: &str,
     options: &CompileOptions,
@@ -5541,36 +5232,29 @@ fn make_warning(
     start: usize,
     end: usize,
 ) -> Warning {
-    let (start_line, start_col) = crate::api::line_column_at_offset(source, start);
-    let (end_line, end_col) = crate::api::line_column_at_offset(source, end);
+    let source_text = SourceText::new(crate::SourceId::new(0), source, options.filename.as_deref());
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
 
     Warning {
         code: code.into(),
         message: message.into(),
         filename: options.filename.clone(),
-        start: Some(SourceLocation {
-            line: start_line,
-            column: start_col,
-            character: start_col,
-        }),
-        end: Some(SourceLocation {
-            line: end_line,
-            column: end_col,
-            character: end_col,
-        }),
+        start: Some(start_location),
+        end: Some(end_location),
         frame: None,
         position: Some([start, end]),
     }
 }
 
-fn warning_from_compile_error(
-    options: &CompileOptions,
-    diagnostic: crate::CompileError,
-) -> Warning {
+fn warning_from_compile_error(source: SourceText<'_>, diagnostic: crate::CompileError) -> Warning {
     Warning {
         code: diagnostic.code,
         message: diagnostic.message,
-        filename: options.filename.clone(),
+        filename: diagnostic
+            .filename
+            .map(|path| path.as_ref().clone())
+            .or_else(|| source.filename.map(|path| path.to_path_buf())),
         start: diagnostic.start.map(|location| *location),
         end: diagnostic.end.map(|location| *location),
         frame: None,
@@ -5582,7 +5266,7 @@ fn warning_from_compile_error(
 
 #[derive(Debug, Default)]
 struct ParsedSvelteIgnoreDirective {
-    ignores: Vec<Arc<str>>,
+    ignores: Box<[Arc<str>]>,
     diagnostics: Vec<IgnoreDirectiveDiagnostic>,
 }
 
@@ -5599,19 +5283,29 @@ fn parse_svelte_ignore_directive(
     comment_data: &str,
     runes_mode: bool,
 ) -> ParsedSvelteIgnoreDirective {
-    let mut out = ParsedSvelteIgnoreDirective::default();
+    let mut ignores = IgnoreCodes::default();
+    let mut diagnostics = Vec::new();
     let Some(payload_start) = svelte_ignore_payload_start(comment_data) else {
-        return out;
+        return ParsedSvelteIgnoreDirective::default();
     };
 
     let payload = &comment_data[payload_start..];
     if runes_mode {
-        parse_svelte_ignore_runes_mode(comment_data_start, payload_start, payload, &mut out);
+        parse_svelte_ignore_runes_mode(
+            comment_data_start,
+            payload_start,
+            payload,
+            &mut ignores,
+            &mut diagnostics,
+        );
     } else {
-        parse_svelte_ignore_legacy_mode(payload, &mut out);
+        parse_svelte_ignore_legacy_mode(payload, &mut ignores);
     }
 
-    out
+    ParsedSvelteIgnoreDirective {
+        ignores: ignores.to_boxed_slice(),
+        diagnostics,
+    }
 }
 
 fn svelte_ignore_payload_start(comment_data: &str) -> Option<usize> {
@@ -5638,7 +5332,8 @@ fn parse_svelte_ignore_runes_mode(
     comment_data_start: usize,
     payload_start: usize,
     payload: &str,
-    out: &mut ParsedSvelteIgnoreDirective,
+    ignores: &mut IgnoreCodes,
+    diagnostics: &mut Vec<IgnoreDirectiveDiagnostic>,
 ) {
     let bytes = payload.as_bytes();
     let mut cursor = 0usize;
@@ -5664,7 +5359,7 @@ fn parse_svelte_ignore_runes_mode(
         };
 
         if is_known_warning_code(token) {
-            push_ignore_unique(&mut out.ignores, token);
+            ignores.push_unique(token);
         } else {
             let replacement = legacy_ignore_replacement(token)
                 .map(str::to_string)
@@ -5672,7 +5367,7 @@ fn parse_svelte_ignore_runes_mode(
             let start = comment_data_start + payload_start + token_start;
             let end = start + token.len();
             if is_known_warning_code(&replacement) {
-                out.diagnostics.push(IgnoreDirectiveDiagnostic {
+                diagnostics.push(IgnoreDirectiveDiagnostic {
                     code: "legacy_code",
                     message: format!(
                         "`{}` is no longer valid — please use `{}` instead",
@@ -5691,7 +5386,7 @@ fn parse_svelte_ignore_runes_mode(
                 } else {
                     format!("`{}` is not a recognised code", token)
                 };
-                out.diagnostics.push(IgnoreDirectiveDiagnostic {
+                diagnostics.push(IgnoreDirectiveDiagnostic {
                     code: "unknown_code",
                     message,
                     start,
@@ -5706,7 +5401,7 @@ fn parse_svelte_ignore_runes_mode(
     }
 }
 
-fn parse_svelte_ignore_legacy_mode(payload: &str, out: &mut ParsedSvelteIgnoreDirective) {
+fn parse_svelte_ignore_legacy_mode(payload: &str, ignores: &mut IgnoreCodes) {
     let bytes = payload.as_bytes();
     let mut cursor = 0usize;
     while cursor < bytes.len() {
@@ -5722,14 +5417,14 @@ fn parse_svelte_ignore_legacy_mode(payload: &str, out: &mut ParsedSvelteIgnoreDi
             cursor += 1;
         }
         let token = &payload[token_start..cursor];
-        push_ignore_unique(&mut out.ignores, token);
+        ignores.push_unique(token);
 
         if !is_known_warning_code(token) {
             let replacement = legacy_ignore_replacement(token)
                 .map(str::to_string)
                 .unwrap_or_else(|| token.replace('-', "_"));
             if is_known_warning_code(&replacement) {
-                push_ignore_unique(&mut out.ignores, &replacement);
+                ignores.push_unique(&replacement);
             }
         }
     }
@@ -5737,13 +5432,6 @@ fn parse_svelte_ignore_legacy_mode(payload: &str, out: &mut ParsedSvelteIgnoreDi
 
 fn is_ignore_code_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'$')
-}
-
-fn push_ignore_unique(ignores: &mut Vec<Arc<str>>, code: &str) {
-    if ignores.iter().any(|existing| existing.as_ref() == code) {
-        return;
-    }
-    ignores.push(Arc::from(code));
 }
 
 fn is_known_warning_code(code: &str) -> bool {

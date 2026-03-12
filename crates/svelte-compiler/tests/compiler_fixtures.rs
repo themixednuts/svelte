@@ -1,3 +1,24 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::collapsible_if,
+    clippy::disallowed_names,
+    clippy::explicit_iter_loop,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    clippy::option_option,
+    clippy::redundant_closure_for_method_calls,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_wraps,
+    clippy::while_let_on_iterator
+)]
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};

@@ -3,15 +3,15 @@ use crate::ast::modern::{
     Alternate, Attribute, AttributeValue, AttributeValueList, EstreeNode, EstreeValue, Expression,
     Fragment, IfBlock, Node, Search, SnippetBlock, SnippetHeaderErrorKind,
 };
-use std::collections::HashSet;
+use crate::estree::raw_identifier_name;
 use std::sync::Arc;
 
 pub(super) fn detect_snippet_invalid_export(source: &str, root: &Root) -> Option<CompileError> {
     let module = root.module.as_ref()?;
     let (exported_name, export_start, export_end) = first_exported_name(&module.content)?;
-    let snippet = find_snippet_block_by_name(&root.fragment, exported_name.as_str())?;
+    let snippet = find_snippet_block_by_name(&root.fragment, exported_name.as_ref())?;
 
-    let mut instance_names = HashSet::<String>::new();
+    let mut instance_names = NameSet::default();
     if let Some(instance) = root.instance.as_ref() {
         collect_instance_binding_names(&instance.content, &mut instance_names);
     }
@@ -61,7 +61,7 @@ pub(super) fn detect_snippet_parameter_assignment(
     source: &str,
     root: &Root,
 ) -> Option<CompileError> {
-    let mut scope = Vec::<HashSet<String>>::new();
+    let mut scope = ScopeStack::default();
     let (start, end) = find_snippet_parameter_assignment(&root.fragment, &mut scope)?;
     Some(compile_error_with_range(
         source,
@@ -172,7 +172,7 @@ fn find_slot_snippet_conflict(fragment: &Fragment) -> Option<(usize, usize)> {
     has_render.map(|_| (slot_start, slot_end))
 }
 
-fn first_exported_name(program: &EstreeNode) -> Option<(String, usize, usize)> {
+fn first_exported_name(program: &EstreeNode) -> Option<(Arc<str>, usize, usize)> {
     let body = estree_node_field_array(program, RawField::Body)?;
     for statement in body {
         let EstreeValue::Object(statement) = statement else {
@@ -216,7 +216,7 @@ fn find_snippet_block_by_name<'a>(fragment: &'a Fragment, name: &str) -> Option<
 
 fn find_snippet_parameter_assignment(
     fragment: &Fragment,
-    scope: &mut Vec<HashSet<String>>,
+    scope: &mut ScopeStack,
 ) -> Option<(usize, usize)> {
     fragment.walk(
         scope,
@@ -235,7 +235,8 @@ fn find_snippet_parameter_assignment(
             let found = match node {
                 Node::Text(_) | Node::Comment(_) => None,
                 Node::DebugTag(tag) => tag.identifiers.iter().find_map(|identifier| {
-                    scope_contains_name(scope, identifier.name.as_ref())
+                    scope
+                        .contains(identifier.name.as_ref())
                         .then_some((identifier.start, identifier.end))
                 }),
                 Node::ExpressionTag(tag) => {
@@ -275,22 +276,15 @@ fn find_snippet_parameter_assignment(
                         })
                 }
                 Node::SnippetBlock(block) => {
-                    let mut names = HashSet::new();
-                    for parameter in block.parameters.iter() {
-                        collect_binding_names(&parameter.0, &mut names);
-                    }
-                    scope.push(names);
+                    scope.push(scope_frame_for_snippet_block(block));
                     None
                 }
                 Node::KeyBlock(block) => {
                     assignment_to_scoped_name_in_expression(&block.expression, scope)
                 }
-                _ => {
-                    let Some(element) = node.as_element() else {
-                        return Search::Continue;
-                    };
+                _ => node.as_element().and_then(|element| {
                     assignment_to_scoped_name_in_attributes(element.attributes(), scope)
-                }
+                }),
             };
 
             match found {
@@ -308,7 +302,7 @@ fn find_snippet_parameter_assignment(
 
 fn assignment_to_scoped_name_in_attributes(
     attributes: &[Attribute],
-    scope: &mut [HashSet<String>],
+    scope: &ScopeStack,
 ) -> Option<(usize, usize)> {
     for attribute in attributes.iter() {
         match attribute {
@@ -333,8 +327,8 @@ fn assignment_to_scoped_name_in_attributes(
                 }
             },
             Attribute::BindDirective(attribute) => {
-                if let Some(base) = raw_base_identifier_name(&attribute.expression.0)
-                    && scope_contains_name(scope, base.as_ref())
+                if let Some(name) = raw_identifier_name(&attribute.expression.0)
+                    && scope.contains(name.as_ref())
                 {
                     return Some((attribute.start, attribute.end));
                 }
@@ -402,7 +396,7 @@ fn assignment_to_scoped_name_in_attributes(
 
 fn assignment_to_scoped_name_in_expression(
     expression: &Expression,
-    scope: &[HashSet<String>],
+    scope: &ScopeStack,
 ) -> Option<(usize, usize)> {
     let mut found = None::<(usize, usize)>;
     walk_estree_node(&expression.0, &mut |node| {
@@ -417,7 +411,7 @@ fn assignment_to_scoped_name_in_expression(
                 let Some(name) = raw_identifier_name(left) else {
                     return;
                 };
-                if !scope_contains_name(scope, name.as_str()) {
+                if !scope.contains(name.as_ref()) {
                     return;
                 }
                 if let Some(span) = estree_node_span(left).or_else(|| estree_node_span(node)) {
@@ -431,7 +425,7 @@ fn assignment_to_scoped_name_in_expression(
                 let Some(name) = raw_identifier_name(argument) else {
                     return;
                 };
-                if !scope_contains_name(scope, name.as_str()) {
+                if !scope.contains(name.as_ref()) {
                     return;
                 }
                 if let Some(span) = estree_node_span(argument).or_else(|| estree_node_span(node)) {
@@ -444,11 +438,7 @@ fn assignment_to_scoped_name_in_expression(
     found
 }
 
-fn scope_contains_name(scope: &[HashSet<String>], name: &str) -> bool {
-    scope.iter().rev().any(|frame| frame.contains(name))
-}
-
-fn collect_instance_binding_names(program: &EstreeNode, out: &mut HashSet<String>) {
+fn collect_instance_binding_names(program: &EstreeNode, out: &mut NameSet) {
     let Some(body) = estree_node_field_array(program, RawField::Body) else {
         return;
     };
@@ -469,75 +459,19 @@ fn collect_instance_binding_names(program: &EstreeNode, out: &mut HashSet<String
             let Some(id) = estree_node_field_object(declarator, RawField::Id) else {
                 continue;
             };
-            collect_binding_names(id, out);
+            extend_name_set_with_pattern_bindings(out, id);
         }
     }
 }
 
-fn collect_binding_names(pattern: &EstreeNode, out: &mut HashSet<String>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.insert(name.to_string());
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_binding_names(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_binding_names(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_binding_names(element, out);
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_binding_names(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_binding_names(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn fragment_references_any_name(fragment: &Fragment, names: &HashSet<String>) -> bool {
+fn fragment_references_any_name(fragment: &Fragment, names: &NameSet) -> bool {
     fragment
         .nodes
         .iter()
         .any(|node| node_references_any_name(node, names))
 }
 
-fn node_references_any_name(node: &Node, names: &HashSet<String>) -> bool {
+fn node_references_any_name(node: &Node, names: &NameSet) -> bool {
     match node {
         Node::Text(_) | Node::Comment(_) => false,
         Node::DebugTag(tag) => tag
@@ -598,7 +532,7 @@ fn node_references_any_name(node: &Node, names: &HashSet<String>) -> bool {
     }
 }
 
-fn if_block_references_any_name(block: &IfBlock, names: &HashSet<String>) -> bool {
+fn if_block_references_any_name(block: &IfBlock, names: &NameSet) -> bool {
     expression_references_any_name(&block.test, names)
         || fragment_references_any_name(&block.consequent, names)
         || match block.alternate.as_deref() {
@@ -608,11 +542,11 @@ fn if_block_references_any_name(block: &IfBlock, names: &HashSet<String>) -> boo
         }
 }
 
-fn expression_references_any_name(expression: &Expression, names: &HashSet<String>) -> bool {
+fn expression_references_any_name(expression: &Expression, names: &NameSet) -> bool {
     raw_expression_references_any_name(&expression.0, names)
 }
 
-fn raw_expression_references_any_name(raw: &EstreeNode, names: &HashSet<String>) -> bool {
+fn raw_expression_references_any_name(raw: &EstreeNode, names: &NameSet) -> bool {
     let mut found = false;
     walk_estree_node(raw, &mut |node| {
         if found || estree_node_type(node) != Some("Identifier") {
@@ -632,24 +566,6 @@ fn estree_node_span(node: &EstreeNode) -> Option<(usize, usize)> {
         estree_value_to_usize(estree_node_field(node, RawField::Start))?,
         estree_value_to_usize(estree_node_field(node, RawField::End))?,
     ))
-}
-
-fn raw_identifier_name(node: &EstreeNode) -> Option<String> {
-    if estree_node_type(node) != Some("Identifier") {
-        return None;
-    }
-    estree_node_field_str(node, RawField::Name).map(ToString::to_string)
-}
-
-fn raw_base_identifier_name(node: &EstreeNode) -> Option<Arc<str>> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(Arc::from),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            raw_base_identifier_name(object)
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -732,5 +648,11 @@ mod tests {
         let error = validate("{#snippet foo()}{/snippet}<slot />{@render foo()}")
             .expect("expected validation error");
         assert_eq!(error.code.as_ref(), "slot_snippet_conflict");
+    }
+
+    #[test]
+    fn allows_binding_to_member_expression_of_snippet_parameter() {
+        let error = validate("{#snippet row(item)}<input bind:value={item.value} />{/snippet}");
+        assert!(error.is_none(), "unexpected validation error: {error:?}");
     }
 }

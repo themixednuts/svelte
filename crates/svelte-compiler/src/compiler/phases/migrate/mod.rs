@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::CompileError;
@@ -13,8 +14,7 @@ use crate::api::{MigrateOptions, MigrateResult, ParseMode, ParseOptions, is_void
 use crate::ast::common::Span;
 use crate::ast::modern::{
     Alternate, Attribute, AttributeValue, AttributeValueList, AwaitBlock, Comment, EstreeValue,
-    Fragment, IfBlock, KeyBlock, Node, RegularElement, Root as ModernRoot, Script, SvelteBoundary,
-    SvelteElement,
+    Fragment, IfBlock, KeyBlock, Node, RegularElement, Root as ModernRoot, Script, SvelteElement,
 };
 use crate::ast::{Document, Root};
 use crate::compiler::phases::parse::parse_component;
@@ -349,9 +349,9 @@ fn program_has_non_identifier_export_let(program: &crate::ast::modern::EstreeNod
     })
 }
 
-fn export_let_declaration<'a>(
-    statement: &'a crate::ast::modern::EstreeNode,
-) -> Option<&'a crate::ast::modern::EstreeNode> {
+fn export_let_declaration(
+    statement: &crate::ast::modern::EstreeNode,
+) -> Option<&crate::ast::modern::EstreeNode> {
     if estree_node_type(statement) != Some("ExportNamedDeclaration") {
         return None;
     }
@@ -1750,12 +1750,10 @@ fn collect_basic_props_edits(
     let props = all_props
         .iter()
         .filter(|prop| {
-            !matches!(
-                prop.default_source
-                    .as_deref()
-                    .and_then(slot_reference_name_from_source),
-                Some(_)
-            )
+            prop.default_source
+                .as_deref()
+                .and_then(slot_reference_name_from_source)
+                .is_none()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1882,10 +1880,6 @@ fn collect_basic_props_edits(
             let replacement = if multiline {
                 format!(
                     "{indent}/**\n{indent} * @typedef {{Object}} Props\n{property_lines}\n{indent} */\n\n{indent}/** @type {{Props}} */\n{indent}let {{\n{indent}{indent}{destructured}\n{indent}}} = $props();\n"
-                )
-            } else if props_have_comments(&props) {
-                format!(
-                    "{indent}/**\n{indent} * @typedef {{Object}} Props\n{property_lines}\n{indent} */\n\n{indent}/** @type {{Props}} */\n{indent}let {{ {destructured} }} = $props();\n"
                 )
             } else {
                 format!(
@@ -3155,98 +3149,25 @@ fn collect_event_handler_node_edits(
     state: &mut EventHandlerMigrationState,
     edits: &mut Vec<Edit>,
 ) {
+    if let Some((attributes, fragment)) = event_handler_target(node) {
+        collect_element_event_handler_edits(source, attributes, names, state, edits);
+        collect_event_handler_fragment_edits(source, fragment, names, state, edits);
+        return;
+    }
+
+    node.for_each_child_fragment(|fragment| {
+        collect_event_handler_fragment_edits(source, fragment, names, state, edits);
+    });
+}
+
+fn event_handler_target(node: &Node) -> Option<(&[Attribute], &Fragment)> {
     match node {
-        Node::RegularElement(element) => {
-            collect_element_event_handler_edits(source, &element.attributes, names, state, edits);
-            collect_event_handler_fragment_edits(source, &element.fragment, names, state, edits);
-        }
-        Node::SvelteElement(element) => {
-            collect_element_event_handler_edits(source, &element.attributes, names, state, edits);
-            collect_event_handler_fragment_edits(source, &element.fragment, names, state, edits);
-        }
-        Node::SvelteWindow(window) => {
-            collect_element_event_handler_edits(source, &window.attributes, names, state, edits);
-            collect_event_handler_fragment_edits(source, &window.fragment, names, state, edits);
-        }
-        Node::SvelteDocument(document) => {
-            collect_element_event_handler_edits(source, &document.attributes, names, state, edits);
-            collect_event_handler_fragment_edits(source, &document.fragment, names, state, edits);
-        }
-        Node::SvelteBody(body) => {
-            collect_element_event_handler_edits(source, &body.attributes, names, state, edits);
-            collect_event_handler_fragment_edits(source, &body.fragment, names, state, edits);
-        }
-        Node::IfBlock(block) => {
-            collect_event_handler_fragment_edits(source, &block.consequent, names, state, edits);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_event_handler_fragment_edits(source, fragment, names, state, edits)
-                    }
-                    Alternate::IfBlock(block) => collect_event_handler_node_edits(
-                        source,
-                        &Node::IfBlock(block.clone()),
-                        names,
-                        state,
-                        edits,
-                    ),
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_event_handler_fragment_edits(source, &block.body, names, state, edits);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_event_handler_fragment_edits(source, fallback, names, state, edits);
-            }
-        }
-        Node::KeyBlock(block) => {
-            collect_event_handler_fragment_edits(source, &block.fragment, names, state, edits)
-        }
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_event_handler_fragment_edits(source, fragment, names, state, edits);
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_event_handler_fragment_edits(source, &block.body, names, state, edits)
-        }
-        Node::Component(component) => {
-            collect_event_handler_fragment_edits(source, &component.fragment, names, state, edits)
-        }
-        Node::SlotElement(slot) => {
-            collect_event_handler_fragment_edits(source, &slot.fragment, names, state, edits)
-        }
-        Node::SvelteHead(head) => {
-            collect_event_handler_fragment_edits(source, &head.fragment, names, state, edits)
-        }
-        Node::SvelteComponent(component) => {
-            collect_event_handler_fragment_edits(source, &component.fragment, names, state, edits)
-        }
-        Node::SvelteSelf(component) => {
-            collect_event_handler_fragment_edits(source, &component.fragment, names, state, edits)
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_event_handler_fragment_edits(source, &fragment.fragment, names, state, edits)
-        }
-        Node::SvelteBoundary(boundary) => {
-            collect_event_handler_fragment_edits(source, &boundary.fragment, names, state, edits)
-        }
-        Node::TitleElement(title) => {
-            collect_event_handler_fragment_edits(source, &title.fragment, names, state, edits)
-        }
-        Node::Text(_)
-        | Node::Comment(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::RenderTag(_)
-        | Node::ConstTag(_)
-        | Node::DebugTag(_) => {}
+        Node::RegularElement(element) => Some((&element.attributes, &element.fragment)),
+        Node::SvelteElement(element) => Some((&element.attributes, &element.fragment)),
+        Node::SvelteWindow(window) => Some((&window.attributes, &window.fragment)),
+        Node::SvelteDocument(document) => Some((&document.attributes, &document.fragment)),
+        Node::SvelteBody(body) => Some((&body.attributes, &body.fragment)),
+        _ => None,
     }
 }
 
@@ -3584,12 +3505,11 @@ fn generated_svelte_component_names_in_source(source: &str) -> HashSet<String> {
             {
                 names.insert(name.to_string());
             }
-        } else if let Some(rest) = trimmed.strip_prefix("const ") {
-            if let Some((name, _)) = rest.split_once(" = ")
-                && name.starts_with("SvelteComponent")
-            {
-                names.insert(name.to_string());
-            }
+        } else if let Some(rest) = trimmed.strip_prefix("const ")
+            && let Some((name, _)) = rest.split_once(" = ")
+            && name.starts_with("SvelteComponent")
+        {
+            names.insert(name.to_string());
         }
     }
     names
@@ -3633,168 +3553,9 @@ fn collect_dynamic_svelte_component_node_edits(
         migrate_dynamic_svelte_component(source, component, path, state, edits);
     }
 
-    match node {
-        Node::RegularElement(element) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &element.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::IfBlock(block) => {
-            collect_dynamic_svelte_component_fragment_edits(
-                source,
-                &block.consequent,
-                path,
-                state,
-                edits,
-            );
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_dynamic_svelte_component_fragment_edits(
-                            source, fragment, path, state, edits,
-                        )
-                    }
-                    Alternate::IfBlock(block) => collect_dynamic_svelte_component_node_edits(
-                        source,
-                        &Node::IfBlock(block.clone()),
-                        path,
-                        state,
-                        edits,
-                    ),
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_dynamic_svelte_component_fragment_edits(
-                source,
-                &block.body,
-                path,
-                state,
-                edits,
-            );
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_dynamic_svelte_component_fragment_edits(
-                    source, fallback, path, state, edits,
-                );
-            }
-        }
-        Node::KeyBlock(block) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &block.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_dynamic_svelte_component_fragment_edits(
-                        source, fragment, path, state, edits,
-                    );
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_dynamic_svelte_component_fragment_edits(source, &block.body, path, state, edits)
-        }
-        Node::Component(component) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &component.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SlotElement(slot) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &slot.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteHead(head) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &head.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteBody(body) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &body.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteWindow(window) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &window.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteDocument(document) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &document.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteComponent(component) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &component.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteElement(element) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &element.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteSelf(component) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &component.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteFragment(fragment) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &fragment.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::SvelteBoundary(boundary) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &boundary.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::TitleElement(title) => collect_dynamic_svelte_component_fragment_edits(
-            source,
-            &title.fragment,
-            path,
-            state,
-            edits,
-        ),
-        Node::Text(_)
-        | Node::Comment(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::RenderTag(_)
-        | Node::ConstTag(_)
-        | Node::DebugTag(_) => {}
-    }
+    node.for_each_child_fragment(|fragment| {
+        collect_dynamic_svelte_component_fragment_edits(source, fragment, path, state, edits);
+    });
 
     path.pop();
 }
@@ -3850,7 +3611,7 @@ fn migrate_dynamic_svelte_component(
         if is_direct_component_member_expression(&expression.0, &migrated_expression) {
             migrated_expression.clone()
         } else {
-            let alias = if let Some(alias) = scoped_svelte_component_alias(
+            if let Some(alias) = scoped_svelte_component_alias(
                 source,
                 component,
                 &migrated_expression,
@@ -3876,8 +3637,7 @@ fn migrate_dynamic_svelte_component(
                         .push((migrated_expression.clone(), generated_alias.clone()));
                     generated_alias
                 }
-            };
-            alias
+            }
         };
 
     replace_svelte_component_tag_name(source, component, &replacement_name, edits);
@@ -4133,15 +3893,18 @@ fn collect_slot_usage_edits(source: &str, root: &ModernRoot, use_ts: bool, edits
     });
     let mut slot_props = HashMap::new();
     let mut derived_aliases = HashMap::new();
+    let mut slot_usage_edit_state = SlotUsageEditState {
+        slot_props: &mut slot_props,
+        derived_aliases: &mut derived_aliases,
+        edits,
+    };
     collect_slot_usage_fragment_edits(
         source,
         &root.fragment,
         false,
         use_rest_props,
         &SlotUsageContext::default(),
-        &mut slot_props,
-        &mut derived_aliases,
-        edits,
+        &mut slot_usage_edit_state,
     );
     collect_slot_reference_fragment_edits(source, &root.fragment, use_rest_props, edits);
     if use_rest_props {
@@ -4198,52 +3961,6 @@ fn collect_slot_placeholder_requirement_node(
     slot_props: &mut HashMap<String, SlotPropRequirement>,
 ) {
     match node {
-        Node::RegularElement(element) => {
-            collect_slot_placeholder_requirement_fragment(source, &element.fragment, slot_props);
-        }
-        Node::IfBlock(block) => {
-            collect_slot_placeholder_requirement_fragment(source, &block.consequent, slot_props);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_slot_placeholder_requirement_fragment(source, fragment, slot_props);
-                    }
-                    Alternate::IfBlock(block) => {
-                        collect_slot_placeholder_requirement_node(
-                            source,
-                            &Node::IfBlock(block.clone()),
-                            slot_props,
-                        );
-                    }
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_slot_placeholder_requirement_fragment(source, &block.body, slot_props);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_slot_placeholder_requirement_fragment(source, fallback, slot_props);
-            }
-        }
-        Node::KeyBlock(block) => {
-            collect_slot_placeholder_requirement_fragment(source, &block.fragment, slot_props);
-        }
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_slot_placeholder_requirement_fragment(source, fragment, slot_props);
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_slot_placeholder_requirement_fragment(source, &block.body, slot_props);
-        }
-        Node::Component(component) => {
-            collect_slot_placeholder_requirement_fragment(source, &component.fragment, slot_props);
-        }
         Node::SlotElement(slot) => {
             if let Some(slot_name) = Some(normalize_slot_identifier(
                 slot_element_name(slot).unwrap_or("default"),
@@ -4266,45 +3983,13 @@ fn collect_slot_placeholder_requirement_node(
                     }
                 }
             }
-            collect_slot_placeholder_requirement_fragment(source, &slot.fragment, slot_props);
-        }
-        Node::SvelteHead(head) => {
-            collect_slot_placeholder_requirement_fragment(source, &head.fragment, slot_props);
-        }
-        Node::SvelteBody(body) => {
-            collect_slot_placeholder_requirement_fragment(source, &body.fragment, slot_props);
-        }
-        Node::SvelteWindow(window) => {
-            collect_slot_placeholder_requirement_fragment(source, &window.fragment, slot_props);
-        }
-        Node::SvelteDocument(document) => {
-            collect_slot_placeholder_requirement_fragment(source, &document.fragment, slot_props);
-        }
-        Node::SvelteComponent(component) => {
-            collect_slot_placeholder_requirement_fragment(source, &component.fragment, slot_props);
-        }
-        Node::SvelteElement(element) => {
-            collect_slot_placeholder_requirement_fragment(source, &element.fragment, slot_props);
-        }
-        Node::SvelteSelf(component) => {
-            collect_slot_placeholder_requirement_fragment(source, &component.fragment, slot_props);
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_slot_placeholder_requirement_fragment(source, &fragment.fragment, slot_props);
-        }
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            collect_slot_placeholder_requirement_fragment(source, fragment, slot_props);
         }
         Node::TitleElement(title) => {
             collect_slot_placeholder_requirement_fragment(source, &title.fragment, slot_props);
         }
-        Node::Comment(_)
-        | Node::Text(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::ConstTag(_)
-        | Node::RenderTag(_)
-        | Node::DebugTag(_) => {}
+        _ => node.for_each_child_fragment(|fragment| {
+            collect_slot_placeholder_requirement_fragment(source, fragment, slot_props);
+        }),
     }
 }
 
@@ -4325,39 +4010,13 @@ fn collect_slot_reference_node_edits(
     use_rest_props: bool,
     edits: &mut Vec<Edit>,
 ) {
+    if let Some(element) = node.as_element() {
+        collect_slot_reference_attribute_edits(source, element.attributes(), use_rest_props, edits);
+    }
+
     match node {
-        Node::RegularElement(element) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &element.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(source, &element.fragment, use_rest_props, edits);
-        }
         Node::IfBlock(block) => {
             collect_slot_reference_expression_edit(&block.test, use_rest_props, edits);
-            collect_slot_reference_fragment_edits(source, &block.consequent, use_rest_props, edits);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_slot_reference_fragment_edits(
-                            source,
-                            fragment,
-                            use_rest_props,
-                            edits,
-                        );
-                    }
-                    Alternate::IfBlock(block) => {
-                        collect_slot_reference_node_edits(
-                            source,
-                            &Node::IfBlock(block.clone()),
-                            use_rest_props,
-                            edits,
-                        );
-                    }
-                }
-            }
         }
         Node::EachBlock(block) => {
             collect_slot_reference_expression_edit(&block.expression, use_rest_props, edits);
@@ -4367,14 +4026,9 @@ fn collect_slot_reference_node_edits(
             if let Some(key) = block.key.as_ref() {
                 collect_slot_reference_expression_edit(key, use_rest_props, edits);
             }
-            collect_slot_reference_fragment_edits(source, &block.body, use_rest_props, edits);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_slot_reference_fragment_edits(source, fallback, use_rest_props, edits);
-            }
         }
         Node::KeyBlock(block) => {
             collect_slot_reference_expression_edit(&block.expression, use_rest_props, edits);
-            collect_slot_reference_fragment_edits(source, &block.fragment, use_rest_props, edits);
         }
         Node::AwaitBlock(block) => {
             collect_slot_reference_expression_edit(&block.expression, use_rest_props, edits);
@@ -4384,137 +4038,22 @@ fn collect_slot_reference_node_edits(
             if let Some(error) = block.error.as_ref() {
                 collect_slot_reference_expression_edit(error, use_rest_props, edits);
             }
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_slot_reference_fragment_edits(source, fragment, use_rest_props, edits);
-                }
-            }
         }
         Node::SnippetBlock(block) => {
             collect_slot_reference_expression_edit(&block.expression, use_rest_props, edits);
             for parameter in block.parameters.iter() {
                 collect_slot_reference_expression_edit(parameter, use_rest_props, edits);
             }
-            collect_slot_reference_fragment_edits(source, &block.body, use_rest_props, edits);
-        }
-        Node::Component(component) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &component.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(
-                source,
-                &component.fragment,
-                use_rest_props,
-                edits,
-            );
-        }
-        Node::SlotElement(slot) => {
-            collect_slot_reference_attribute_edits(source, &slot.attributes, use_rest_props, edits);
-            collect_slot_reference_fragment_edits(source, &slot.fragment, use_rest_props, edits);
-        }
-        Node::SvelteHead(head) => {
-            collect_slot_reference_fragment_edits(source, &head.fragment, use_rest_props, edits)
-        }
-        Node::SvelteBody(body) => {
-            collect_slot_reference_fragment_edits(source, &body.fragment, use_rest_props, edits)
-        }
-        Node::SvelteWindow(window) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &window.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(source, &window.fragment, use_rest_props, edits);
-        }
-        Node::SvelteDocument(document) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &document.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(
-                source,
-                &document.fragment,
-                use_rest_props,
-                edits,
-            );
         }
         Node::SvelteComponent(component) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &component.attributes,
-                use_rest_props,
-                edits,
-            );
             if let Some(expression) = component.expression.as_ref() {
                 collect_slot_reference_expression_edit(expression, use_rest_props, edits);
             }
-            collect_slot_reference_fragment_edits(
-                source,
-                &component.fragment,
-                use_rest_props,
-                edits,
-            );
         }
         Node::SvelteElement(element) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &element.attributes,
-                use_rest_props,
-                edits,
-            );
             if let Some(expression) = element.expression.as_ref() {
                 collect_slot_reference_expression_edit(expression, use_rest_props, edits);
             }
-            collect_slot_reference_fragment_edits(source, &element.fragment, use_rest_props, edits);
-        }
-        Node::SvelteSelf(component) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &component.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(
-                source,
-                &component.fragment,
-                use_rest_props,
-                edits,
-            );
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_slot_reference_attribute_edits(
-                source,
-                &fragment.attributes,
-                use_rest_props,
-                edits,
-            );
-            collect_slot_reference_fragment_edits(
-                source,
-                &fragment.fragment,
-                use_rest_props,
-                edits,
-            );
-        }
-        Node::SvelteBoundary(SvelteBoundary {
-            attributes,
-            fragment,
-            ..
-        }) => {
-            collect_slot_reference_attribute_edits(source, attributes, use_rest_props, edits);
-            collect_slot_reference_fragment_edits(source, fragment, use_rest_props, edits);
-        }
-        Node::TitleElement(title) => {
-            collect_slot_reference_fragment_edits(source, &title.fragment, use_rest_props, edits)
         }
         Node::ExpressionTag(tag) => {
             collect_slot_reference_expression_edit(&tag.expression, use_rest_props, edits)
@@ -4529,7 +4068,12 @@ fn collect_slot_reference_node_edits(
             collect_slot_reference_expression_edit(&tag.declaration, use_rest_props, edits)
         }
         Node::Comment(_) | Node::Text(_) | Node::DebugTag(_) => {}
+        _ => {}
     }
+
+    node.for_each_child_fragment(|fragment| {
+        collect_slot_reference_fragment_edits(source, fragment, use_rest_props, edits);
+    });
 }
 
 fn collect_slot_reference_attribute_edits(
@@ -4807,72 +4351,28 @@ fn fragment_has_slot_usage(fragment: &Fragment) -> bool {
 }
 
 fn node_has_slot_usage(node: &Node) -> bool {
-    match node {
-        Node::Component(component) => {
-            attributes_have_slot_usage(&component.attributes)
-                || fragment_has_slot_usage(&component.fragment)
-        }
-        Node::SvelteComponent(component) => {
-            attributes_have_slot_usage(&component.attributes)
-                || fragment_has_slot_usage(&component.fragment)
-        }
-        Node::RegularElement(element) => {
-            attributes_have_slot_usage(&element.attributes)
-                || fragment_has_slot_usage(&element.fragment)
-        }
-        Node::SvelteElement(element) => {
-            attributes_have_slot_usage(&element.attributes)
-                || fragment_has_slot_usage(&element.fragment)
-        }
-        Node::SvelteFragment(fragment) => {
-            attributes_have_slot_usage(&fragment.attributes)
-                || fragment_has_slot_usage(&fragment.fragment)
-        }
-        Node::SlotElement(_) => true,
-        Node::IfBlock(block) => {
-            fragment_has_slot_usage(&block.consequent)
-                || block
-                    .alternate
-                    .as_deref()
-                    .is_some_and(|alternate| match alternate {
-                        Alternate::Fragment(fragment) => fragment_has_slot_usage(fragment),
-                        Alternate::IfBlock(block) => {
-                            node_has_slot_usage(&Node::IfBlock(block.clone()))
-                        }
-                    })
-        }
-        Node::EachBlock(block) => {
-            fragment_has_slot_usage(&block.body)
-                || block
-                    .fallback
-                    .as_ref()
-                    .is_some_and(|fallback| fragment_has_slot_usage(fallback))
-        }
-        Node::KeyBlock(block) => fragment_has_slot_usage(&block.fragment),
-        Node::AwaitBlock(block) => [
-            block.pending.as_ref(),
-            block.then.as_ref(),
-            block.catch.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(fragment_has_slot_usage),
-        Node::SnippetBlock(block) => fragment_has_slot_usage(&block.body),
-        Node::SvelteHead(head) => fragment_has_slot_usage(&head.fragment),
-        Node::SvelteBody(body) => fragment_has_slot_usage(&body.fragment),
-        Node::SvelteWindow(window) => fragment_has_slot_usage(&window.fragment),
-        Node::SvelteDocument(document) => fragment_has_slot_usage(&document.fragment),
-        Node::SvelteSelf(component) => fragment_has_slot_usage(&component.fragment),
-        Node::SvelteBoundary(boundary) => fragment_has_slot_usage(&boundary.fragment),
-        Node::TitleElement(title) => fragment_has_slot_usage(&title.fragment),
-        Node::Comment(_)
-        | Node::Text(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::ConstTag(_)
-        | Node::RenderTag(_)
-        | Node::DebugTag(_) => false,
+    if matches!(node, Node::SlotElement(_)) {
+        return true;
     }
+
+    if let Some(element) = node.as_element() {
+        return attributes_have_slot_usage(element.attributes())
+            || fragment_has_slot_usage(element.fragment());
+    }
+
+    if let Node::SvelteFragment(fragment) = node {
+        return attributes_have_slot_usage(&fragment.attributes)
+            || fragment_has_slot_usage(&fragment.fragment);
+    }
+
+    node.try_for_each_child_fragment(|fragment| {
+        if fragment_has_slot_usage(fragment) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 fn collect_component_slot_usage_structure_edits(
@@ -4898,125 +4398,21 @@ fn collect_component_slot_usage_structure_node_edits(
     edits: &mut Vec<Edit>,
 ) {
     match node {
-        Node::RegularElement(element) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &element.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::IfBlock(block) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &block.consequent,
-                svelte_component_state,
-                edits,
-            );
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => {
-                        collect_component_slot_usage_structure_edits(
-                            source,
-                            fragment,
-                            svelte_component_state,
-                            edits,
-                        );
-                    }
-                    Alternate::IfBlock(block) => collect_component_slot_usage_structure_node_edits(
-                        source,
-                        &Node::IfBlock(block.clone()),
-                        svelte_component_state,
-                        edits,
-                    ),
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &block.body,
-                svelte_component_state,
-                edits,
-            );
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_component_slot_usage_structure_edits(
-                    source,
-                    fallback,
-                    svelte_component_state,
-                    edits,
-                );
-            }
-        }
-        Node::KeyBlock(block) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &block.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_component_slot_usage_structure_edits(
-                        source,
-                        fragment,
-                        svelte_component_state,
-                        edits,
-                    );
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &block.body,
-                svelte_component_state,
-                edits,
-            );
-        }
         Node::Component(component) => {
             if attributes_have_slot_usage(&component.attributes)
                 || fragment_has_slot_usage(&component.fragment)
             {
                 let mut local_state = svelte_component_state.clone();
-                if let Some(replacement) = render_component_slot_usage_node(
+                if push_component_slot_usage_structure_edit(
                     source,
-                    component.start,
-                    component.end,
-                    component.name.as_ref(),
-                    &component.attributes,
-                    &component.fragment,
-                    None,
+                    node,
                     None,
                     &mut local_state,
+                    edits,
                 ) {
                     *svelte_component_state = local_state;
-                    edits.push(Edit {
-                        start: component.start,
-                        end: component.end,
-                        replacement,
-                    });
-                } else {
-                    collect_component_slot_usage_structure_edits(
-                        source,
-                        &component.fragment,
-                        svelte_component_state,
-                        edits,
-                    );
+                    return;
                 }
-            } else {
-                collect_component_slot_usage_structure_edits(
-                    source,
-                    &component.fragment,
-                    svelte_component_state,
-                    edits,
-                );
             }
         }
         Node::SvelteComponent(component) => {
@@ -5029,119 +4425,17 @@ fn collect_component_slot_usage_structure_node_edits(
                     .as_ref()
                     .filter(|tag| tag.prelude.is_none())
                     .map(|tag| tag.name.as_str());
-                if let Some(replacement) = render_component_slot_usage_node(
+                if push_component_slot_usage_structure_edit(
                     source,
-                    component.start,
-                    component.end,
-                    component.name.as_ref(),
-                    &component.attributes,
-                    &component.fragment,
+                    node,
                     static_name,
-                    None,
                     &mut local_state,
+                    edits,
                 ) {
                     *svelte_component_state = local_state;
-                    edits.push(Edit {
-                        start: component.start,
-                        end: component.end,
-                        replacement,
-                    });
-                } else {
-                    collect_component_slot_usage_structure_edits(
-                        source,
-                        &component.fragment,
-                        svelte_component_state,
-                        edits,
-                    );
+                    return;
                 }
-            } else {
-                collect_component_slot_usage_structure_edits(
-                    source,
-                    &component.fragment,
-                    svelte_component_state,
-                    edits,
-                );
             }
-        }
-        Node::SlotElement(slot) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &slot.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteHead(head) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &head.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteBody(body) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &body.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteWindow(window) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &window.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteDocument(document) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &document.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteElement(element) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &element.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteSelf(component) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &component.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &fragment.fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                fragment,
-                svelte_component_state,
-                edits,
-            );
-        }
-        Node::TitleElement(title) => {
-            collect_component_slot_usage_structure_edits(
-                source,
-                &title.fragment,
-                svelte_component_state,
-                edits,
-            );
         }
         Node::Comment(_)
         | Node::Text(_)
@@ -5150,20 +4444,83 @@ fn collect_component_slot_usage_structure_node_edits(
         | Node::ConstTag(_)
         | Node::RenderTag(_)
         | Node::DebugTag(_) => {}
+        _ => {}
     }
+
+    node.for_each_child_fragment(|fragment| {
+        collect_component_slot_usage_structure_edits(
+            source,
+            fragment,
+            svelte_component_state,
+            edits,
+        );
+    });
+}
+
+fn push_component_slot_usage_structure_edit(
+    source: &str,
+    node: &Node,
+    static_name: Option<&str>,
+    svelte_component_state: &mut SvelteComponentMigrationState,
+    edits: &mut Vec<Edit>,
+) -> bool {
+    let Some(render_args) = slot_usage_render_args(node, static_name) else {
+        return false;
+    };
+    let Some(replacement) =
+        render_component_slot_usage_node(source, render_args, svelte_component_state)
+    else {
+        return false;
+    };
+
+    edits.push(Edit {
+        start: node.start(),
+        end: node.end(),
+        replacement,
+    });
+    true
+}
+
+struct SlotUsageRenderArgs<'a> {
+    start: usize,
+    end: usize,
+    original_name: &'a str,
+    attributes: &'a [Attribute],
+    fragment: &'a Fragment,
+    static_name: Option<&'a str>,
+    tag_prelude: Option<&'a str>,
+}
+
+fn slot_usage_render_args<'a>(
+    node: &'a Node,
+    static_name: Option<&'a str>,
+) -> Option<SlotUsageRenderArgs<'a>> {
+    let element = node.as_element()?;
+    Some(SlotUsageRenderArgs {
+        start: node.start(),
+        end: node.end(),
+        original_name: element.name(),
+        attributes: element.attributes(),
+        fragment: element.fragment(),
+        static_name,
+        tag_prelude: None,
+    })
 }
 
 fn render_component_slot_usage_node(
     source: &str,
-    start: usize,
-    end: usize,
-    original_name: &str,
-    attributes: &[Attribute],
-    fragment: &Fragment,
-    static_name: Option<&str>,
-    tag_prelude: Option<&str>,
+    render_args: SlotUsageRenderArgs<'_>,
     svelte_component_state: &mut SvelteComponentMigrationState,
 ) -> Option<String> {
+    let SlotUsageRenderArgs {
+        start,
+        end,
+        original_name,
+        attributes,
+        fragment,
+        static_name,
+        tag_prelude,
+    } = render_args;
     let let_props = let_directive_props(source, start, end, attributes);
     let parent_props = component_slot_parent_props(attributes);
     let rendered_fragment = render_component_slot_usage_fragment(
@@ -5192,13 +4549,15 @@ fn render_component_slot_usage_node(
     let open_end = opening_tag_end(source, start, end)?;
     let open_tag = cleaned_tag_source(
         source,
-        start,
-        if is_self_closing { end } else { open_end + 1 },
-        original_name,
-        static_name,
-        attributes,
-        true,
-        true,
+        TagSourceCleanupArgs {
+            start,
+            end: if is_self_closing { end } else { open_end + 1 },
+            original_name,
+            static_name,
+            attributes,
+            remove_slot: true,
+            remove_lets: true,
+        },
     )?;
     let close_tag = if is_self_closing {
         if original_name == "svelte:component" && static_name.is_some() {
@@ -5372,7 +4731,7 @@ fn render_component_default_slot_snippet(
                 }
             }
         } else if default_groups.len() <= 1 {
-            indent_block_with_first_indent(&default_content, &child_indent, &snippet_indent)
+            indent_block_with_first_indent(&default_content, &child_indent, snippet_indent)
         } else {
             let mut groups = default_groups;
             let first_group = groups.remove(0);
@@ -5384,7 +4743,7 @@ fn render_component_default_slot_snippet(
                     .to_string()
             };
             let mut output =
-                indent_block_with_first_indent(&first_group, &child_indent, &snippet_indent);
+                indent_block_with_first_indent(&first_group, &child_indent, snippet_indent);
             let trailing_groups = groups.join("");
             output.push_str(trailing_groups.trim_end_matches(char::is_whitespace));
             output
@@ -5416,29 +4775,17 @@ fn render_component_child_slot_usage(
     svelte_component_state: &mut SvelteComponentMigrationState,
 ) -> Option<SlotRenderedSegment> {
     match node {
-        Node::RegularElement(element) => render_slot_usage_element_like(
+        Node::RegularElement(_) => render_slot_usage_element_like(
             source,
-            node.start(),
-            node.end(),
-            element.name.as_ref(),
-            &element.attributes,
-            &element.fragment,
-            None,
-            None,
+            slot_usage_render_args(node, None)?,
             false,
             parent_props,
             context,
             svelte_component_state,
         ),
-        Node::Component(component) => render_component_slot_usage_node(
+        Node::Component(_) => render_component_slot_usage_node(
             source,
-            node.start(),
-            node.end(),
-            component.name.as_ref(),
-            &component.attributes,
-            &component.fragment,
-            None,
-            None,
+            slot_usage_render_args(node, None)?,
             svelte_component_state,
         )
         .map(|rendered| SlotRenderedSegment {
@@ -5449,28 +4796,16 @@ fn render_component_child_slot_usage(
         .or_else(|| {
             render_slot_usage_element_like(
                 source,
-                node.start(),
-                node.end(),
-                component.name.as_ref(),
-                &component.attributes,
-                &component.fragment,
-                None,
-                None,
+                slot_usage_render_args(node, None)?,
                 false,
                 parent_props,
                 context,
                 svelte_component_state,
             )
         }),
-        Node::SvelteElement(element) => render_slot_usage_element_like(
+        Node::SvelteElement(_) => render_slot_usage_element_like(
             source,
-            node.start(),
-            node.end(),
-            element.name.as_ref(),
-            &element.attributes,
-            &element.fragment,
-            None,
-            None,
+            slot_usage_render_args(node, None)?,
             false,
             parent_props,
             context,
@@ -5483,15 +4818,10 @@ fn render_component_child_slot_usage(
                 .as_ref()
                 .and_then(|tag| tag.prelude.clone())
                 .unwrap_or_default();
+            let static_name = rendered_tag.as_ref().map(|tag| tag.name.as_str());
             render_component_slot_usage_node(
                 source,
-                node.start(),
-                node.end(),
-                component.name.as_ref(),
-                &component.attributes,
-                &component.fragment,
-                rendered_tag.as_ref().map(|tag| tag.name.as_str()),
-                None,
+                slot_usage_render_args(node, static_name)?,
                 svelte_component_state,
             )
             .map(|rendered| SlotRenderedSegment {
@@ -5502,13 +4832,7 @@ fn render_component_child_slot_usage(
             .or_else(|| {
                 render_slot_usage_element_like(
                     source,
-                    node.start(),
-                    node.end(),
-                    component.name.as_ref(),
-                    &component.attributes,
-                    &component.fragment,
-                    rendered_tag.as_ref().map(|tag| tag.name.as_str()),
-                    None,
+                    slot_usage_render_args(node, static_name)?,
                     false,
                     parent_props,
                     context,
@@ -5534,15 +4858,9 @@ fn render_component_child_slot_usage(
                 }
             })
         }
-        Node::SvelteFragment(fragment) => render_slot_usage_element_like(
+        Node::SvelteFragment(_) => render_slot_usage_element_like(
             source,
-            node.start(),
-            node.end(),
-            fragment.name.as_ref(),
-            &fragment.attributes,
-            &fragment.fragment,
-            None,
-            None,
+            slot_usage_render_args(node, None)?,
             true,
             parent_props,
             context,
@@ -5554,37 +4872,40 @@ fn render_component_child_slot_usage(
 
 fn render_slot_usage_element_like(
     source: &str,
-    start: usize,
-    end: usize,
-    original_name: &str,
-    attributes: &[Attribute],
-    fragment: &Fragment,
-    static_name: Option<&str>,
-    tag_prelude: Option<&str>,
+    render_args: SlotUsageRenderArgs<'_>,
     is_fragment: bool,
     parent_props: &HashSet<String>,
     context: &SlotUsageContext,
     svelte_component_state: &mut SvelteComponentMigrationState,
 ) -> Option<SlotRenderedSegment> {
+    let SlotUsageRenderArgs {
+        start,
+        end,
+        original_name,
+        attributes,
+        fragment,
+        static_name,
+        tag_prelude,
+    } = render_args;
     let raw_slot_name = slot_usage_attribute_name(attributes);
     if let Some(slot_name) = raw_slot_name
         && slot_name != "default"
     {
         if !is_valid_identifier(slot_name) || is_reserved_identifier(slot_name) {
-            return Some(unmigrated_slot_segment(
+            return unmigrated_slot_segment(
                 source,
                 start,
                 end,
                 &format!("`{slot_name}` is an invalid identifier"),
-            )?);
+            );
         }
         if parent_props.contains(slot_name) {
-            return Some(unmigrated_slot_segment(
+            return unmigrated_slot_segment(
                 source,
                 start,
                 end,
                 &format!("`{slot_name}` would shadow a prop on the parent component"),
-            )?);
+            );
         }
     }
     let slot_name = raw_slot_name
@@ -5654,13 +4975,15 @@ fn render_slot_usage_element_like(
     let open_end = opening_tag_end(source, start, end)?;
     let open_tag = cleaned_tag_source(
         source,
-        start,
-        if is_self_closing { end } else { open_end + 1 },
-        original_name,
-        static_name,
-        attributes,
-        true,
-        true,
+        TagSourceCleanupArgs {
+            start,
+            end: if is_self_closing { end } else { open_end + 1 },
+            original_name,
+            static_name,
+            attributes,
+            remove_slot: true,
+            remove_lets: true,
+        },
     )?;
     let nested_context = extend_slot_usage_context(context, attributes);
     let (inner_segments, close_tag) = if is_self_closing {
@@ -5697,9 +5020,7 @@ fn render_slot_usage_element_like(
     let inner = inner_segments
         .into_iter()
         .map(|segment| {
-            if hoist_child_prelude {
-                segment.rendered
-            } else if slot_name != "children" {
+            if hoist_child_prelude || slot_name != "children" {
                 segment.rendered
             } else {
                 format!("{}{}", segment.prelude, segment.rendered)
@@ -5921,16 +5242,26 @@ fn render_snippet_props(let_props: &[String]) -> String {
     }
 }
 
-fn cleaned_tag_source(
-    source: &str,
+struct TagSourceCleanupArgs<'a> {
     start: usize,
     end: usize,
-    original_name: &str,
-    static_name: Option<&str>,
-    attributes: &[Attribute],
+    original_name: &'a str,
+    static_name: Option<&'a str>,
+    attributes: &'a [Attribute],
     remove_slot: bool,
     remove_lets: bool,
-) -> Option<String> {
+}
+
+fn cleaned_tag_source(source: &str, args: TagSourceCleanupArgs<'_>) -> Option<String> {
+    let TagSourceCleanupArgs {
+        start,
+        end,
+        original_name,
+        static_name,
+        attributes,
+        remove_slot,
+        remove_lets,
+    } = args;
     let mut edits = Vec::new();
     let has_slot_attribute = attributes.iter().any(|attribute| {
         matches!(attribute, Attribute::Attribute(attribute) if attribute.name.as_ref() == "slot")
@@ -6272,9 +5603,7 @@ fn collect_slot_usage_fragment_edits(
     parent_is_component: bool,
     use_rest_props: bool,
     context: &SlotUsageContext,
-    slot_props: &mut HashMap<String, SlotPropRequirement>,
-    derived_aliases: &mut HashMap<String, SlotDerivedAlias>,
-    edits: &mut Vec<Edit>,
+    state: &mut SlotUsageEditState<'_>,
 ) {
     for node in fragment.nodes.iter() {
         collect_slot_usage_node_edits(
@@ -6283,11 +5612,15 @@ fn collect_slot_usage_fragment_edits(
             parent_is_component,
             use_rest_props,
             context,
-            slot_props,
-            derived_aliases,
-            edits,
+            state,
         );
     }
+}
+
+struct SlotUsageEditState<'a> {
+    slot_props: &'a mut HashMap<String, SlotPropRequirement>,
+    derived_aliases: &'a mut HashMap<String, SlotDerivedAlias>,
+    edits: &'a mut Vec<Edit>,
 }
 
 fn collect_slot_usage_node_edits(
@@ -6296,293 +5629,38 @@ fn collect_slot_usage_node_edits(
     parent_is_component: bool,
     use_rest_props: bool,
     context: &SlotUsageContext,
-    slot_props: &mut HashMap<String, SlotPropRequirement>,
-    derived_aliases: &mut HashMap<String, SlotDerivedAlias>,
-    edits: &mut Vec<Edit>,
+    state: &mut SlotUsageEditState<'_>,
 ) {
     match node {
-        Node::RegularElement(element) => {
-            let next_context = extend_slot_usage_context(context, &element.attributes);
-            collect_slot_usage_fragment_edits(
-                source,
-                &element.fragment,
-                false,
-                use_rest_props,
-                &next_context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::IfBlock(block) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &block.consequent,
-                parent_is_component,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => collect_slot_usage_fragment_edits(
-                        source,
-                        fragment,
-                        parent_is_component,
-                        use_rest_props,
-                        context,
-                        slot_props,
-                        derived_aliases,
-                        edits,
-                    ),
-                    Alternate::IfBlock(block) => collect_slot_usage_node_edits(
-                        source,
-                        &Node::IfBlock(block.clone()),
-                        parent_is_component,
-                        use_rest_props,
-                        context,
-                        slot_props,
-                        derived_aliases,
-                        edits,
-                    ),
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &block.body,
-                parent_is_component,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_slot_usage_fragment_edits(
-                    source,
-                    fallback,
-                    parent_is_component,
-                    use_rest_props,
-                    context,
-                    slot_props,
-                    derived_aliases,
-                    edits,
-                );
-            }
-        }
-        Node::KeyBlock(block) => collect_slot_usage_fragment_edits(
-            source,
-            &block.fragment,
-            parent_is_component,
-            use_rest_props,
-            context,
-            slot_props,
-            derived_aliases,
-            edits,
-        ),
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_slot_usage_fragment_edits(
-                        source,
-                        fragment,
-                        parent_is_component,
-                        use_rest_props,
-                        context,
-                        slot_props,
-                        derived_aliases,
-                        edits,
-                    );
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &block.body,
-                parent_is_component,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::Component(component) => {
-            let next_context = extend_slot_usage_context(context, &component.attributes);
-            collect_slot_usage_fragment_edits(
-                source,
-                &component.fragment,
-                true,
-                use_rest_props,
-                &next_context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
         Node::SlotElement(slot) => {
             if parent_is_component
                 && let Some((edit, requirement)) =
                     migrate_component_child_slot_element(source, slot, use_rest_props, context)
             {
                 if let Some(alias) = slot_alias_name(slot, context) {
-                    record_slot_alias(derived_aliases, alias, requirement.name.clone());
+                    record_slot_alias(state.derived_aliases, alias, requirement.name.clone());
                 }
-                record_slot_requirement(slot_props, requirement);
-                edits.push(edit);
+                record_slot_requirement(state.slot_props, requirement);
+                state.edits.push(edit);
                 return;
             }
             if let Some((edit, requirement)) =
                 migrate_slot_element_placeholder(source, slot, use_rest_props, context)
             {
                 if let Some(alias) = slot_alias_name(slot, context) {
-                    record_slot_alias(derived_aliases, alias, requirement.name.clone());
+                    record_slot_alias(state.derived_aliases, alias, requirement.name.clone());
                 }
-                record_slot_requirement(slot_props, requirement);
-                edits.push(edit);
+                record_slot_requirement(state.slot_props, requirement);
+                state.edits.push(edit);
                 return;
             }
-            collect_slot_usage_fragment_edits(
+            collect_slot_usage_descendant_edits(
                 source,
-                &slot.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteHead(head) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &head.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteBody(body) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &body.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteWindow(window) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &window.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteDocument(document) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &document.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteComponent(component) => {
-            let next_context = extend_slot_usage_context(context, &component.attributes);
-            collect_slot_usage_fragment_edits(
-                source,
-                &component.fragment,
-                true,
-                use_rest_props,
-                &next_context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteElement(element) => {
-            let next_context = extend_slot_usage_context(context, &element.attributes);
-            collect_slot_usage_fragment_edits(
-                source,
-                &element.fragment,
-                false,
-                use_rest_props,
-                &next_context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteSelf(component) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &component.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteFragment(fragment) => {
-            let next_context = extend_slot_usage_context(context, &fragment.attributes);
-            collect_slot_usage_fragment_edits(
-                source,
-                &fragment.fragment,
-                parent_is_component,
-                use_rest_props,
-                &next_context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                fragment,
+                node,
                 parent_is_component,
                 use_rest_props,
                 context,
-                slot_props,
-                derived_aliases,
-                edits,
-            );
-        }
-        Node::TitleElement(title) => {
-            collect_slot_usage_fragment_edits(
-                source,
-                &title.fragment,
-                false,
-                use_rest_props,
-                context,
-                slot_props,
-                derived_aliases,
-                edits,
+                state,
             );
         }
         Node::Comment(_)
@@ -6592,6 +5670,49 @@ fn collect_slot_usage_node_edits(
         | Node::ConstTag(_)
         | Node::RenderTag(_)
         | Node::DebugTag(_) => {}
+        _ => collect_slot_usage_descendant_edits(
+            source,
+            node,
+            parent_is_component,
+            use_rest_props,
+            context,
+            state,
+        ),
+    }
+}
+
+fn collect_slot_usage_descendant_edits(
+    source: &str,
+    node: &Node,
+    parent_is_component: bool,
+    use_rest_props: bool,
+    context: &SlotUsageContext,
+    state: &mut SlotUsageEditState<'_>,
+) {
+    let next_context = node
+        .as_element()
+        .map(|element| extend_slot_usage_context(context, element.attributes()));
+    let next_parent_is_component = slot_usage_child_parent_is_component(node, parent_is_component);
+    let next_context = next_context.as_ref().unwrap_or(context);
+
+    node.for_each_child_fragment(|fragment| {
+        collect_slot_usage_fragment_edits(
+            source,
+            fragment,
+            next_parent_is_component,
+            use_rest_props,
+            next_context,
+            state,
+        );
+    });
+}
+
+fn slot_usage_child_parent_is_component(node: &Node, parent_is_component: bool) -> bool {
+    match node {
+        Node::Component(_) | Node::SvelteComponent(_) => true,
+        Node::SvelteFragment(_) => parent_is_component,
+        _ if node.as_element().is_some() => false,
+        _ => parent_is_component,
     }
 }
 
@@ -6724,11 +5845,14 @@ fn collect_slot_prop_prelude_edits(
         );
 
         if use_ts && !is_typescript && !program_has_export_let(&instance.content) {
-            let newline_end = source
+            let newline_end = if source
                 .get(instance.content_start..)
                 .is_some_and(|content| content.starts_with('\n'))
-                .then_some(instance.content_start + 1)
-                .unwrap_or(instance.content_start);
+            {
+                instance.content_start + 1
+            } else {
+                instance.content_start
+            };
             edits.push(Edit {
                 start: instance.content_start.saturating_sub(1),
                 end: instance.content_start.saturating_sub(1),
@@ -7298,9 +6422,9 @@ fn collect_assignment_target_identifiers(
     });
 }
 
-fn unwrap_parenthesized_expression<'a>(
-    mut node: &'a crate::ast::modern::EstreeNode,
-) -> &'a crate::ast::modern::EstreeNode {
+fn unwrap_parenthesized_expression(
+    mut node: &crate::ast::modern::EstreeNode,
+) -> &crate::ast::modern::EstreeNode {
     while estree_node_type(node) == Some("ParenthesizedExpression") {
         let Some(expression) = estree_node_field_object(node, RawField::Expression) else {
             break;
@@ -7428,95 +6552,19 @@ fn node_impossible_slot_name_change(
     node: &Node,
     declared_names: &HashSet<String>,
 ) -> Option<(String, String)> {
-    match node {
-        Node::RegularElement(element) => {
-            first_impossible_slot_name_change(&element.fragment, declared_names)
-        }
-        Node::IfBlock(block) => if_block_impossible_slot_name_change(block, declared_names),
-        Node::EachBlock(block) => {
-            if let Some(change) = first_impossible_slot_name_change(&block.body, declared_names) {
-                return Some(change);
-            }
-            block
-                .fallback
-                .as_ref()
-                .and_then(|fragment| first_impossible_slot_name_change(fragment, declared_names))
-        }
-        Node::KeyBlock(block) => first_impossible_slot_name_change(&block.fragment, declared_names),
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment
-                    && let Some(change) =
-                        first_impossible_slot_name_change(fragment, declared_names)
-                {
-                    return Some(change);
-                }
-            }
-            None
-        }
-        Node::SnippetBlock(block) => first_impossible_slot_name_change(&block.body, declared_names),
-        Node::Component(component) => {
-            first_impossible_slot_name_change(&component.fragment, declared_names)
-        }
-        Node::SlotElement(slot) => impossible_slot_element_name_change(slot, declared_names)
-            .or_else(|| first_impossible_slot_name_change(&slot.fragment, declared_names)),
-        Node::SvelteHead(head) => first_impossible_slot_name_change(&head.fragment, declared_names),
-        Node::SvelteBody(body) => first_impossible_slot_name_change(&body.fragment, declared_names),
-        Node::SvelteWindow(window) => {
-            first_impossible_slot_name_change(&window.fragment, declared_names)
-        }
-        Node::SvelteDocument(document) => {
-            first_impossible_slot_name_change(&document.fragment, declared_names)
-        }
-        Node::SvelteComponent(component) => {
-            first_impossible_slot_name_change(&component.fragment, declared_names)
-        }
-        Node::SvelteElement(element) => {
-            first_impossible_slot_name_change(&element.fragment, declared_names)
-        }
-        Node::SvelteSelf(component) => {
-            first_impossible_slot_name_change(&component.fragment, declared_names)
-        }
-        Node::SvelteFragment(fragment) => {
-            first_impossible_slot_name_change(&fragment.fragment, declared_names)
-        }
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            first_impossible_slot_name_change(fragment, declared_names)
-        }
-        Node::TitleElement(title) => {
-            first_impossible_slot_name_change(&title.fragment, declared_names)
-        }
-        Node::Comment(_)
-        | Node::Text(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::ConstTag(_)
-        | Node::RenderTag(_)
-        | Node::DebugTag(_) => None,
-    }
-}
-
-fn if_block_impossible_slot_name_change(
-    block: &IfBlock,
-    declared_names: &HashSet<String>,
-) -> Option<(String, String)> {
-    if let Some(change) = first_impossible_slot_name_change(&block.consequent, declared_names) {
-        return Some(change);
+    if let Node::SlotElement(slot) = node {
+        return impossible_slot_element_name_change(slot, declared_names)
+            .or_else(|| first_impossible_slot_name_change(&slot.fragment, declared_names));
     }
 
-    match block.alternate.as_deref() {
-        Some(Alternate::Fragment(fragment)) => {
-            first_impossible_slot_name_change(fragment, declared_names)
+    node.try_for_each_child_fragment(|fragment| {
+        if let Some(change) = first_impossible_slot_name_change(fragment, declared_names) {
+            ControlFlow::Break(change)
+        } else {
+            ControlFlow::Continue(())
         }
-        Some(Alternate::IfBlock(block)) => {
-            if_block_impossible_slot_name_change(block, declared_names)
-        }
-        None => None,
-    }
+    })
+    .break_value()
 }
 
 fn impossible_slot_element_name_change(
@@ -7930,92 +6978,11 @@ fn collect_fragment_bind_targets(fragment: &Fragment, names: &mut HashSet<String
 }
 
 fn collect_node_bind_targets(node: &Node, names: &mut HashSet<String>) {
-    match node {
-        Node::RegularElement(element) => {
-            collect_attributes_bind_targets(&element.attributes, names);
-            collect_fragment_bind_targets(&element.fragment, names);
-        }
-        Node::IfBlock(block) => {
-            collect_fragment_bind_targets(&block.consequent, names);
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => collect_fragment_bind_targets(fragment, names),
-                    Alternate::IfBlock(block) => {
-                        collect_node_bind_targets(&Node::IfBlock(block.clone()), names)
-                    }
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_fragment_bind_targets(&block.body, names);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_fragment_bind_targets(fallback, names);
-            }
-        }
-        Node::KeyBlock(block) => collect_fragment_bind_targets(&block.fragment, names),
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_fragment_bind_targets(fragment, names);
-                }
-            }
-        }
-        Node::SnippetBlock(block) => collect_fragment_bind_targets(&block.body, names),
-        Node::Component(component) => {
-            collect_attributes_bind_targets(&component.attributes, names);
-            collect_fragment_bind_targets(&component.fragment, names);
-        }
-        Node::SlotElement(slot) => {
-            collect_attributes_bind_targets(&slot.attributes, names);
-            collect_fragment_bind_targets(&slot.fragment, names);
-        }
-        Node::SvelteHead(head) => collect_fragment_bind_targets(&head.fragment, names),
-        Node::SvelteBody(body) => collect_fragment_bind_targets(&body.fragment, names),
-        Node::SvelteWindow(window) => {
-            collect_attributes_bind_targets(&window.attributes, names);
-            collect_fragment_bind_targets(&window.fragment, names);
-        }
-        Node::SvelteDocument(document) => {
-            collect_attributes_bind_targets(&document.attributes, names);
-            collect_fragment_bind_targets(&document.fragment, names);
-        }
-        Node::SvelteComponent(component) => {
-            collect_attributes_bind_targets(&component.attributes, names);
-            collect_fragment_bind_targets(&component.fragment, names);
-        }
-        Node::SvelteElement(element) => {
-            collect_attributes_bind_targets(&element.attributes, names);
-            collect_fragment_bind_targets(&element.fragment, names);
-        }
-        Node::SvelteSelf(component) => {
-            collect_attributes_bind_targets(&component.attributes, names);
-            collect_fragment_bind_targets(&component.fragment, names);
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_attributes_bind_targets(&fragment.attributes, names);
-            collect_fragment_bind_targets(&fragment.fragment, names);
-        }
-        Node::SvelteBoundary(SvelteBoundary {
-            attributes,
-            fragment,
-            ..
-        }) => {
-            collect_attributes_bind_targets(attributes, names);
-            collect_fragment_bind_targets(fragment, names);
-        }
-        Node::TitleElement(title) => collect_fragment_bind_targets(&title.fragment, names),
-        Node::Comment(_)
-        | Node::Text(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::ConstTag(_)
-        | Node::RenderTag(_)
-        | Node::DebugTag(_) => {}
+    if let Some(element) = node.as_element() {
+        collect_attributes_bind_targets(element.attributes(), names);
     }
+
+    node.for_each_child_fragment(|fragment| collect_fragment_bind_targets(fragment, names));
 }
 
 fn collect_attributes_bind_targets(attributes: &[Attribute], names: &mut HashSet<String>) {
@@ -8036,57 +7003,18 @@ fn fragment_has_svelte_component(fragment: &Fragment) -> bool {
 }
 
 fn node_has_svelte_component(node: &Node) -> bool {
-    match node {
-        Node::SvelteComponent(_) => true,
-        Node::RegularElement(element) => fragment_has_svelte_component(&element.fragment),
-        Node::IfBlock(block) => {
-            fragment_has_svelte_component(&block.consequent)
-                || match block.alternate.as_deref() {
-                    Some(Alternate::Fragment(fragment)) => fragment_has_svelte_component(fragment),
-                    Some(Alternate::IfBlock(block)) => {
-                        node_has_svelte_component(&Node::IfBlock(block.clone()))
-                    }
-                    None => false,
-                }
-        }
-        Node::EachBlock(block) => {
-            fragment_has_svelte_component(&block.body)
-                || block
-                    .fallback
-                    .as_ref()
-                    .is_some_and(fragment_has_svelte_component)
-        }
-        Node::KeyBlock(block) => fragment_has_svelte_component(&block.fragment),
-        Node::AwaitBlock(block) => [
-            block.pending.as_ref(),
-            block.then.as_ref(),
-            block.catch.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(fragment_has_svelte_component),
-        Node::SnippetBlock(block) => fragment_has_svelte_component(&block.body),
-        Node::Component(component) => fragment_has_svelte_component(&component.fragment),
-        Node::SlotElement(slot) => fragment_has_svelte_component(&slot.fragment),
-        Node::SvelteHead(head) => fragment_has_svelte_component(&head.fragment),
-        Node::SvelteBody(body) => fragment_has_svelte_component(&body.fragment),
-        Node::SvelteWindow(window) => fragment_has_svelte_component(&window.fragment),
-        Node::SvelteDocument(document) => fragment_has_svelte_component(&document.fragment),
-        Node::SvelteElement(element) => fragment_has_svelte_component(&element.fragment),
-        Node::SvelteSelf(component) => fragment_has_svelte_component(&component.fragment),
-        Node::SvelteFragment(fragment) => fragment_has_svelte_component(&fragment.fragment),
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            fragment_has_svelte_component(fragment)
-        }
-        Node::TitleElement(title) => fragment_has_svelte_component(&title.fragment),
-        Node::Comment(_)
-        | Node::Text(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::ConstTag(_)
-        | Node::RenderTag(_)
-        | Node::DebugTag(_) => false,
+    if matches!(node, Node::SvelteComponent(_)) {
+        return true;
     }
+
+    node.try_for_each_child_fragment(|fragment| {
+        if fragment_has_svelte_component(fragment) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 fn collect_migrate_edits(
@@ -8175,56 +7103,38 @@ fn collect_node_edits(
             if let Some(edit) = migrate_self_closing_element(source, element) {
                 edits.push(edit);
             }
-            collect_fragment_edits(source, &element.fragment, emit_svelte_self_task, edits);
         }
         Node::Comment(comment) => {
             if let Some(edit) = migrate_html_comment(source, comment) {
                 edits.push(edit);
             }
         }
-        Node::IfBlock(block) => collect_if_block_edits(source, block, emit_svelte_self_task, edits),
+        Node::IfBlock(block) => {
+            collect_if_block_edits(source, block, emit_svelte_self_task, edits);
+            return;
+        }
         Node::EachBlock(block) => {
             collect_fragment_edits(source, &block.body, emit_svelte_self_task, edits);
             if let Some(fallback) = block.fallback.as_ref() {
                 collect_fragment_edits(source, fallback, emit_svelte_self_task, edits);
             }
+            return;
         }
         Node::KeyBlock(block) => {
-            collect_key_block_edits(source, block, emit_svelte_self_task, edits)
+            collect_key_block_edits(source, block, emit_svelte_self_task, edits);
+            return;
         }
         Node::AwaitBlock(block) => {
-            collect_await_block_edits(source, block, emit_svelte_self_task, edits)
-        }
-        Node::SnippetBlock(block) => {
-            collect_fragment_edits(source, &block.body, emit_svelte_self_task, edits)
-        }
-        Node::Component(component) => {
-            collect_fragment_edits(source, &component.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SlotElement(slot) => {
-            collect_fragment_edits(source, &slot.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SvelteHead(head) => {
-            collect_fragment_edits(source, &head.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SvelteBody(body) => {
-            collect_fragment_edits(source, &body.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SvelteWindow(window) => {
-            collect_fragment_edits(source, &window.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SvelteDocument(document) => {
-            collect_fragment_edits(source, &document.fragment, emit_svelte_self_task, edits)
+            collect_await_block_edits(source, block, emit_svelte_self_task, edits);
+            return;
         }
         Node::SvelteComponent(component) => {
             collect_static_svelte_component_edits(source, component, edits);
-            collect_fragment_edits(source, &component.fragment, emit_svelte_self_task, edits)
         }
         Node::SvelteElement(element) => {
             if let Some(edit) = migrate_svelte_element_static_this(source, element) {
                 edits.push(edit);
             }
-            collect_fragment_edits(source, &element.fragment, emit_svelte_self_task, edits);
         }
         Node::SvelteSelf(component) => {
             if emit_svelte_self_task
@@ -8232,16 +7142,6 @@ fn collect_node_edits(
             {
                 edits.push(edit);
             }
-            collect_fragment_edits(source, &component.fragment, emit_svelte_self_task, edits);
-        }
-        Node::SvelteFragment(fragment) => {
-            collect_fragment_edits(source, &fragment.fragment, emit_svelte_self_task, edits)
-        }
-        Node::SvelteBoundary(SvelteBoundary { fragment, .. }) => {
-            collect_fragment_edits(source, fragment, emit_svelte_self_task, edits)
-        }
-        Node::TitleElement(title) => {
-            collect_fragment_edits(source, &title.fragment, emit_svelte_self_task, edits)
         }
         Node::Text(_) | Node::ExpressionTag(_) | Node::RenderTag(_) | Node::DebugTag(_) => {}
         Node::HtmlTag(tag) => {
@@ -8254,7 +7154,21 @@ fn collect_node_edits(
                 edits.push(edit);
             }
         }
+        _ => {}
     }
+
+    collect_node_child_edits(source, node, emit_svelte_self_task, edits);
+}
+
+fn collect_node_child_edits(
+    source: &str,
+    node: &Node,
+    emit_svelte_self_task: bool,
+    edits: &mut Vec<Edit>,
+) {
+    node.for_each_child_fragment(|fragment| {
+        collect_fragment_edits(source, fragment, emit_svelte_self_task, edits);
+    });
 }
 
 fn collect_if_block_edits(
@@ -8265,10 +7179,9 @@ fn collect_if_block_edits(
 ) {
     if let Some(test_end) = expression_end(&block.test)
         && let Some(end) = braced_segment_close(source, test_end)
+        && let Some(edit) = trim_braced_segment(source, block.start, end)
     {
-        if let Some(edit) = trim_braced_segment(source, block.start, end) {
-            edits.push(edit);
-        }
+        edits.push(edit);
     }
 
     collect_fragment_edits(source, &block.consequent, emit_svelte_self_task, edits);
@@ -8327,10 +7240,11 @@ fn collect_await_block_edits(
         block.pending.as_ref(),
         block.then.as_ref(),
         block.catch.as_ref(),
-    ] {
-        if let Some(fragment) = fragment {
-            collect_fragment_edits(source, fragment, emit_svelte_self_task, edits);
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        collect_fragment_edits(source, fragment, emit_svelte_self_task, edits);
     }
 }
 
@@ -8554,168 +7468,24 @@ fn collect_svelte_self_node_edits(
     stats: &mut SvelteSelfRewriteStats,
     edits: &mut Vec<Edit>,
 ) {
-    match node {
-        Node::RegularElement(element) => collect_svelte_self_fragment_edits(
-            source,
-            &element.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::IfBlock(block) => {
-            collect_svelte_self_fragment_edits(
-                source,
-                &block.consequent,
-                component_name,
-                stats,
-                edits,
-            );
-            if let Some(alternate) = block.alternate.as_deref() {
-                match alternate {
-                    Alternate::Fragment(fragment) => collect_svelte_self_fragment_edits(
-                        source,
-                        fragment,
-                        component_name,
-                        stats,
-                        edits,
-                    ),
-                    Alternate::IfBlock(block) => collect_svelte_self_node_edits(
-                        source,
-                        &Node::IfBlock(block.clone()),
-                        component_name,
-                        stats,
-                        edits,
-                    ),
-                }
-            }
-        }
-        Node::EachBlock(block) => {
-            collect_svelte_self_fragment_edits(source, &block.body, component_name, stats, edits);
-            if let Some(fallback) = block.fallback.as_ref() {
-                collect_svelte_self_fragment_edits(source, fallback, component_name, stats, edits);
-            }
-        }
-        Node::KeyBlock(block) => collect_svelte_self_fragment_edits(
-            source,
-            &block.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::AwaitBlock(block) => {
-            for fragment in [
-                block.pending.as_ref(),
-                block.then.as_ref(),
-                block.catch.as_ref(),
-            ] {
-                if let Some(fragment) = fragment {
-                    collect_svelte_self_fragment_edits(
-                        source,
-                        fragment,
-                        component_name,
-                        stats,
-                        edits,
-                    );
-                }
-            }
-        }
-        Node::SnippetBlock(block) => {
-            collect_svelte_self_fragment_edits(source, &block.body, component_name, stats, edits)
-        }
-        Node::Component(component) => collect_svelte_self_fragment_edits(
-            source,
-            &component.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SlotElement(slot) => {
-            collect_svelte_self_fragment_edits(source, &slot.fragment, component_name, stats, edits)
-        }
-        Node::SvelteHead(head) => {
-            collect_svelte_self_fragment_edits(source, &head.fragment, component_name, stats, edits)
-        }
-        Node::SvelteBody(body) => {
-            collect_svelte_self_fragment_edits(source, &body.fragment, component_name, stats, edits)
-        }
-        Node::SvelteWindow(window) => collect_svelte_self_fragment_edits(
-            source,
-            &window.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SvelteDocument(document) => collect_svelte_self_fragment_edits(
-            source,
-            &document.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SvelteComponent(component) => collect_svelte_self_fragment_edits(
-            source,
-            &component.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SvelteElement(element) => collect_svelte_self_fragment_edits(
-            source,
-            &element.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SvelteSelf(component) => {
-            let Some(raw) = source.get(component.start..component.end) else {
-                return;
-            };
-            stats.has_svelte_self = true;
-            stats.needs_props |= raw.contains("$$props.");
-            edits.push(Edit {
-                start: component.start,
-                end: component.end,
-                replacement: raw
-                    .replace("svelte:self", component_name)
-                    .replace("$$props.", "props."),
-            });
-            collect_svelte_self_fragment_edits(
-                source,
-                &component.fragment,
-                component_name,
-                stats,
-                edits,
-            );
-        }
-        Node::SvelteFragment(fragment) => collect_svelte_self_fragment_edits(
-            source,
-            &fragment.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::SvelteBoundary(boundary) => collect_svelte_self_fragment_edits(
-            source,
-            &boundary.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::TitleElement(title) => collect_svelte_self_fragment_edits(
-            source,
-            &title.fragment,
-            component_name,
-            stats,
-            edits,
-        ),
-        Node::Text(_)
-        | Node::Comment(_)
-        | Node::ExpressionTag(_)
-        | Node::HtmlTag(_)
-        | Node::RenderTag(_)
-        | Node::ConstTag(_)
-        | Node::DebugTag(_) => {}
+    if let Node::SvelteSelf(component) = node {
+        let Some(raw) = source.get(component.start..component.end) else {
+            return;
+        };
+        stats.has_svelte_self = true;
+        stats.needs_props |= raw.contains("$$props.");
+        edits.push(Edit {
+            start: component.start,
+            end: component.end,
+            replacement: raw
+                .replace("svelte:self", component_name)
+                .replace("$$props.", "props."),
+        });
     }
+
+    node.for_each_child_fragment(|fragment| {
+        collect_svelte_self_fragment_edits(source, fragment, component_name, stats, edits);
+    });
 }
 
 fn migrate_html_comment(source: &str, comment: &Comment) -> Option<Edit> {
@@ -8987,7 +7757,7 @@ fn migrate_script_context_module(source: &str, script: &Script) -> Option<Edit> 
         if attribute.name.as_ref() != "context" {
             continue;
         }
-        if named_attribute_string_value(&attribute) != Some("module") {
+        if named_attribute_string_value(attribute) != Some("module") {
             continue;
         }
 
@@ -9341,6 +8111,173 @@ fn apply_edits(source: &str, edits: &mut [Edit]) -> String {
     output
 }
 
+fn unique_component_name(base: &str, declared_names: HashSet<String>) -> String {
+    if !declared_names.contains(base) {
+        return base.to_string();
+    }
+
+    let mut counter = 1usize;
+    loop {
+        let candidate = format!("{base}_{counter}");
+        if !declared_names.contains(&candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+fn unique_generated_name(base: &str, used_names: &mut HashSet<String>) -> String {
+    if used_names.insert(base.to_string()) {
+        return base.to_string();
+    }
+
+    let mut index = 1usize;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn declared_names_in_program(program: &crate::ast::modern::EstreeNode) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(body) = estree_node_field_array(program, RawField::Body) else {
+        return names;
+    };
+
+    for statement in body {
+        let EstreeValue::Object(statement) = statement else {
+            continue;
+        };
+        collect_declared_names_from_node(statement, &mut names);
+    }
+
+    names
+}
+
+fn collect_declared_names_from_node(
+    node: &crate::ast::modern::EstreeNode,
+    names: &mut HashSet<String>,
+) {
+    match estree_node_type(node) {
+        Some("ImportDeclaration") => {
+            if let Some(specifiers) = estree_node_field_array(node, RawField::Specifiers) {
+                for specifier in specifiers {
+                    let EstreeValue::Object(specifier) = specifier else {
+                        continue;
+                    };
+                    if let Some(local) = estree_node_field_object(specifier, RawField::Local) {
+                        collect_pattern_names(local, names);
+                    }
+                }
+            }
+        }
+        Some("VariableDeclaration") => {
+            if let Some(declarations) = estree_node_field_array(node, RawField::Declarations) {
+                for declaration in declarations {
+                    let EstreeValue::Object(declaration) = declaration else {
+                        continue;
+                    };
+                    if let Some(id) = estree_node_field_object(declaration, RawField::Id) {
+                        collect_pattern_names(id, names);
+                    }
+                }
+            }
+        }
+        Some("FunctionDeclaration" | "ClassDeclaration") => {
+            if let Some(id) = estree_node_field_object(node, RawField::Id) {
+                collect_pattern_names(id, names);
+            }
+        }
+        Some("ExportNamedDeclaration" | "ExportDefaultDeclaration") => {
+            if let Some(declaration) = estree_node_field_object(node, RawField::Declaration) {
+                collect_declared_names_from_node(declaration, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_pattern_names(node: &crate::ast::modern::EstreeNode, names: &mut HashSet<String>) {
+    match estree_node_type(node) {
+        Some("Identifier") => {
+            if let Some(name) = estree_node_field_str(node, RawField::Name) {
+                names.insert(name.to_string());
+            }
+        }
+        Some("ObjectPattern") => {
+            if let Some(properties) = estree_node_field_array(node, RawField::Properties) {
+                for property in properties {
+                    let EstreeValue::Object(property) = property else {
+                        continue;
+                    };
+                    match estree_node_type(property) {
+                        Some("Property") => {
+                            if let Some(value) = estree_node_field_object(property, RawField::Value)
+                            {
+                                collect_pattern_names(value, names);
+                            }
+                        }
+                        Some("RestElement") => {
+                            if let Some(argument) =
+                                estree_node_field_object(property, RawField::Argument)
+                            {
+                                collect_pattern_names(argument, names);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("ArrayPattern") => {
+            if let Some(elements) = estree_node_field_array(node, RawField::Elements) {
+                for element in elements {
+                    let EstreeValue::Object(element) = element else {
+                        continue;
+                    };
+                    collect_pattern_names(element, names);
+                }
+            }
+        }
+        Some("AssignmentPattern") => {
+            if let Some(left) = estree_node_field_object(node, RawField::Left) {
+                collect_pattern_names(left, names);
+            }
+        }
+        Some("RestElement") => {
+            if let Some(argument) = estree_node_field_object(node, RawField::Argument) {
+                collect_pattern_names(argument, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn first_non_whitespace(source: &str, start: usize, end: usize) -> Option<usize> {
+    let slice = source.get(start..end)?;
+    let offset = slice
+        .char_indices()
+        .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(offset))?;
+    Some(start + offset)
+}
+
+fn leading_whitespace_before(source: &str, index: usize) -> Option<&str> {
+    let line_start = source
+        .get(..index)?
+        .rfind('\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let line = source.get(line_start..index)?;
+    if line.chars().all(char::is_whitespace) {
+        Some(line)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::migrate;
@@ -9634,172 +8571,5 @@ mod tests {
             result.code.as_ref(),
             "<script lang=\"ts\">\n\tinterface Props {\n\t\tclass?: string;\n\t}\n\n\tlet { class: klass = '' }: Props = $props();\n\t\n</script>\n\n{klass}"
         );
-    }
-}
-
-fn unique_component_name(base: &str, declared_names: HashSet<String>) -> String {
-    if !declared_names.contains(base) {
-        return base.to_string();
-    }
-
-    let mut counter = 1usize;
-    loop {
-        let candidate = format!("{base}_{counter}");
-        if !declared_names.contains(&candidate) {
-            return candidate;
-        }
-        counter += 1;
-    }
-}
-
-fn unique_generated_name(base: &str, used_names: &mut HashSet<String>) -> String {
-    if used_names.insert(base.to_string()) {
-        return base.to_string();
-    }
-
-    let mut index = 1usize;
-    loop {
-        let candidate = format!("{base}_{index}");
-        if used_names.insert(candidate.clone()) {
-            return candidate;
-        }
-        index += 1;
-    }
-}
-
-fn declared_names_in_program(program: &crate::ast::modern::EstreeNode) -> HashSet<String> {
-    let mut names = HashSet::new();
-    let Some(body) = estree_node_field_array(program, RawField::Body) else {
-        return names;
-    };
-
-    for statement in body {
-        let EstreeValue::Object(statement) = statement else {
-            continue;
-        };
-        collect_declared_names_from_node(statement, &mut names);
-    }
-
-    names
-}
-
-fn collect_declared_names_from_node(
-    node: &crate::ast::modern::EstreeNode,
-    names: &mut HashSet<String>,
-) {
-    match estree_node_type(node) {
-        Some("ImportDeclaration") => {
-            if let Some(specifiers) = estree_node_field_array(node, RawField::Specifiers) {
-                for specifier in specifiers {
-                    let EstreeValue::Object(specifier) = specifier else {
-                        continue;
-                    };
-                    if let Some(local) = estree_node_field_object(specifier, RawField::Local) {
-                        collect_pattern_names(local, names);
-                    }
-                }
-            }
-        }
-        Some("VariableDeclaration") => {
-            if let Some(declarations) = estree_node_field_array(node, RawField::Declarations) {
-                for declaration in declarations {
-                    let EstreeValue::Object(declaration) = declaration else {
-                        continue;
-                    };
-                    if let Some(id) = estree_node_field_object(declaration, RawField::Id) {
-                        collect_pattern_names(id, names);
-                    }
-                }
-            }
-        }
-        Some("FunctionDeclaration" | "ClassDeclaration") => {
-            if let Some(id) = estree_node_field_object(node, RawField::Id) {
-                collect_pattern_names(id, names);
-            }
-        }
-        Some("ExportNamedDeclaration" | "ExportDefaultDeclaration") => {
-            if let Some(declaration) = estree_node_field_object(node, RawField::Declaration) {
-                collect_declared_names_from_node(declaration, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_pattern_names(node: &crate::ast::modern::EstreeNode, names: &mut HashSet<String>) {
-    match estree_node_type(node) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(node, RawField::Name) {
-                names.insert(name.to_string());
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(node, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_pattern_names(value, names);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_pattern_names(argument, names);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(node, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_pattern_names(element, names);
-                }
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(node, RawField::Left) {
-                collect_pattern_names(left, names);
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(node, RawField::Argument) {
-                collect_pattern_names(argument, names);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn first_non_whitespace(source: &str, start: usize, end: usize) -> Option<usize> {
-    let slice = source.get(start..end)?;
-    let offset = slice
-        .char_indices()
-        .find_map(|(offset, ch)| (!ch.is_whitespace()).then_some(offset))?;
-    Some(start + offset)
-}
-
-fn leading_whitespace_before(source: &str, index: usize) -> Option<&str> {
-    let line_start = source
-        .get(..index)?
-        .rfind('\n')
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-    let line = source.get(line_start..index)?;
-    if line.chars().all(char::is_whitespace) {
-        Some(line)
-    } else {
-        None
     }
 }

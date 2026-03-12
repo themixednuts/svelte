@@ -3,7 +3,14 @@ use crate::ast::modern::{
     Attribute, AttributeValue, AttributeValueList, EachBlock, EstreeNode, EstreeValue, Expression,
     Fragment, Node, Search,
 };
-use std::collections::{HashMap, HashSet};
+use crate::estree::{
+    PathStep, class_key_name, path_has_function_scope, raw_base_identifier_name, raw_callee_name,
+    raw_identifier_name, raw_literal_string, raw_member_property_name, this_member_name,
+    walk_estree_node_with_path,
+};
+use crate::names::NameStack;
+use crate::{SourceId, SourceText};
+use std::collections::HashMap;
 
 pub(super) fn detect_runes_mode_invalid_import(source: &str, root: &Root) -> Option<CompileError> {
     let script = root.instance.as_ref()?;
@@ -64,7 +71,8 @@ pub(super) fn detect_store_invalid_scoped_subscription(
         ));
     }
 
-    let (start, end) = find_store_invalid_scoped_subscription(&root.fragment, &mut Vec::new())?;
+    let (start, end) =
+        find_store_invalid_scoped_subscription(&root.fragment, &mut AliasStack::default())?;
     Some(compile_error_with_range(
         source,
         CompilerDiagnosticKind::StoreInvalidScopedSubscription,
@@ -116,9 +124,7 @@ pub(super) fn detect_global_reference_invalid_markup(
         find_invalid_global_reference_in_fragment(&root.fragment, runes_mode, instance)?;
     Some(compile_error_with_range(
         source,
-        CompilerDiagnosticKind::GlobalReferenceInvalid {
-            ident: Arc::from(ident.as_str()),
-        },
+        CompilerDiagnosticKind::GlobalReferenceInvalid { ident },
         start,
         end,
     ))
@@ -159,7 +165,7 @@ pub(super) fn detect_each_item_invalid_assignment(
     source: &str,
     root: &Root,
 ) -> Option<CompileError> {
-    let mut scope = Vec::<HashSet<String>>::new();
+    let mut scope = ScopeStack::default();
     let (start, end) = find_each_item_invalid_assignment(&root.fragment, &mut scope)?;
     Some(compile_error_with_range(
         source,
@@ -171,7 +177,7 @@ pub(super) fn detect_each_item_invalid_assignment(
 
 fn find_each_item_invalid_assignment(
     fragment: &Fragment,
-    scope: &mut Vec<HashSet<String>>,
+    scope: &mut ScopeStack,
 ) -> Option<(usize, usize)> {
     fragment.walk(
         scope,
@@ -209,27 +215,20 @@ fn find_each_item_invalid_assignment(
                         return Search::Found(span);
                     }
 
-                    let mut names = HashSet::new();
-                    if let Some(context) = block.context.as_ref() {
-                        collect_binding_names(&context.0, &mut names);
-                    }
-                    if let Some(index) = block.index.as_ref() {
-                        names.insert(index.to_string());
-                    }
-                    scope.push(names);
+                    if let Some(span) =
+                        scope.with_frame(scope_frame_for_each_block(block), |scope| {
+                            if let Some(key) = block.key.as_ref()
+                                && let Some(span) =
+                                    assignment_to_each_scoped_name_in_expression(key, scope)
+                            {
+                                return Some(span);
+                            }
 
-                    if let Some(key) = block.key.as_ref()
-                        && let Some(span) = assignment_to_each_scoped_name_in_expression(key, scope)
+                            find_each_item_invalid_assignment(&block.body, scope)
+                        })
                     {
-                        scope.pop();
                         return Search::Found(span);
                     }
-
-                    if let Some(span) = find_each_item_invalid_assignment(&block.body, scope) {
-                        scope.pop();
-                        return Search::Found(span);
-                    }
-                    scope.pop();
 
                     if let Some(fallback) = block.fallback.as_ref()
                         && let Some(span) = find_each_item_invalid_assignment(fallback, scope)
@@ -256,12 +255,9 @@ fn find_each_item_invalid_assignment(
                 Node::KeyBlock(block) => {
                     assignment_to_each_scoped_name_in_expression(&block.expression, scope)
                 }
-                _ => {
-                    let Some(element) = node.as_element() else {
-                        return Search::Continue;
-                    };
+                _ => node.as_element().and_then(|element| {
                     assignment_to_each_scoped_name_in_attributes(element.attributes(), scope)
-                }
+                }),
             };
 
             match found {
@@ -275,7 +271,7 @@ fn find_each_item_invalid_assignment(
 
 fn assignment_to_each_scoped_name_in_attributes(
     attributes: &[Attribute],
-    scope: &mut [HashSet<String>],
+    scope: &ScopeStack,
 ) -> Option<(usize, usize)> {
     for attribute in attributes.iter() {
         match attribute {
@@ -368,7 +364,7 @@ fn assignment_to_each_scoped_name_in_attributes(
 
 fn assignment_to_each_scoped_name_in_expression(
     expression: &Expression,
-    scope: &[HashSet<String>],
+    scope: &ScopeStack,
 ) -> Option<(usize, usize)> {
     let mut found = None::<(usize, usize)>;
     walk_estree_node(&expression.0, &mut |node| {
@@ -405,23 +401,17 @@ fn assignment_to_each_scoped_name_in_expression(
     found
 }
 
-fn assignment_target_contains_each_binding(target: &EstreeNode, scope: &[HashSet<String>]) -> bool {
+fn assignment_target_contains_each_binding(target: &EstreeNode, scope: &ScopeStack) -> bool {
     if estree_node_type(target) == Some("Identifier")
         && let Some(name) = raw_identifier_name(target)
-        && each_scope_contains_name(scope, name.as_str())
+        && scope.contains(name.as_ref())
     {
         return true;
     }
 
-    let mut names = HashSet::new();
-    collect_binding_names(target, &mut names);
-    names
-        .iter()
-        .any(|name| each_scope_contains_name(scope, name.as_str()))
-}
-
-fn each_scope_contains_name(scope: &[HashSet<String>], name: &str) -> bool {
-    scope.iter().rev().any(|frame| frame.contains(name))
+    let mut names = NameSet::default();
+    extend_name_set_with_pattern_bindings(&mut names, target);
+    names.iter().any(|name| scope.contains(name.as_ref()))
 }
 
 pub(super) fn detect_render_tag_errors_from_root(
@@ -739,9 +729,7 @@ pub(super) fn detect_invalid_name(source: &str, program: &EstreeNode) -> Option<
     let (name, start, end) = find_invalid_rune_name(program)?;
     Some(compile_error_with_range(
         source,
-        CompilerDiagnosticKind::RuneInvalidName {
-            name: Arc::from(name.as_str()),
-        },
+        CompilerDiagnosticKind::RuneInvalidName { name },
         start,
         end,
     ))
@@ -904,7 +892,7 @@ fn find_renamed_effect_active(program: &EstreeNode) -> Option<(usize, usize)> {
         let Some(property_name) = raw_identifier_name(property) else {
             return;
         };
-        if object_name == "$effect" && property_name == "active" {
+        if object_name.as_ref() == "$effect" && property_name.as_ref() == "active" {
             found = estree_node_span(node);
         }
     });
@@ -1039,7 +1027,7 @@ fn find_dollar_prefix_invalid_in_program(program: &EstreeNode) -> Option<(usize,
                     let Some(name) = raw_identifier_name(local) else {
                         continue;
                     };
-                    if is_dollar_prefixed_invalid_identifier(name.as_str())
+                    if is_dollar_prefixed_invalid_identifier(name.as_ref())
                         && let Some((start, _)) = estree_node_span(local)
                     {
                         return Some((start, start + 1));
@@ -1062,7 +1050,7 @@ fn find_invalid_dollar_in_variable_declaration(declaration: &EstreeNode) -> Opti
         let Some(name) = raw_identifier_name(id) else {
             continue;
         };
-        if is_dollar_prefixed_invalid_identifier(name.as_str())
+        if is_dollar_prefixed_invalid_identifier(name.as_ref())
             && let Some((start, _)) = estree_node_span(id)
         {
             return Some((start, start + 1));
@@ -1087,6 +1075,12 @@ enum FieldKind {
     Method,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PropertyFieldKind {
+    Prop,
+    AssignedProp,
+}
+
 #[derive(Debug)]
 struct ClassStateFieldError {
     kind: CompilerDiagnosticKind,
@@ -1105,31 +1099,138 @@ struct StateField<'a> {
     node: &'a EstreeNode,
 }
 
-fn raw_identifier_name(node: &EstreeNode) -> Option<String> {
-    if estree_node_type(node) != Some("Identifier") {
-        return None;
-    }
-    estree_node_field_str(node, RawField::Name).map(ToString::to_string)
+#[derive(Default)]
+struct FieldHistory {
+    property: Option<PropertyFieldKind>,
+    has_get: bool,
+    has_set: bool,
+    has_method: bool,
 }
 
-fn raw_base_identifier_name(node: &EstreeNode) -> Option<Arc<str>> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(Arc::from),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            raw_base_identifier_name(object)
+impl FieldHistory {
+    fn record_property(&mut self, kind: PropertyFieldKind) -> bool {
+        if self.property.is_some() || self.has_get || self.has_set || self.has_method {
+            return false;
         }
-        _ => None,
+        self.property = Some(kind);
+        true
+    }
+
+    fn record_method_kind(&mut self, kind: FieldKind) -> bool {
+        if self.property.is_some() {
+            return false;
+        }
+        match kind {
+            FieldKind::Get => {
+                if self.has_get || self.has_method {
+                    return false;
+                }
+                self.has_get = true;
+                true
+            }
+            FieldKind::Set => {
+                if self.has_set || self.has_method {
+                    return false;
+                }
+                self.has_set = true;
+                true
+            }
+            FieldKind::Method => {
+                if self.has_get || self.has_set || self.has_method {
+                    return false;
+                }
+                self.has_method = true;
+                true
+            }
+            FieldKind::Prop | FieldKind::AssignedProp => false,
+        }
+    }
+
+    fn allows_state_field(&self) -> bool {
+        self.property == Some(PropertyFieldKind::Prop)
     }
 }
 
-fn raw_literal_string(node: &EstreeNode) -> Option<String> {
-    if estree_node_type(node) != Some("Literal") {
-        return None;
+struct ClassFieldIndex<'a> {
+    declared_kinds: HashMap<Arc<str>, FieldHistory>,
+    state_fields: HashMap<Arc<str>, StateField<'a>>,
+}
+
+impl<'a> ClassFieldIndex<'a> {
+    fn new() -> Self {
+        Self {
+            declared_kinds: HashMap::new(),
+            state_fields: HashMap::new(),
+        }
     }
-    match estree_node_field(node, RawField::Value) {
-        Some(EstreeValue::String(value)) => Some(value.to_string()),
-        _ => None,
+
+    fn record_property_kind(
+        &mut self,
+        node: &EstreeNode,
+        name: Arc<str>,
+        kind: FieldKind,
+    ) -> Option<ClassStateFieldError> {
+        let property_kind = match kind {
+            FieldKind::Prop => PropertyFieldKind::Prop,
+            FieldKind::AssignedProp => PropertyFieldKind::AssignedProp,
+            FieldKind::Get | FieldKind::Set | FieldKind::Method => {
+                return Some(duplicate_class_field_error(node, name));
+            }
+        };
+        let mut history = FieldHistory::default();
+        if !history.record_property(property_kind)
+            || self.declared_kinds.insert(name.clone(), history).is_some()
+        {
+            return Some(duplicate_class_field_error(node, name));
+        }
+        None
+    }
+
+    fn record_method_kind(
+        &mut self,
+        node: &EstreeNode,
+        name: Arc<str>,
+        kind: FieldKind,
+    ) -> Option<ClassStateFieldError> {
+        match self.declared_kinds.get_mut(&name) {
+            None => {
+                let mut history = FieldHistory::default();
+                if !history.record_method_kind(kind) {
+                    return Some(duplicate_class_field_error(node, name));
+                }
+                self.declared_kinds.insert(name, history);
+                None
+            }
+            Some(existing) => existing
+                .record_method_kind(kind)
+                .then_some(())
+                .map_or_else(|| Some(duplicate_class_field_error(node, name)), |_| None),
+        }
+    }
+
+    fn record_state_field(
+        &mut self,
+        node: &'a EstreeNode,
+        name: &Arc<str>,
+    ) -> Option<ClassStateFieldError> {
+        let value = estree_node_value(node)?;
+        if !is_state_creation_call(value) {
+            return None;
+        }
+        if self.state_fields.contains_key(name) {
+            return Some(state_field_duplicate_error(node, name.clone()));
+        }
+        if let Some(kinds) = self.declared_kinds.get(name)
+            && !kinds.allows_state_field()
+        {
+            return Some(duplicate_class_field_error(node, name.clone()));
+        }
+        self.state_fields.insert(name.clone(), StateField { node });
+        None
+    }
+
+    fn state_field(&self, name: &str) -> Option<&StateField<'a>> {
+        self.state_fields.get(name)
     }
 }
 
@@ -1141,13 +1242,8 @@ fn is_dollar_prefixed_invalid_identifier(name: &str) -> bool {
     second == b'_' || second.is_ascii_alphabetic()
 }
 
-struct PathStep<'a> {
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-}
-
-fn find_rune_invalid_spread(program: &EstreeNode) -> Option<(String, usize, usize)> {
-    let mut found = None::<(String, usize, usize)>;
+fn find_rune_invalid_spread(program: &EstreeNode) -> Option<(Arc<str>, usize, usize)> {
+    let mut found = None::<(Arc<str>, usize, usize)>;
     walk_estree_node(program, &mut |node| {
         if found.is_some() || estree_node_type(node) != Some("CallExpression") {
             return;
@@ -1160,7 +1256,7 @@ fn find_rune_invalid_spread(program: &EstreeNode) -> Option<(String, usize, usiz
             return;
         };
         if !matches!(
-            name.as_str(),
+            name.as_ref(),
             "$derived" | "$derived.by" | "$state" | "$state.raw"
         ) {
             return;
@@ -1190,44 +1286,6 @@ fn find_rune_invalid_spread(program: &EstreeNode) -> Option<(String, usize, usiz
     found
 }
 
-fn walk_estree_node_with_path<'a>(
-    node: &'a EstreeNode,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    visitor(node, path);
-    for (key, value) in node.fields.iter() {
-        walk_raw_value_with_path(value, node, key.as_str(), path, visitor);
-    }
-}
-
-fn walk_raw_value_with_path<'a>(
-    value: &'a EstreeValue,
-    parent: &'a EstreeNode,
-    via_key: &'a str,
-    path: &mut Vec<PathStep<'a>>,
-    visitor: &mut impl FnMut(&'a EstreeNode, &[PathStep<'a>]),
-) {
-    match value {
-        EstreeValue::Object(node) => {
-            path.push(PathStep { parent, via_key });
-            walk_estree_node_with_path(node, path, visitor);
-            path.pop();
-        }
-        EstreeValue::Array(values) => {
-            for item in values.iter() {
-                walk_raw_value_with_path(item, parent, via_key, path, visitor);
-            }
-        }
-        EstreeValue::String(_)
-        | EstreeValue::Int(_)
-        | EstreeValue::UInt(_)
-        | EstreeValue::Number(_)
-        | EstreeValue::Bool(_)
-        | EstreeValue::Null => {}
-    }
-}
-
 fn find_first_call_span_by_name(program: &EstreeNode, name: &str) -> Option<(usize, usize)> {
     let mut found = None::<(usize, usize)>;
     walk_estree_node_with_path(program, &mut Vec::new(), &mut |node, _path| {
@@ -1237,7 +1295,7 @@ fn find_first_call_span_by_name(program: &EstreeNode, name: &str) -> Option<(usi
         let Some((call_name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if call_name == name {
+        if call_name.as_ref() == name {
             found = Some((start, end));
         }
     });
@@ -1250,7 +1308,7 @@ fn count_calls_by_name(program: &EstreeNode, name: &str) -> usize {
         let Some((call_name, _, _, _)) = call_node_info(node) else {
             return;
         };
-        if call_name == name {
+        if call_name.as_ref() == name {
             count += 1;
         }
     });
@@ -1258,7 +1316,7 @@ fn count_calls_by_name(program: &EstreeNode, name: &str) -> usize {
 }
 
 fn find_props_illegal_name(program: &EstreeNode) -> Option<(usize, usize)> {
-    let mut props_rest_bindings = HashSet::<String>::new();
+    let mut props_rest_bindings = NameSet::default();
     let mut found = None::<(usize, usize)>;
 
     walk_estree_node(program, &mut |node| {
@@ -1279,7 +1337,7 @@ fn find_props_illegal_name(program: &EstreeNode) -> Option<(usize, usize)> {
         match estree_node_type(id) {
             Some("Identifier") => {
                 if let Some(name) = raw_identifier_name(id) {
-                    props_rest_bindings.insert(name.to_string());
+                    props_rest_bindings.insert(name);
                 }
             }
             Some("ObjectPattern") => {
@@ -1301,7 +1359,7 @@ fn find_props_illegal_name(program: &EstreeNode) -> Option<(usize, usize)> {
                                 continue;
                             }
                             if let Some(name) = raw_identifier_name(argument) {
-                                props_rest_bindings.insert(name.to_string());
+                                props_rest_bindings.insert(name);
                             }
                         }
                         Some("Property") => {
@@ -1353,7 +1411,7 @@ fn find_props_illegal_name(program: &EstreeNode) -> Option<(usize, usize)> {
         let Some(object_name) = raw_identifier_name(object) else {
             return;
         };
-        if !props_rest_bindings.contains(object_name.as_str()) {
+        if !props_rest_bindings.contains(object_name.as_ref()) {
             return;
         }
 
@@ -1389,7 +1447,7 @@ fn find_invalid_call_arg_count(
         let Some((call_name, start, end, arg_count)) = call_node_info(node) else {
             return;
         };
-        if call_name == name && !is_valid(arg_count) {
+        if call_name.as_ref() == name && !is_valid(arg_count) {
             found = Some((start, end));
         }
     });
@@ -1407,7 +1465,7 @@ fn find_invalid_rune_argument_count(
         let Some((name, start, end, arg_count)) = call_node_info(node) else {
             return;
         };
-        let Some(kind) = invalid_rune_argument_kind(name.as_str(), arg_count) else {
+        let Some(kind) = invalid_rune_argument_kind(name.as_ref(), arg_count) else {
             return;
         };
         found = Some((kind, start, end));
@@ -1443,7 +1501,7 @@ fn find_props_invalid_placement_component(program: &EstreeNode) -> Option<(usize
         let Some((call_name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if call_name != "$props" {
+        if call_name.as_ref() != "$props" {
             return;
         }
         if !is_top_level_variable_initializer(path) {
@@ -1462,7 +1520,7 @@ fn find_bindable_invalid_location(program: &EstreeNode) -> Option<(usize, usize)
         let Some((call_name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if call_name != "$bindable" {
+        if call_name.as_ref() != "$bindable" {
             return;
         }
         if !is_bindable_props_destructure_location(path) {
@@ -1523,7 +1581,7 @@ fn find_invalid_initializer_placement(
         let Some((name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if name != call_name {
+        if name.as_ref() != call_name {
             return;
         }
         let Some(callee) = estree_node_field_object(node, RawField::Callee) else {
@@ -1548,7 +1606,7 @@ fn find_effect_invalid_placement(program: &EstreeNode) -> Option<(usize, usize)>
         let Some((name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if name != "$effect" {
+        if name.as_ref() != "$effect" {
             return;
         }
         let Some(callee) = estree_node_field_object(node, RawField::Callee) else {
@@ -1600,7 +1658,7 @@ fn find_static_state_call(program: &EstreeNode) -> Option<(usize, usize)> {
         let Some((name, start, end, _)) = call_node_info(node) else {
             return;
         };
-        if name != "$state" {
+        if name.as_ref() != "$state" {
             return;
         }
         let Some(parent) = path.last().map(|step| step.parent) else {
@@ -1616,39 +1674,6 @@ fn find_static_state_call(program: &EstreeNode) -> Option<(usize, usize)> {
         }
     });
     found
-}
-
-fn class_key_name(node: &EstreeNode) -> Option<Arc<str>> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(Arc::from),
-        Some("PrivateIdentifier") => {
-            estree_node_field_str(node, RawField::Name).map(|name| Arc::from(format!("#{name}")))
-        }
-        Some("Literal") => match estree_node_field(node, RawField::Value) {
-            Some(EstreeValue::String(value)) => Some(value.clone()),
-            Some(EstreeValue::Int(value)) => Some(Arc::from(value.to_string())),
-            Some(EstreeValue::UInt(value)) => Some(Arc::from(value.to_string())),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn this_member_name(node: &EstreeNode) -> Option<Arc<str>> {
-    if estree_node_type(node) != Some("MemberExpression") {
-        return None;
-    }
-    let object = estree_node_field_object(node, RawField::Object)?;
-    if estree_node_type(object) != Some("ThisExpression") {
-        return None;
-    }
-    let property = estree_node_field_object(node, RawField::Property)?;
-    if estree_node_field_bool_named(node, "computed").unwrap_or(false)
-        && estree_node_type(property) != Some("Literal")
-    {
-        return None;
-    }
-    class_key_name(property)
 }
 
 fn find_rune_missing_parentheses_in_program(program: &EstreeNode) -> Option<(usize, usize)> {
@@ -1684,8 +1709,8 @@ fn find_rune_missing_parentheses_in_program(program: &EstreeNode) -> Option<(usi
     found
 }
 
-fn find_invalid_rune_name(program: &EstreeNode) -> Option<(String, usize, usize)> {
-    let mut found = None::<(String, usize, usize)>;
+fn find_invalid_rune_name(program: &EstreeNode) -> Option<(Arc<str>, usize, usize)> {
+    let mut found = None::<(Arc<str>, usize, usize)>;
     walk_estree_node_with_path(program, &mut Vec::new(), &mut |node, _path| {
         if found.is_some() || estree_node_type(node) != Some("MemberExpression") {
             return;
@@ -1702,21 +1727,24 @@ fn find_invalid_rune_name(program: &EstreeNode) -> Option<(String, usize, usize)
         let Some(property_name) = raw_identifier_name(property) else {
             return;
         };
-        if object_name == "$state" && property_name != "raw" && property_name != "snapshot" {
-            let full = format!("{object_name}.{property_name}");
+        if object_name.as_ref() == "$state"
+            && property_name.as_ref() != "raw"
+            && property_name.as_ref() != "snapshot"
+        {
+            let full = Arc::<str>::from(format!("{object_name}.{property_name}"));
             if let Some((start, end)) = estree_node_span(node) {
                 found = Some((full, start, end));
             }
             return;
         }
 
-        if object_name == "$effect"
+        if object_name.as_ref() == "$effect"
             && !matches!(
-                property_name.as_str(),
+                property_name.as_ref(),
                 "active" | "pre" | "tracking" | "root"
             )
         {
-            let full = format!("{object_name}.{property_name}");
+            let full = Arc::<str>::from(format!("{object_name}.{property_name}"));
             if let Some((start, end)) = estree_node_span(node) {
                 found = Some((full, start, end));
             }
@@ -1726,13 +1754,13 @@ fn find_invalid_rune_name(program: &EstreeNode) -> Option<(String, usize, usize)
 }
 
 fn find_constant_assignment(program: &EstreeNode) -> Option<(usize, usize)> {
-    let outer_immutables = HashSet::new();
+    let outer_immutables = NameSet::default();
     find_constant_assignment_in_node(program, &outer_immutables)
 }
 
 pub(super) fn find_constant_assignment_in_expression(
     expression: &Expression,
-    outer_immutables: &HashSet<String>,
+    outer_immutables: &NameSet,
 ) -> Option<(usize, usize)> {
     find_constant_assignment_in_node(&expression.0, outer_immutables)
 }
@@ -1743,30 +1771,96 @@ enum BindingMutability {
     Mutable,
 }
 
+#[derive(Default)]
+struct BindingFrame {
+    bindings: HashMap<Arc<str>, BindingMutability>,
+}
+
+impl BindingFrame {
+    fn insert(&mut self, name: Arc<str>, mutability: BindingMutability) {
+        self.bindings.insert(name, mutability);
+    }
+
+    fn get(&self, name: &str) -> Option<BindingMutability> {
+        self.bindings.get(name).copied()
+    }
+}
+
+struct BindingScopeStack {
+    frames: Vec<BindingFrame>,
+}
+
+impl Default for BindingScopeStack {
+    fn default() -> Self {
+        Self {
+            frames: vec![BindingFrame::default()],
+        }
+    }
+}
+
+impl BindingScopeStack {
+    fn push_frame(&mut self) {
+        self.frames.push(BindingFrame::default());
+    }
+
+    fn pop_frame(&mut self) {
+        let _ = self.frames.pop();
+    }
+
+    fn current_frame_mut(&mut self) -> Option<&mut BindingFrame> {
+        self.frames.last_mut()
+    }
+
+    fn declare(&mut self, name: Arc<str>, mutability: BindingMutability) {
+        if let Some(frame) = self.current_frame_mut() {
+            frame.insert(name, mutability);
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Option<BindingMutability> {
+        self.frames.iter().rev().find_map(|frame| frame.get(name))
+    }
+}
+
+#[derive(Default)]
+struct AliasStack {
+    aliases: NameStack,
+}
+
+impl AliasStack {
+    fn push(&mut self, alias: Arc<str>) {
+        self.aliases.push(alias);
+    }
+
+    fn pop(&mut self) {
+        self.aliases.pop();
+    }
+
+    fn contains(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+}
+
 struct ConstAssignmentAnalyzer<'a> {
-    outer_immutables: &'a HashSet<String>,
+    outer_immutables: &'a NameSet,
     found: Option<(usize, usize)>,
 }
 
 fn find_constant_assignment_in_node(
     node: &EstreeNode,
-    outer_immutables: &HashSet<String>,
+    outer_immutables: &NameSet,
 ) -> Option<(usize, usize)> {
     let mut analyzer = ConstAssignmentAnalyzer {
         outer_immutables,
         found: None,
     };
-    let mut scopes = vec![HashMap::<String, BindingMutability>::new()];
+    let mut scopes = BindingScopeStack::default();
     analyzer.visit_node(node, &mut scopes);
     analyzer.found
 }
 
 impl<'a> ConstAssignmentAnalyzer<'a> {
-    fn visit_node(
-        &mut self,
-        node: &EstreeNode,
-        scopes: &mut Vec<HashMap<String, BindingMutability>>,
-    ) {
+    fn visit_node(&mut self, node: &EstreeNode, scopes: &mut BindingScopeStack) {
         if self.found.is_some() {
             return;
         }
@@ -1780,13 +1874,13 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
                 }
             }
             Some("BlockStatement") => {
-                scopes.push(HashMap::new());
+                scopes.push_frame();
                 if let Some(body) = estree_node_field_array(node, RawField::Body) {
                     self.visit_statement_list(body, scopes);
                 } else {
                     self.visit_children(node, scopes);
                 }
-                scopes.pop();
+                scopes.pop_frame();
             }
             Some("VariableDeclaration") => {
                 let mutability = if estree_node_field_str(node, RawField::Kind) == Some("const") {
@@ -1799,10 +1893,8 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
                         let EstreeValue::Object(declaration) = declaration else {
                             continue;
                         };
-                        if let Some(id) = estree_node_field_object(declaration, RawField::Id)
-                            && let Some(scope) = scopes.last_mut()
-                        {
-                            self.declare_pattern_bindings(id, mutability, scope);
+                        if let Some(id) = estree_node_field_object(declaration, RawField::Id) {
+                            self.declare_pattern_bindings(id, mutability, scopes);
                         }
                     }
                     for declaration in declarations {
@@ -1824,13 +1916,11 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
                         let EstreeValue::Object(specifier) = specifier else {
                             continue;
                         };
-                        if let Some(local) = estree_node_field_object(specifier, RawField::Local)
-                            && let Some(scope) = scopes.last_mut()
-                        {
+                        if let Some(local) = estree_node_field_object(specifier, RawField::Local) {
                             self.declare_pattern_bindings(
                                 local,
                                 BindingMutability::Immutable,
-                                scope,
+                                scopes,
                             );
                         }
                     }
@@ -1846,9 +1936,8 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
             Some("FunctionDeclaration") => {
                 if let Some(id) = estree_node_field_object(node, RawField::Id)
                     && let Some(name) = raw_identifier_name(id)
-                    && let Some(scope) = scopes.last_mut()
                 {
-                    scope.insert(name, BindingMutability::Mutable);
+                    scopes.declare(name, BindingMutability::Mutable);
                 }
                 self.visit_function_node(node, scopes, false);
             }
@@ -1861,25 +1950,22 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
             Some("ClassDeclaration") => {
                 if let Some(id) = estree_node_field_object(node, RawField::Id)
                     && let Some(name) = raw_identifier_name(id)
-                    && let Some(scope) = scopes.last_mut()
                 {
-                    scope.insert(name, BindingMutability::Mutable);
+                    scopes.declare(name, BindingMutability::Mutable);
                 }
                 self.visit_children(node, scopes);
             }
             Some("CatchClause") => {
-                scopes.push(HashMap::new());
-                if let Some(EstreeValue::Object(param)) = node.fields.get("param")
-                    && let Some(scope) = scopes.last_mut()
-                {
-                    self.declare_pattern_bindings(param, BindingMutability::Mutable, scope);
+                scopes.push_frame();
+                if let Some(EstreeValue::Object(param)) = node.fields.get("param") {
+                    self.declare_pattern_bindings(param, BindingMutability::Mutable, scopes);
                 }
                 if let Some(body) = estree_node_field_object(node, RawField::Body) {
                     self.visit_node(body, scopes);
                 } else {
                     self.visit_children(node, scopes);
                 }
-                scopes.pop();
+                scopes.pop_frame();
             }
             Some("AssignmentExpression") => {
                 if let Some(left) = estree_node_field_object(node, RawField::Left)
@@ -1905,11 +1991,7 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
         }
     }
 
-    fn visit_statement_list(
-        &mut self,
-        statements: &[EstreeValue],
-        scopes: &mut Vec<HashMap<String, BindingMutability>>,
-    ) {
+    fn visit_statement_list(&mut self, statements: &[EstreeValue], scopes: &mut BindingScopeStack) {
         for statement in statements {
             let EstreeValue::Object(statement) = statement else {
                 continue;
@@ -1921,11 +2003,7 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
         }
     }
 
-    fn visit_children(
-        &mut self,
-        node: &EstreeNode,
-        scopes: &mut Vec<HashMap<String, BindingMutability>>,
-    ) {
+    fn visit_children(&mut self, node: &EstreeNode, scopes: &mut BindingScopeStack) {
         for value in node.fields.values() {
             self.visit_value(value, scopes);
             if self.found.is_some() {
@@ -1934,11 +2012,7 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
         }
     }
 
-    fn visit_value(
-        &mut self,
-        value: &EstreeValue,
-        scopes: &mut Vec<HashMap<String, BindingMutability>>,
-    ) {
+    fn visit_value(&mut self, value: &EstreeValue, scopes: &mut BindingScopeStack) {
         if self.found.is_some() {
             return;
         }
@@ -1964,17 +2038,16 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
     fn visit_function_node(
         &mut self,
         node: &EstreeNode,
-        scopes: &mut Vec<HashMap<String, BindingMutability>>,
+        scopes: &mut BindingScopeStack,
         declare_function_name_in_inner_scope: bool,
     ) {
-        scopes.push(HashMap::new());
+        scopes.push_frame();
 
         if declare_function_name_in_inner_scope
             && let Some(id) = estree_node_field_object(node, RawField::Id)
             && let Some(name) = raw_identifier_name(id)
-            && let Some(scope) = scopes.last_mut()
         {
-            scope.insert(name, BindingMutability::Mutable);
+            scopes.declare(name, BindingMutability::Mutable);
         }
 
         if let Some(params) = estree_node_field_array(node, RawField::Params) {
@@ -1982,9 +2055,7 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
                 let EstreeValue::Object(param) = param else {
                     continue;
                 };
-                if let Some(scope) = scopes.last_mut() {
-                    self.declare_pattern_bindings(param, BindingMutability::Mutable, scope);
-                }
+                self.declare_pattern_bindings(param, BindingMutability::Mutable, scopes);
             }
         }
 
@@ -1992,197 +2063,49 @@ impl<'a> ConstAssignmentAnalyzer<'a> {
             self.visit_node(body, scopes);
         }
 
-        scopes.pop();
+        scopes.pop_frame();
     }
 
     fn declare_pattern_bindings(
         &self,
         pattern: &EstreeNode,
         mutability: BindingMutability,
-        scope: &mut HashMap<String, BindingMutability>,
+        scopes: &mut BindingScopeStack,
     ) {
-        match estree_node_type(pattern) {
-            Some("Identifier") => {
-                if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                    scope.insert(name.to_string(), mutability);
-                }
-            }
-            Some("RestElement") => {
-                if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                    self.declare_pattern_bindings(argument, mutability, scope);
-                }
-            }
-            Some("AssignmentPattern") => {
-                if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                    self.declare_pattern_bindings(left, mutability, scope);
-                }
-            }
-            Some("ArrayPattern") => {
-                if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                    for element in elements {
-                        let EstreeValue::Object(element) = element else {
-                            continue;
-                        };
-                        self.declare_pattern_bindings(element, mutability, scope);
-                    }
-                }
-            }
-            Some("ObjectPattern") => {
-                if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                    for property in properties {
-                        let EstreeValue::Object(property) = property else {
-                            continue;
-                        };
-                        match estree_node_type(property) {
-                            Some("Property") => {
-                                if let Some(value) =
-                                    estree_node_field_object(property, RawField::Value)
-                                {
-                                    self.declare_pattern_bindings(value, mutability, scope);
-                                }
-                            }
-                            Some("RestElement") => {
-                                if let Some(argument) =
-                                    estree_node_field_object(property, RawField::Argument)
-                                {
-                                    self.declare_pattern_bindings(argument, mutability, scope);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            _ => {}
+        let mut names = NameSet::default();
+        extend_name_set_with_pattern_bindings(&mut names, pattern);
+        for name in names {
+            scopes.declare(name, mutability);
         }
     }
 
     fn assignment_target_has_immutable_binding(
         &self,
         target: &EstreeNode,
-        scopes: &[HashMap<String, BindingMutability>],
+        scopes: &BindingScopeStack,
     ) -> bool {
-        match estree_node_type(target) {
-            Some("Identifier") => {
-                let Some(name) = estree_node_field_str(target, RawField::Name) else {
-                    return false;
-                };
-                self.lookup_binding_mutability(name, scopes) == Some(BindingMutability::Immutable)
-            }
-            Some("ArrayPattern") => estree_node_field_array(target, RawField::Elements)
-                .is_some_and(|elements| {
-                    elements.iter().any(|element| {
-                        let EstreeValue::Object(element) = element else {
-                            return false;
-                        };
-                        self.assignment_target_has_immutable_binding(element, scopes)
-                    })
-                }),
-            Some("ObjectPattern") => estree_node_field_array(target, RawField::Properties)
-                .is_some_and(|properties| {
-                    properties.iter().any(|property| {
-                        let EstreeValue::Object(property) = property else {
-                            return false;
-                        };
-                        match estree_node_type(property) {
-                            Some("Property") => estree_node_field_object(property, RawField::Value)
-                                .is_some_and(|value| {
-                                    self.assignment_target_has_immutable_binding(value, scopes)
-                                }),
-                            Some("RestElement") => estree_node_field_object(
-                                property,
-                                RawField::Argument,
-                            )
-                            .is_some_and(|argument| {
-                                self.assignment_target_has_immutable_binding(argument, scopes)
-                            }),
-                            _ => false,
-                        }
-                    })
-                }),
-            Some("AssignmentPattern") => estree_node_field_object(target, RawField::Left)
-                .is_some_and(|left| self.assignment_target_has_immutable_binding(left, scopes)),
-            Some("RestElement") => estree_node_field_object(target, RawField::Argument)
-                .is_some_and(|argument| {
-                    self.assignment_target_has_immutable_binding(argument, scopes)
-                }),
-            _ => false,
-        }
+        let mut names = Vec::new();
+        crate::estree::collect_assignment_target_identifiers(target, &mut names);
+        names.into_iter().any(|name| {
+            self.lookup_binding_mutability(name.as_ref(), scopes)
+                == Some(BindingMutability::Immutable)
+        })
     }
 
     fn lookup_binding_mutability(
         &self,
         name: &str,
-        scopes: &[HashMap<String, BindingMutability>],
+        scopes: &BindingScopeStack,
     ) -> Option<BindingMutability> {
-        for scope in scopes.iter().rev() {
-            if let Some(mutability) = scope.get(name) {
-                return Some(*mutability);
-            }
-        }
-        self.outer_immutables
-            .contains(name)
-            .then_some(BindingMutability::Immutable)
+        scopes.lookup(name).or_else(|| {
+            self.outer_immutables
+                .contains(name)
+                .then_some(BindingMutability::Immutable)
+        })
     }
 }
 
-fn collect_binding_names(pattern: &EstreeNode, out: &mut std::collections::HashSet<String>) {
-    match estree_node_type(pattern) {
-        Some("Identifier") => {
-            if let Some(name) = estree_node_field_str(pattern, RawField::Name) {
-                out.insert(name.to_string());
-            }
-        }
-        Some("RestElement") => {
-            if let Some(argument) = estree_node_field_object(pattern, RawField::Argument) {
-                collect_binding_names(argument, out);
-            }
-        }
-        Some("AssignmentPattern") => {
-            if let Some(left) = estree_node_field_object(pattern, RawField::Left) {
-                collect_binding_names(left, out);
-            }
-        }
-        Some("ArrayPattern") => {
-            if let Some(elements) = estree_node_field_array(pattern, RawField::Elements) {
-                for element in elements {
-                    let EstreeValue::Object(element) = element else {
-                        continue;
-                    };
-                    collect_binding_names(element, out);
-                }
-            }
-        }
-        Some("ObjectPattern") => {
-            if let Some(properties) = estree_node_field_array(pattern, RawField::Properties) {
-                for property in properties {
-                    let EstreeValue::Object(property) = property else {
-                        continue;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => {
-                            if let Some(value) = estree_node_field_object(property, RawField::Value)
-                            {
-                                collect_binding_names(value, out);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(argument) =
-                                estree_node_field_object(property, RawField::Argument)
-                            {
-                                collect_binding_names(argument, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn call_node_info(node: &EstreeNode) -> Option<(String, usize, usize, usize)> {
+fn call_node_info(node: &EstreeNode) -> Option<(Arc<str>, usize, usize, usize)> {
     if estree_node_type(node) != Some("CallExpression") {
         return None;
     }
@@ -2195,26 +2118,12 @@ fn call_node_info(node: &EstreeNode) -> Option<(String, usize, usize, usize)> {
     Some((call_name, start, end, arg_count))
 }
 
-fn call_name_for_node(node: &EstreeNode) -> Option<String> {
+fn call_name_for_node(node: &EstreeNode) -> Option<Arc<str>> {
     if estree_node_type(node) != Some("CallExpression") {
         return None;
     }
     let callee = estree_node_field_object(node, RawField::Callee)?;
     raw_callee_name(callee)
-}
-
-fn raw_callee_name(node: &EstreeNode) -> Option<String> {
-    match estree_node_type(node) {
-        Some("Identifier") => estree_node_field_str(node, RawField::Name).map(ToString::to_string),
-        Some("MemberExpression") => {
-            let object = estree_node_field_object(node, RawField::Object)?;
-            let property = estree_node_field_object(node, RawField::Property)?;
-            let object_name = raw_identifier_name(object)?;
-            let property_name = raw_identifier_name(property)?;
-            Some(format!("{object_name}.{property_name}"))
-        }
-        _ => None,
-    }
 }
 
 fn compile_error_custom_runes(
@@ -2224,23 +2133,19 @@ fn compile_error_custom_runes(
     start: usize,
     end: usize,
 ) -> CompileError {
-    let (start_line, start_column) = line_column_at_offset(source, start);
-    let (end_line, end_column) = line_column_at_offset(source, end);
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
 
     CompileError {
         code: Arc::from(code),
         message: message.into(),
-        position: Some(Box::new(SourcePosition { start, end })),
-        start: Some(Box::new(SourceLocation {
-            line: start_line,
-            column: start_column,
-            character: start,
+        position: Some(Box::new(SourcePosition {
+            start: start_location.character,
+            end: end_location.character,
         })),
-        end: Some(Box::new(SourceLocation {
-            line: end_line,
-            column: end_column,
-            character: end,
-        })),
+        start: Some(Box::new(start_location)),
+        end: Some(Box::new(end_location)),
         filename: None,
     }
 }
@@ -2258,8 +2163,7 @@ fn find_class_state_field_error(program: &EstreeNode) -> Option<ClassStateFieldE
 
 fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError> {
     let members = estree_node_field_array(body, RawField::Body)?;
-    let mut state_fields = HashMap::<Arc<str>, StateField<'_>>::new();
-    let mut fields = HashMap::<Arc<str>, Vec<FieldKind>>::new();
+    let mut fields = ClassFieldIndex::new();
     let mut constructor = None::<&'a EstreeNode>;
 
     for member in members {
@@ -2281,7 +2185,7 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
                     continue;
                 };
 
-                if let Some(error) = record_state_field(member, &name, &fields, &mut state_fields) {
+                if let Some(error) = fields.record_state_field(member, &name) {
                     return Some(error);
                 }
 
@@ -2291,8 +2195,8 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
                     FieldKind::Prop
                 };
 
-                if fields.insert(name.clone(), vec![kind]).is_some() {
-                    return Some(duplicate_class_field_error(member, name));
+                if let Some(error) = fields.record_property_kind(member, name, kind) {
+                    return Some(error);
                 }
             }
             Some("MethodDefinition") => {
@@ -2322,32 +2226,8 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
                     _ => FieldKind::Method,
                 };
 
-                match fields.get_mut(&name) {
-                    None => {
-                        fields.insert(name, vec![kind]);
-                    }
-                    Some(existing) => {
-                        if existing.contains(&kind)
-                            || existing.contains(&FieldKind::Prop)
-                            || existing.contains(&FieldKind::AssignedProp)
-                        {
-                            return Some(duplicate_class_field_error(member, name));
-                        }
-                        match kind {
-                            FieldKind::Get
-                                if existing.len() == 1 && existing[0] == FieldKind::Set =>
-                            {
-                                existing.push(FieldKind::Get);
-                            }
-                            FieldKind::Set
-                                if existing.len() == 1 && existing[0] == FieldKind::Get =>
-                            {
-                                existing.push(FieldKind::Set);
-                            }
-                            FieldKind::Method => existing.push(FieldKind::Method),
-                            _ => return Some(duplicate_class_field_error(member, name)),
-                        }
-                    }
+                if let Some(error) = fields.record_method_kind(member, name, kind) {
+                    return Some(error);
                 }
             }
             _ => {}
@@ -2355,8 +2235,7 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
     }
 
     if let Some(constructor) = constructor
-        && let Some(error) =
-            validate_constructor_state_fields(constructor, &fields, &mut state_fields)
+        && let Some(error) = validate_constructor_state_fields(constructor, &mut fields)
     {
         return Some(error);
     }
@@ -2376,7 +2255,7 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
         let Some(name) = class_key_name(key) else {
             continue;
         };
-        let Some(field) = state_fields.get(&name) else {
+        let Some(field) = fields.state_field(name.as_ref()) else {
             continue;
         };
         if std::ptr::eq(member, field.node) {
@@ -2398,7 +2277,7 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
     }
 
     if let Some(constructor) = constructor {
-        return find_constructor_state_assignment_before_declaration(constructor, &state_fields);
+        return find_constructor_state_assignment_before_declaration(constructor, &fields);
     }
 
     None
@@ -2406,8 +2285,7 @@ fn validate_class_body<'a>(body: &'a EstreeNode) -> Option<ClassStateFieldError>
 
 fn validate_constructor_state_fields<'a>(
     constructor: &'a EstreeNode,
-    fields: &HashMap<Arc<str>, Vec<FieldKind>>,
-    state_fields: &mut HashMap<Arc<str>, StateField<'a>>,
+    fields: &mut ClassFieldIndex<'a>,
 ) -> Option<ClassStateFieldError> {
     let function = estree_node_field_object(constructor, RawField::Value)?;
     let body = estree_node_field_object(function, RawField::Body)?;
@@ -2432,7 +2310,7 @@ fn validate_constructor_state_fields<'a>(
         let Some(name) = this_member_name(left) else {
             continue;
         };
-        if let Some(error) = record_state_field(expression, &name, fields, state_fields) {
+        if let Some(error) = fields.record_state_field(expression, &name) {
             return Some(error);
         }
     }
@@ -2442,7 +2320,7 @@ fn validate_constructor_state_fields<'a>(
 
 fn find_constructor_state_assignment_before_declaration(
     constructor: &EstreeNode,
-    state_fields: &HashMap<Arc<str>, StateField<'_>>,
+    fields: &ClassFieldIndex<'_>,
 ) -> Option<ClassStateFieldError> {
     let function = estree_node_field_object(constructor, RawField::Value)?;
     let body = estree_node_field_object(function, RawField::Body)?;
@@ -2467,7 +2345,7 @@ fn find_constructor_state_assignment_before_declaration(
         let Some(name) = this_member_name(left) else {
             return;
         };
-        let Some(field) = state_fields.get(&name) else {
+        let Some(field) = fields.state_field(name.as_ref()) else {
             return;
         };
         if estree_node_type(field.node) != Some("AssignmentExpression")
@@ -2492,30 +2370,6 @@ fn find_constructor_state_assignment_before_declaration(
     });
 
     found
-}
-
-fn record_state_field<'a>(
-    node: &'a EstreeNode,
-    name: &Arc<str>,
-    fields: &HashMap<Arc<str>, Vec<FieldKind>>,
-    state_fields: &mut HashMap<Arc<str>, StateField<'a>>,
-) -> Option<ClassStateFieldError> {
-    let Some(value) = estree_node_value(node) else {
-        return None;
-    };
-    if !is_state_creation_call(value) {
-        return None;
-    }
-    if state_fields.contains_key(name) {
-        return Some(state_field_duplicate_error(node, name.clone()));
-    }
-    if let Some(kinds) = fields.get(name)
-        && !(kinds.len() == 1 && kinds[0] == FieldKind::Prop)
-    {
-        return Some(duplicate_class_field_error(node, name.clone()));
-    }
-    state_fields.insert(name.clone(), StateField { node });
-    None
 }
 
 fn estree_node_value(node: &EstreeNode) -> Option<&EstreeNode> {
@@ -2768,9 +2622,7 @@ fn detect_dollar_binding_error_in_program(
     {
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::GlobalReferenceInvalid {
-                ident: Arc::from(ident.as_str()),
-            },
+            CompilerDiagnosticKind::GlobalReferenceInvalid { ident },
             start,
             end,
         ));
@@ -2815,20 +2667,11 @@ fn find_dollar_binding_invalid_declaration(
     found
 }
 
-fn path_has_function_scope(path: &[PathStep<'_>]) -> bool {
-    path.iter().any(|step| {
-        matches!(
-            estree_node_type(step.parent),
-            Some("FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression")
-        )
-    })
-}
-
 fn find_invalid_global_reference_in_fragment(
     fragment: &Fragment,
     runes_mode: bool,
     instance: Option<&EstreeNode>,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Arc<str>, usize, usize)> {
     fragment.find_map(|entry| {
         let node = entry.as_node()?;
         match node {
@@ -2878,7 +2721,7 @@ fn find_invalid_global_reference_in_each_block(
     block: &EachBlock,
     runes_mode: bool,
     instance: Option<&EstreeNode>,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Arc<str>, usize, usize)> {
     find_invalid_global_rune_reference_in_node_with_program(
         &block.expression.0,
         runes_mode,
@@ -2902,7 +2745,7 @@ fn find_invalid_global_reference_in_await_block(
     block: &crate::ast::modern::AwaitBlock,
     runes_mode: bool,
     instance: Option<&EstreeNode>,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Arc<str>, usize, usize)> {
     find_invalid_global_rune_reference_in_node_with_program(
         &block.expression.0,
         runes_mode,
@@ -2924,7 +2767,7 @@ fn find_invalid_global_reference_in_attributes(
     attributes: &[Attribute],
     runes_mode: bool,
     instance: Option<&EstreeNode>,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Arc<str>, usize, usize)> {
     for attribute in attributes {
         let found = match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
@@ -3009,7 +2852,7 @@ fn find_invalid_global_reference_in_attributes(
 fn find_invalid_global_rune_reference_in_node(
     node: &EstreeNode,
     runes_mode: bool,
-) -> Option<(String, usize, usize)> {
+) -> Option<(Arc<str>, usize, usize)> {
     find_invalid_global_rune_reference_in_node_with_program(node, runes_mode, None)
 }
 
@@ -3017,8 +2860,8 @@ fn find_invalid_global_rune_reference_in_node_with_program(
     node: &EstreeNode,
     runes_mode: bool,
     program: Option<&EstreeNode>,
-) -> Option<(String, usize, usize)> {
-    let mut found = None::<(String, usize, usize)>;
+) -> Option<(Arc<str>, usize, usize)> {
+    let mut found = None::<(Arc<str>, usize, usize)>;
     walk_estree_node_with_path(node, &mut Vec::new(), &mut |node, path| {
         if found.is_some() {
             return;
@@ -3037,7 +2880,7 @@ fn find_invalid_global_rune_reference_in_node_with_program(
                     return;
                 }
                 if let Some((start, end)) = estree_node_span(node) {
-                    found = Some((name.to_string(), start, end));
+                    found = Some((Arc::from(name), start, end));
                 }
             }
             Some("CallExpression") => {
@@ -3049,7 +2892,7 @@ fn find_invalid_global_rune_reference_in_node_with_program(
                     && let Some(object) = estree_node_field_object(callee, RawField::Object)
                     && let Some(object_name) = raw_identifier_name(object)
                     && matches!(
-                        object_name.as_str(),
+                        object_name.as_ref(),
                         "$state" | "$effect" | "$derived" | "$inspect"
                     )
                 {
@@ -3060,7 +2903,7 @@ fn find_invalid_global_rune_reference_in_node_with_program(
                 let Some(name) = raw_callee_name(callee) else {
                     return;
                 };
-                if !name.starts_with('$') || is_allowed_rune_name(name.as_str()) {
+                if !name.starts_with('$') || is_allowed_rune_name(name.as_ref()) {
                     return;
                 }
                 if legacy_dollar_callee_is_allowed(
@@ -3177,7 +3020,7 @@ fn find_render_tag_error_in_fragment(fragment: &Fragment) -> Option<RenderTagDia
 
 fn find_store_invalid_scoped_subscription(
     fragment: &Fragment,
-    scoped_aliases: &mut Vec<String>,
+    scoped_aliases: &mut AliasStack,
 ) -> Option<(usize, usize)> {
     fragment.walk(
         scoped_aliases,
@@ -3265,15 +3108,12 @@ fn find_store_invalid_scoped_subscription(
                     &block.expression,
                     scoped_aliases,
                 ),
-                _ => {
-                    let Some(element) = node.as_element() else {
-                        return Search::Continue;
-                    };
+                _ => node.as_element().and_then(|element| {
                     find_store_invalid_scoped_subscription_in_attributes(
                         element.attributes(),
                         scoped_aliases,
                     )
-                }
+                }),
             };
 
             match found {
@@ -3296,7 +3136,7 @@ fn find_store_invalid_scoped_subscription(
 
 fn find_store_invalid_scoped_subscription_in_attributes(
     attributes: &[Attribute],
-    scoped_aliases: &[String],
+    scoped_aliases: &AliasStack,
 ) -> Option<(usize, usize)> {
     for attribute in attributes.iter() {
         match attribute {
@@ -3390,7 +3230,7 @@ fn find_store_invalid_scoped_subscription_in_attributes(
 
 fn find_store_invalid_scoped_subscription_in_expression(
     expression: &Expression,
-    scoped_aliases: &[String],
+    scoped_aliases: &AliasStack,
 ) -> Option<(usize, usize)> {
     let mut found = None::<(usize, usize)>;
     walk_estree_node_with_path(&expression.0, &mut Vec::new(), &mut |node, path| {
@@ -3452,7 +3292,9 @@ fn find_store_invalid_scoped_subscription_in_program(
         let Some((start, end)) = estree_node_span(node) else {
             return;
         };
-        if let Some(span) = scoped_store_identifier_span_in_path(name, start, end, &[], path) {
+        if let Some(span) =
+            scoped_store_identifier_span_in_path(name, start, end, &AliasStack::default(), path)
+        {
             keep_earliest_span(&mut found, span);
         }
     });
@@ -3470,13 +3312,13 @@ fn scoped_store_identifier_span(
     identifier: &str,
     start: usize,
     end: usize,
-    scoped_aliases: &[String],
+    scoped_aliases: &AliasStack,
 ) -> Option<(usize, usize)> {
     let alias = identifier.strip_prefix('$')?;
     if alias.is_empty() {
         return None;
     }
-    if scoped_aliases.iter().any(|name| name == alias) {
+    if scoped_aliases.contains(alias) {
         return Some((start, end));
     }
     None
@@ -3486,16 +3328,14 @@ fn scoped_store_identifier_span_in_path(
     identifier: &str,
     start: usize,
     end: usize,
-    scoped_aliases: &[String],
+    scoped_aliases: &AliasStack,
     path: &[PathStep<'_>],
 ) -> Option<(usize, usize)> {
     let alias = identifier.strip_prefix('$')?;
     if alias.is_empty() {
         return None;
     }
-    if scoped_aliases.iter().any(|name| name == alias)
-        || is_shadowed_store_alias_in_path(alias, path)
-    {
+    if scoped_aliases.contains(alias) || is_shadowed_store_alias_in_path(alias, path) {
         return Some((start, end));
     }
     None
@@ -3559,7 +3399,7 @@ fn function_scope_declares_alias(function: &EstreeNode, alias: &str) -> bool {
             let EstreeValue::Object(param) = param else {
                 return false;
             };
-            pattern_binds_alias(param, alias)
+            pattern_binds_name(param, alias)
         })
     {
         return true;
@@ -3581,7 +3421,7 @@ fn statement_declares_alias(statement: &EstreeNode, alias: &str) -> bool {
         Some("FunctionDeclaration" | "ClassDeclaration") => {
             estree_node_field_object(statement, RawField::Id)
                 .and_then(raw_identifier_name)
-                .is_some_and(|name| name == alias)
+                .is_some_and(|name| name.as_ref() == alias)
         }
         Some("ForStatement" | "ForInStatement" | "ForOfStatement") => {
             scope_declares_alias(statement, alias)
@@ -3601,7 +3441,7 @@ fn variable_declaration_declares_alias(declaration: &EstreeNode, alias: &str) ->
         let Some(id) = estree_node_field_object(declarator, RawField::Id) else {
             return false;
         };
-        pattern_binds_alias(id, alias)
+        pattern_binds_name(id, alias)
     })
 }
 
@@ -3611,45 +3451,7 @@ fn node_or_declaration_declares_alias(value: &EstreeValue, alias: &str) -> bool 
     };
     match estree_node_type(node) {
         Some("VariableDeclaration") => variable_declaration_declares_alias(node, alias),
-        _ => pattern_binds_alias(node, alias),
-    }
-}
-
-fn pattern_binds_alias(pattern: &EstreeNode, alias: &str) -> bool {
-    match estree_node_type(pattern) {
-        Some("Identifier") => estree_node_field_str(pattern, RawField::Name) == Some(alias),
-        Some("RestElement") => estree_node_field_object(pattern, RawField::Argument)
-            .is_some_and(|argument| pattern_binds_alias(argument, alias)),
-        Some("AssignmentPattern") => estree_node_field_object(pattern, RawField::Left)
-            .is_some_and(|left| pattern_binds_alias(left, alias)),
-        Some("ArrayPattern") => {
-            estree_node_field_array(pattern, RawField::Elements).is_some_and(|elements| {
-                elements.iter().any(|element| {
-                    let EstreeValue::Object(element) = element else {
-                        return false;
-                    };
-                    pattern_binds_alias(element, alias)
-                })
-            })
-        }
-        Some("ObjectPattern") => estree_node_field_array(pattern, RawField::Properties)
-            .is_some_and(|properties| {
-                properties.iter().any(|property| {
-                    let EstreeValue::Object(property) = property else {
-                        return false;
-                    };
-                    match estree_node_type(property) {
-                        Some("Property") => estree_node_field_object(property, RawField::Value)
-                            .is_some_and(|value| pattern_binds_alias(value, alias)),
-                        Some("RestElement") => {
-                            estree_node_field_object(property, RawField::Argument)
-                                .is_some_and(|argument| pattern_binds_alias(argument, alias))
-                        }
-                        _ => false,
-                    }
-                })
-            }),
-        _ => false,
+        _ => pattern_binds_name(node, alias),
     }
 }
 
@@ -3718,12 +3520,4 @@ fn unwrap_optional_expression(raw: &EstreeNode) -> &EstreeNode {
         return estree_node_field_object(raw, RawField::Expression).unwrap_or(raw);
     }
     raw
-}
-
-fn raw_member_property_name(node: &EstreeNode) -> Option<String> {
-    if estree_node_type(node) != Some("MemberExpression") {
-        return None;
-    }
-    let property = estree_node_field_object(node, RawField::Property)?;
-    raw_identifier_name(property)
 }

@@ -29,6 +29,7 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smallvec.workspace = true
+svelte-syntax = { version = "0.1.0", path = "../svelte-syntax" }
 thiserror.workspace = true
 tree-sitter.workspace = true
 tree-sitter-svelte.workspace = true
@@ -37,4 +38,4 @@ winnow.workspace = true
 
 [dev-dependencies]
 datatest-stable.workspace = true
-svelte-test-fixtures = { path = "../svelte-test-fixtures" }
+svelte-test-fixtures = { version = "0.1.0", path = "../svelte-test-fixtures" }

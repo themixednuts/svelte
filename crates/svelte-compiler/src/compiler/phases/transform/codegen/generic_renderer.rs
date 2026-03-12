@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 
 use camino::Utf8Path;
 
-use crate::api::GenerateTarget;
 use crate::api::modern::{
     RawField, estree_node_field_array, estree_node_field_object, estree_node_type,
 };
@@ -18,33 +17,26 @@ const TEMPLATE_COMPONENT_CLIENT: &str = include_str!("templates/component.client
 const TEMPLATE_COMPONENT_SERVER: &str = include_str!("templates/component.server.js");
 
 pub(crate) trait RenderBackend {
-    const TARGET: GenerateTarget;
     const TEMPLATE: &'static str;
 }
 
 pub(crate) struct ClientRenderBackend;
 
 impl RenderBackend for ClientRenderBackend {
-    const TARGET: GenerateTarget = GenerateTarget::Client;
     const TEMPLATE: &'static str = TEMPLATE_COMPONENT_CLIENT;
 }
 
 pub(crate) struct ServerRenderBackend;
 
 impl RenderBackend for ServerRenderBackend {
-    const TARGET: GenerateTarget = GenerateTarget::Server;
     const TEMPLATE: &'static str = TEMPLATE_COMPONENT_SERVER;
 }
 
 pub(crate) fn compile_generic_markup_js<B: RenderBackend>(
     _source: &str,
-    target: GenerateTarget,
     root: &Root,
     filename: Option<&Utf8Path>,
 ) -> Option<String> {
-    if target != B::TARGET {
-        return None;
-    }
     let component_name = component_name_from_filename(filename);
     let scripts = collect_script_sections(root)?;
 

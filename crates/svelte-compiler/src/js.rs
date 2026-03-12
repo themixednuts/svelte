@@ -411,7 +411,7 @@ impl Renderer {
     }
 
     fn sequence(&self, node: &EstreeNode) -> Option<String> {
-        Some(self.join_array(node, "expressions")?)
+        self.join_array(node, "expressions")
     }
 
     fn arrow(&self, node: &EstreeNode) -> Option<String> {
@@ -947,13 +947,11 @@ impl Renderer {
     }
 
     fn params(&self, node: &EstreeNode) -> Option<Vec<String>> {
-        Some(
-            field_array(node, "params")
-                .unwrap_or(&[])
-                .iter()
-                .map(|value| self.value(value))
-                .collect::<Option<Vec<_>>>()?,
-        )
+        field_array(node, "params")
+            .unwrap_or(&[])
+            .iter()
+            .map(|value| self.value(value))
+            .collect::<Option<Vec<_>>>()
     }
 
     fn value(&self, value: &EstreeValue) -> Option<String> {

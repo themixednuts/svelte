@@ -1,14 +1,13 @@
-mod css;
-mod cst;
 mod oxc;
 mod regions;
 
 use std::sync::Arc;
 
 use crate::api::ParseOptions;
-use crate::ast::modern::{EstreeNode, Expression, Root};
+use crate::ast::modern::{EstreeNode, Root};
 use crate::ast::{CssAst, Document};
 use crate::error::CompileError;
+use crate::{SourceId, SourceText};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedComponent {
@@ -47,21 +46,35 @@ pub(crate) fn parse_component(
     source: &str,
     options: ParseOptions,
 ) -> Result<Document, CompileError> {
-    cst::SvelteParserCore::new(source, options).parse()
+    let syntax_options = syntax_parse_options(options);
+    let parsed = svelte_syntax::parse(source, syntax_options)?;
+    let source_arc = Arc::<str>::from(parsed.source());
+
+    Ok(Document {
+        root: parsed.root,
+        source: source_arc,
+    })
 }
 
 pub(crate) fn parse_component_for_compile(source: &str) -> Result<ParsedComponent, CompileError> {
-    let normalized = source.replace('\r', "");
-    let root = cst::parse_root_for_compile(normalized.as_str())?;
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    parse_component_for_compile_source(source_text)
+}
+
+pub(crate) fn parse_component_for_compile_source(
+    source_text: SourceText<'_>,
+) -> Result<ParsedComponent, CompileError> {
+    let root = svelte_syntax::parse_modern_root(source_text.text)
+        .map_err(|error| error.with_source_text(source_text))?;
 
     Ok(ParsedComponent {
-        source: Arc::from(normalized),
+        source: Arc::from(source_text.text),
         root,
     })
 }
 
 pub(crate) fn parse_css(source: &str) -> Result<CssAst, CompileError> {
-    css::parse_css_stylesheet(source)
+    svelte_syntax::parse_css(source)
 }
 
 pub(crate) fn parse_modern_css_nodes(
@@ -69,7 +82,7 @@ pub(crate) fn parse_modern_css_nodes(
     start: usize,
     end: usize,
 ) -> Vec<crate::ast::modern::CssNode> {
-    css::parse_modern_css_nodes(source, start, end)
+    svelte_syntax::parse_modern_css_nodes(source, start, end)
 }
 
 pub(crate) fn parse_js_import_ranges_for_compile(source: &str) -> Option<Vec<(usize, usize)>> {
@@ -90,6 +103,19 @@ pub(crate) fn non_module_script_content_ranges(root: &Root) -> Vec<(usize, usize
 
 pub(crate) fn style_block_ranges(root: &Root) -> Vec<(usize, usize, usize, usize)> {
     regions::style_block_ranges(root)
+}
+
+fn syntax_parse_options(options: ParseOptions) -> svelte_syntax::ParseOptions {
+    svelte_syntax::ParseOptions {
+        filename: options.filename,
+        root_dir: options.root_dir,
+        modern: options.modern,
+        mode: match options.mode {
+            crate::api::ParseMode::Legacy => svelte_syntax::ParseMode::Legacy,
+            crate::api::ParseMode::Modern => svelte_syntax::ParseMode::Modern,
+        },
+        loose: options.loose,
+    }
 }
 
 pub(crate) fn parse_modern_program_content_with_offsets(
@@ -113,60 +139,6 @@ pub(crate) fn parse_modern_program_content_with_offsets(
         .parse_program_for_compile()
 }
 
-pub(crate) fn parse_modern_expression_with_oxc(
-    expression: &str,
-    global_start: usize,
-    base_line: usize,
-    base_column: usize,
-) -> Option<Expression> {
-    oxc::SvelteOxcParser::new(expression)
-        .with_offsets(oxc::OxcProgramOffsets {
-            global_start,
-            start_line: base_line,
-            start_column: base_column,
-            end_line: base_line,
-            end_column: base_column + expression.len(),
-        })
-        .with_typescript(true)
-        .parse_expression_for_template()
-}
-
-pub(crate) fn parse_modern_expression_error_with_oxc(
-    expression: &str,
-    global_start: usize,
-    base_line: usize,
-    base_column: usize,
-) -> Option<Arc<str>> {
-    oxc::SvelteOxcParser::new(expression)
-        .with_offsets(oxc::OxcProgramOffsets {
-            global_start,
-            start_line: base_line,
-            start_column: base_column,
-            end_line: base_line,
-            end_column: base_column + expression.len(),
-        })
-        .with_typescript(true)
-        .parse_expression_error_for_template()
-}
-
-pub(crate) fn parse_modern_expression_error_detail_with_oxc(
-    expression: &str,
-    global_start: usize,
-    base_line: usize,
-    base_column: usize,
-) -> Option<(usize, Arc<str>)> {
-    oxc::SvelteOxcParser::new(expression)
-        .with_offsets(oxc::OxcProgramOffsets {
-            global_start,
-            start_line: base_line,
-            start_column: base_column,
-            end_line: base_line,
-            end_column: base_column + expression.len(),
-        })
-        .with_typescript(true)
-        .parse_expression_error_detail_for_template()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -181,7 +153,7 @@ mod tests {
         let parsed: super::ParsedComponent =
             super::parse_component_for_compile("<h1>Hello</h1>").expect("parse component");
 
-        fn source<'a, T: AsRef<str>>(value: &'a T) -> &'a str {
+        fn source<T: AsRef<str>>(value: &T) -> &str {
             value.as_ref()
         }
 
@@ -195,6 +167,32 @@ mod tests {
         let (source, root) = parsed.clone().into_parts();
         assert_eq!(source, Arc::<str>::from("<h1>Hello</h1>"));
         assert_eq!(root.start, 0);
+    }
+
+    #[test]
+    fn node_child_fragment_helpers_visit_direct_child_fragments() {
+        let parsed = super::parse_component_for_compile(
+            "{#if foo}<p>one</p>{:else if bar}<p>two</p>{:else}<p>three</p>{/if}",
+        )
+        .expect("parse component");
+
+        let Some(node) = parsed.root.fragment.nodes.first() else {
+            panic!("expected a top-level node");
+        };
+        let Node::IfBlock(_) = node else {
+            panic!("expected an if block");
+        };
+
+        let mut fragment_lengths = Vec::new();
+        node.for_each_child_fragment(|fragment| fragment_lengths.push(fragment.nodes.len()));
+
+        assert_eq!(fragment_lengths, vec![1, 1]);
+
+        let stopped = node.try_for_each_child_fragment(|fragment| {
+            std::ops::ControlFlow::Break(fragment.nodes.len())
+        });
+
+        assert_eq!(stopped, std::ops::ControlFlow::Break(1));
     }
 
     fn first_attribute(source: &str) -> Attribute {
@@ -640,7 +638,7 @@ mod tests {
         else {
             panic!("expected each block");
         };
-        let Some(crate::ast::modern::Node::ConstTag(tag)) = block.body.nodes.get(0) else {
+        let Some(crate::ast::modern::Node::ConstTag(tag)) = block.body.nodes.first() else {
             panic!("expected const tag");
         };
 

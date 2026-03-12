@@ -551,24 +551,28 @@ fn render_node(source: &str, node: &Node) -> Rendered {
             }
         }
         Node::SvelteElement(el) => rendered(render_element_with_this(
-            source,
-            el.start,
-            el.end,
-            &el.name,
-            &el.attributes,
-            &el.fragment,
+            ElementRender {
+                source,
+                start: el.start,
+                end: el.end,
+                name: &el.name,
+                attributes: &el.attributes,
+                fragment: &el.fragment,
+                component: false,
+            },
             el.expression.as_ref(),
-            false,
         )),
         Node::SvelteComponent(el) => rendered(render_element_with_this(
-            source,
-            el.start,
-            el.end,
-            &el.name,
-            &el.attributes,
-            &el.fragment,
+            ElementRender {
+                source,
+                start: el.start,
+                end: el.end,
+                name: &el.name,
+                attributes: &el.attributes,
+                fragment: &el.fragment,
+                component: true,
+            },
             el.expression.as_ref(),
-            true,
         )),
         Node::IfBlock(block) => rendered(render_if_block(source, block)),
         Node::EachBlock(block) => rendered(render_each_block(source, block)),
@@ -735,63 +739,40 @@ fn render_element(
     fragment: &Fragment,
     component: bool,
 ) -> String {
-    let mut out = format!("<{name}");
-    let attrs = render_attributes(source, attributes, 0);
-    out.push_str(&attrs.text);
-
-    let is_doctype = name.eq_ignore_ascii_case("!doctype");
-    let component_like = component
-        || matches!(
-            classify_element_name(name),
-            ElementKind::Svelte(SvelteElementKind::Component)
-        );
-    let is_self_closing =
-        is_void_element_name(name) || (component_like && fragment.nodes.is_empty());
-
-    if is_doctype {
-        out.push('>');
-        return out;
-    }
-
-    if is_self_closing {
-        if attrs.multiline {
-            out.push_str("/>");
-        } else {
-            out.push_str(" />");
-        }
-        return out;
-    }
-
-    out.push('>');
-    let allow_inline = !matches!(
-        classify_element_name(name),
-        ElementKind::Svelte(SvelteElementKind::Element)
-    );
-    if fragment.nodes.is_empty()
-        && let Some(inner) = extract_raw_element_inner(source, start, end, name)
-        && !inner.trim().is_empty()
-    {
-        out.push_str(inner.trim());
-    } else {
-        out.push_str(&render_block(source, fragment, allow_inline));
-    }
-    out.push_str("</");
-    out.push_str(name);
-    out.push('>');
-    out
+    render_element_core(
+        ElementRender {
+            source,
+            start,
+            end,
+            name,
+            attributes,
+            fragment,
+            component,
+        },
+        None,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_element_with_this(
-    source: &str,
+struct ElementRender<'a> {
+    source: &'a str,
     start: usize,
     end: usize,
-    name: &str,
-    attributes: &[Attribute],
-    fragment: &Fragment,
-    expression: Option<&Expression>,
+    name: &'a str,
+    attributes: &'a [Attribute],
+    fragment: &'a Fragment,
     component: bool,
-) -> String {
+}
+
+fn render_element_core(element: ElementRender<'_>, expression: Option<&Expression>) -> String {
+    let ElementRender {
+        source,
+        start,
+        end,
+        name,
+        attributes,
+        fragment,
+        component,
+    } = element;
     let mut out = format!("<{name}");
 
     // Render `this={expression}` first if present
@@ -836,6 +817,10 @@ fn render_element_with_this(
     out.push_str(name);
     out.push('>');
     out
+}
+
+fn render_element_with_this(element: ElementRender<'_>, expression: Option<&Expression>) -> String {
+    render_element_core(element, expression)
 }
 
 struct RenderedAttributes {
@@ -1344,7 +1329,28 @@ fn is_identifier(text: &str) -> bool {
 }
 
 fn has_blank_line(text: &str) -> bool {
-    text.replace('\r', "").contains("\n\n")
+    let mut saw_newline = false;
+    let mut only_whitespace_since_newline = true;
+
+    for ch in text.chars() {
+        match ch {
+            '\n' => {
+                if saw_newline && only_whitespace_since_newline {
+                    return true;
+                }
+                saw_newline = true;
+                only_whitespace_since_newline = true;
+            }
+            '\r' => {}
+            _ if ch.is_whitespace() => {}
+            _ => {
+                saw_newline = false;
+                only_whitespace_since_newline = false;
+            }
+        }
+    }
+
+    false
 }
 
 fn strip_prefix_whitespace(text: &str, max: usize) -> &str {
@@ -1443,4 +1449,20 @@ fn rendered_comment(text: String) -> Rendered {
     let mut value = rendered(text);
     value.is_comment = true;
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_blank_line;
+
+    #[test]
+    fn single_crlf_gap_is_not_a_blank_line() {
+        assert!(!has_blank_line("\r\n    "));
+    }
+
+    #[test]
+    fn double_line_break_counts_as_blank_line() {
+        assert!(has_blank_line("\r\n\r\n    "));
+        assert!(has_blank_line("\n  \n"));
+    }
 }
