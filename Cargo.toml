@@ -2,18 +2,18 @@
 resolver = "3"
 members = [
   "crates/kit",
-  "crates/svelte-cli",
-  "crates/svelte-compiler",
-  "crates/svelte-compiler-napi",
-  "crates/svelte-syntax",
-  "crates/svelte-vite-rolldown",
-  "crates/svelte-vite-rolldown-napi",
+  "crates/cli",
+  "crates/compiler",
+  "crates/compiler-napi",
+  "crates/syntax",
+  "crates/vite-rolldown",
+  "crates/vite-rolldown-napi",
   "crates/svelte-test-fixtures",
 ]
-default-members = ["crates/svelte-cli", "crates/svelte-compiler"]
+default-members = ["crates/cli", "crates/compiler"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -23,6 +23,7 @@ repository = "https://github.com/themixednuts/svelte"
 [workspace.dependencies]
 anyhow = "1.0.100"
 aria-query = "0.0.6"
+base64 = "0.22.1"
 biome_aria = "0.5.7"
 biome_aria_metadata = "0.5.7"
 bumpalo = { version = "3.17.0", features = ["collections"] }
@@ -34,21 +35,28 @@ memchr = "2.8.0"
 html-escape = "0.2.13"
 lightningcss = { version = "1.0.0-alpha.70", default-features = false }
 miette = { version = "7.6.0", features = ["fancy"] }
-oxc_allocator = "=0.115.0"
-oxc_ast = { version = "=0.115.0", features = ["serialize"] }
-oxc_ast_visit = { version = "=0.115.0", features = ["serialize"] }
-oxc_estree = { version = "=0.115.0", features = ["serialize"] }
-oxc_parser = "=0.115.0"
-oxc_span = "=0.115.0"
+oxc_allocator = "0.118.0"
+oxc_ast = { version = "0.118.0", features = ["serialize"] }
+oxc_ast_visit = { version = "0.118.0", features = ["serialize"] }
+oxc_diagnostics = "0.118.0"
+oxc_codegen = "0.118.0"
+oxc_estree = { version = "0.118.0", features = ["serialize"] }
+oxc_parser = "0.118.0"
+oxc_span = "0.118.0"
+oxc_syntax = "0.118.0"
 napi = "=3.8.3"
 napi-derive = "=3.5.2"
 napi-build = "=2.3.1"
 regex = "1.11.1"
+rayon = "1.11.0"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = "1.0.149"
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+self_cell = "1.2.2"
 rustc-hash = "1.1.0"
 smallvec = "1.15.1"
-svelte-syntax = { version = "0.1.1", path = "crates/svelte-syntax" }
+svelte-compiler = { version = "0.1.1", path = "crates/compiler" }
+svelte-syntax = { version = "0.1.1", path = "crates/syntax" }
+svelte-vite-rolldown = { version = "0.1.1", path = "crates/vite-rolldown" }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
 tower-lsp-server = "0.23.0"
