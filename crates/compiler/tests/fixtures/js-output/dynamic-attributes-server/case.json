@@ -1,0 +1,9 @@
+{
+  "kind": "component",
+  "options": {
+    "filename": "main.svelte",
+    "generate": "server",
+    "css": "external",
+    "discloseVersion": true
+  }
+}

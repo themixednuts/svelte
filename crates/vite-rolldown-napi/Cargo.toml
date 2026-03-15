@@ -1,0 +1,22 @@
+[package]
+name = "svelte-vite-rolldown-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+path = "src/lib.rs"
+
+[dependencies]
+napi.workspace = true
+napi-derive.workspace = true
+serde_json.workspace = true
+svelte-compiler.workspace = true
+svelte-vite-rolldown.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true

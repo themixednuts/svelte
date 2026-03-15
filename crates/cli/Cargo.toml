@@ -1,0 +1,22 @@
+[package]
+name = "svelte"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Unified Svelte Rust binary"
+
+[[bin]]
+name = "svelte"
+path = "src/main.rs"
+
+[dependencies]
+camino.workspace = true
+clap.workspace = true
+miette.workspace = true
+serde_json.workspace = true
+svelte-compiler = { workspace = true }
+tokio.workspace = true
+tower-lsp-server.workspace = true

@@ -1,0 +1,20 @@
+{
+  "name": "@mixednuts/svelte-vite-native",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native Node-API wrapper for the Rust Svelte Vite bridge",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "dependencies": {
+    "@jridgewell/remapping": "^2.3.5",
+    "@jridgewell/sourcemap-codec": "^1.5.5",
+    "locate-character": "^3.0.0"
+  },
+  "scripts": {
+    "build": "node -e \"\"",
+    "check": "node --check ./index.js"
+  }
+}

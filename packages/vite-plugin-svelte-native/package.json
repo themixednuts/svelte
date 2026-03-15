@@ -1,0 +1,34 @@
+{
+  "name": "@mixednuts/vite-plugin-svelte-native",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Native Vite plugin for Svelte",
+  "types": "./src/public.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/public.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "scripts": {
+    "check": "node --check ./src/index.js && node --test ./src/index.test.js ./src/parity.test.js"
+  },
+  "engines": {
+    "node": "^20.19 || ^22.12 || >=24"
+  },
+  "dependencies": {
+    "@mixednuts/svelte-vite-native": "file:../svelte-vite-native",
+    "deepmerge": "^4.3.1",
+    "obug": "^2.1.0",
+    "vitefu": "^1.1.2"
+  },
+  "peerDependencies": {
+    "svelte": "^5.46.4",
+    "vite": "^8.0.0-beta.7 || ^8.0.0"
+  },
+  "devDependencies": {
+    "svelte": "^5.46.4",
+    "vite": "^8.0.0-beta.7"
+  }
+}

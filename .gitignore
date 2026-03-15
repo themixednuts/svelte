@@ -22,11 +22,13 @@ coverage
 .DS_Store
 
 tmp
+.tmp
 .claude/
 .codemogger/
 /svelte/
 /kit/
 /svelte-language-tools/
+/vite-plugin-svelte/
 packages/svelte-compiler-napi/.native/
 
 benchmarking/compare/.results

@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "schemaVersion": 1,
+    "generatedAt": "2026-03-12T07:26:30.436Z",
+    "rustCrateVersion": "0.1.1",
+    "rustSvelteVersion": "5.53.9",
+    "jsPackageVersion": "5.53.9",
+    "nodeVersion": "v25.6.1",
+    "caseName": "function-prop-no-getter-client"
+  },
+  "case": {
+    "kind": "component",
+    "options": {
+      "filename": "index.svelte",
+      "generate": "client",
+      "css": "external",
+      "discloseVersion": true
+    }
+  },
+  "expected": {
+    "js": {
+      "code": "import 'svelte/internal/disclose-version';\nimport * as $ from 'svelte/internal/client';\n\nexport default function Index($$anchor) {\n\tlet count = $.state(0);\n\n\tfunction onmouseup() {\n\t\t$.set(count, $.get(count) + 2);\n\t}\n\n\tconst plusOne = (num) => num + 1;\n\n\tButton($$anchor, {\n\t\tonmousedown: () => $.set(count, $.get(count) + 1),\n\t\tonmouseup,\n\t\tonmouseenter: () => $.set(count, plusOne($.get(count)), true),\n\t\tchildren: ($$anchor, $$slotProps) => {\n\t\t\t$.next();\n\n\t\t\tvar text = $.text();\n\n\t\t\t$.template_effect(() => $.set_text(text, `clicks: ${$.get(count) ?? ''}`));\n\t\t\t$.append($$anchor, text);\n\t\t},\n\t\t$$slots: { default: true }\n\t});\n}"
+    },
+    "css": null,
+    "warnings": [],
+    "metadata": {
+      "runes": true
+    }
+  }
+}

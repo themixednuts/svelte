@@ -27,6 +27,7 @@ impl FixtureCase {
         Ok(None)
     }
 
+    #[must_use]
     pub fn has_file(&self, relative_path: &str) -> bool {
         self.path.join(relative_path).exists()
     }
@@ -81,9 +82,8 @@ pub fn discover_suite_cases_by_name(
             continue;
         }
 
-        let path = match Utf8PathBuf::from_path_buf(entry.path()) {
-            Ok(path) => path,
-            Err(_) => continue,
+        let Ok(path) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
         };
 
         let name = entry.file_name().to_string_lossy().to_string();

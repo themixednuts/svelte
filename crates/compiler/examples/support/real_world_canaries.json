@@ -1,0 +1,39 @@
+{
+  "repositories": [
+    {
+      "name": "immich",
+      "url": "https://github.com/immich-app/immich.git",
+      "commit": "6c531e0a5a34af52b676bf0c5d1e2be8bee8f985",
+      "subdir": "web",
+      "maxFiles": 12
+    },
+    {
+      "name": "coolify",
+      "url": "https://github.com/coollabsio/coolify.git",
+      "commit": "ce076817d2806caa42aa8834091ab06f22f59c1e",
+      "subdir": "apps/ui",
+      "maxFiles": 12
+    },
+    {
+      "name": "cobalt",
+      "url": "https://github.com/imputnet/cobalt.git",
+      "commit": "a62d73499348d6c822575fd117156c0edbfcb55e",
+      "subdir": "web",
+      "maxFiles": 12
+    },
+    {
+      "name": "vert",
+      "url": "https://github.com/VERT-sh/VERT.git",
+      "commit": "91542138686005a81045938b8839bfd992eeccfd",
+      "subdir": "sites/app",
+      "maxFiles": 12
+    },
+    {
+      "name": "chat-ui",
+      "url": "https://github.com/huggingface/chat-ui.git",
+      "commit": "46b74885c920ff52e8c7ec51c7cac23aac6de052",
+      "subdir": "src",
+      "maxFiles": 12
+    }
+  ]
+}

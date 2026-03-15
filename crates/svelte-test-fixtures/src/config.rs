@@ -73,7 +73,7 @@ fn evaluate_config_source<T: DeserializeOwned>(
     source: &str,
     case: &FixtureCase,
 ) -> io::Result<Option<T>> {
-    let script = r#"
+    let script = r"
 import fs from 'node:fs';
 
 function normalize(value, seen = new WeakSet()) {
@@ -132,7 +132,7 @@ try {
   process.stdout.write(JSON.stringify({ ok: false, error: String(error) }));
   process.exit(1);
 }
-"#;
+";
 
     let mut child = Command::new("node")
         .arg("--input-type=module")
@@ -203,10 +203,10 @@ fn parse_import_clause(clause: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    if let Some(rest) = clause.strip_prefix("*") {
-        if let Some(alias) = rest.trim().strip_prefix("as ") {
-            return vec![sanitize_ident(alias)];
-        }
+    if let Some(rest) = clause.strip_prefix("*")
+        && let Some(alias) = rest.trim().strip_prefix("as ")
+    {
+        return vec![sanitize_ident(alias)];
     }
 
     if clause.starts_with('{') {

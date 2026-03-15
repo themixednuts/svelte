@@ -1,0 +1,9 @@
+{
+  "kind": "component",
+  "options": {
+    "filename": "index.svelte",
+    "generate": "client",
+    "css": "external",
+    "discloseVersion": true
+  }
+}
