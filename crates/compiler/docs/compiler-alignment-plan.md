@@ -288,7 +288,7 @@ Rust uses `RegularElement`/`Component` with `name` to distinguish; JS uses dedic
 
 ### Attribute value (Attribute.value)
 
-| JS | Legacy Rust AttributeValueList | Modern Rust AttributeValueList | Status |
+| JS | Legacy Rust AttributeValueKind | Modern Rust AttributeValueKind | Status |
 |----|--------------------------------|-------------------------------|--------|
 | `true` (boolean) | `Boolean(bool)` | `Boolean(bool)` | OK |
 | `ExpressionTag` | `Values([MustacheTag])` | `ExpressionTag(ExpressionTag)` | OK |

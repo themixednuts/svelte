@@ -56,7 +56,7 @@ Compiler core should converge on explicit native primitives and trait-based ergo
 
 - `BytePos` and `Span` as canonical byte-offset range types.
 - `SourceId` for stable source identity across CST/AST/diagnostics.
-- line/column `SourceLocation` for human-facing diagnostics only.
+- line/column `LineColumn` for human-facing diagnostics only.
 - avoid ad-hoc `(start, end)` tuples in public contracts where primitives are available.
 
 Design expectations:
