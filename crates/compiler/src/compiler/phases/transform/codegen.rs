@@ -24,10 +24,45 @@ pub(crate) use generic_client::compile_generic_client_markup_js;
 pub(crate) use generic_server::compile_generic_server_markup_js;
 pub(crate) use static_markup::compile_static_markup_js;
 
+// ---------------------------------------------------------------------------
+// Shared codegen helpers
+// ---------------------------------------------------------------------------
+
+/// A source-range replacement: replace bytes `start..end` with `text`.
+#[derive(Debug)]
+pub(super) struct SourceReplacement {
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+impl SourceReplacement {
+    pub fn new(start: usize, end: usize, text: String) -> Self {
+        Self { start, end, text }
+    }
+
+    /// Build from an OXC `Span` (u32 offsets → usize).
+    pub fn from_span(span: Span, text: String) -> Self {
+        Self { start: span.start as usize, end: span.end as usize, text }
+    }
+
+    /// Deletion: replace a span with nothing.
+    pub fn delete(span: Span) -> Self {
+        Self::from_span(span, String::new())
+    }
+}
+
+/// Create an OXC `Codegen` pre-configured with our standard options and source text.
+pub(super) fn oxc_codegen_for<'a>(source: &'a str) -> Codegen<'a> {
+    Codegen::new()
+        .with_options(codegen_options())
+        .with_source_text(source)
+}
+
 const TEMPLATE_MODULE_CLIENT: &str = include_str!("codegen/templates/module.client.js");
 const TEMPLATE_MODULE_SERVER: &str = include_str!("codegen/templates/module.server.js");
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ComponentCodegenContext<'a> {
     pub(crate) source: &'a str,
     pub(crate) root: &'a Root,
@@ -45,14 +80,7 @@ pub(crate) fn compile_component_js_code(ctx: ComponentCodegenContext<'_>) -> Opt
         return Some(output);
     }
     if ctx.scoped_element_starts.is_empty()
-        && let Some(output) = compile_dynamic_markup_js(
-            ctx.source,
-            ctx.target,
-            ctx.root,
-            ctx.runes_mode,
-            ctx.hmr,
-            ctx.filename,
-        )
+        && let Some(output) = compile_dynamic_markup_js(&ctx)
     {
         return Some(output);
     }
@@ -187,9 +215,7 @@ fn render_module_statement_from_oxc(
 }
 
 fn render_statement_with_codegen(source: &str, statement: &Statement<'_>) -> String {
-    let mut codegen = Codegen::new()
-        .with_options(codegen_options())
-        .with_source_text(source);
+    let mut codegen = oxc_codegen_for(source);
     statement.print(&mut codegen, Context::default());
     codegen.into_source_text()
 }
@@ -260,7 +286,7 @@ pub(super) fn render_state_declaration_statement(
             GenerateTarget::Server => argument.render(source)?,
             GenerateTarget::None => continue,
         };
-        replacements.push((init.span(), replacement));
+        replacements.push(SourceReplacement::from_span(init.span(), replacement));
     }
 
     if replacements.is_empty() {
@@ -271,10 +297,7 @@ pub(super) fn render_state_declaration_statement(
     let mut rendered = replace_source_ranges(
         source,
         declaration_span,
-        replacements
-            .into_iter()
-            .map(|(span, replacement)| (span.start as usize, span.end as usize, replacement))
-            .collect(),
+        replacements,
     )?;
     if exported {
         rendered = format!("export {rendered}");
@@ -307,8 +330,7 @@ fn render_function_statement_with_state_rewrites(
         else {
             continue;
         };
-        let span = statement.span();
-        replacements.push((span.start as usize, span.end as usize, replacement));
+        replacements.push(SourceReplacement::from_span(statement.span(), replacement));
     }
 
     if replacements.is_empty() {
@@ -382,8 +404,8 @@ fn render_typescript_statement_source(
     let mut replacements = collect_typescript_strip_ranges(statement);
 
     if let Some((start, end)) = single_identifier_arrow_parameter_parens(statement) {
-        replacements.push((start as usize, start as usize + 1, String::new()));
-        replacements.push((end as usize - 1, end as usize, String::new()));
+        replacements.push(SourceReplacement::new(start as usize, start as usize + 1, String::new()));
+        replacements.push(SourceReplacement::new(end as usize - 1, end as usize, String::new()));
     }
 
     replace_source_ranges(source, statement_span, replacements).ok()
@@ -412,41 +434,29 @@ fn statement_is_typescript_only(statement: &Statement<'_>) -> bool {
     }
 }
 
-fn collect_typescript_strip_ranges(statement: &Statement<'_>) -> Vec<(usize, usize, String)> {
+fn collect_typescript_strip_ranges(statement: &Statement<'_>) -> Vec<SourceReplacement> {
     #[derive(Default)]
     struct TypeStripVisitor {
-        ranges: Vec<(usize, usize, String)>,
+        ranges: Vec<SourceReplacement>,
     }
 
     impl<'a> Visit<'a> for TypeStripVisitor {
         fn visit_ts_type_annotation(&mut self, annotation: &oxc_ast::ast::TSTypeAnnotation<'a>) {
-            self.ranges.push((
-                annotation.span.start as usize,
-                annotation.span.end as usize,
-                String::new(),
-            ));
+            self.ranges.push(SourceReplacement::delete(annotation.span));
         }
 
         fn visit_ts_type_parameter_declaration(
             &mut self,
             declaration: &oxc_ast::ast::TSTypeParameterDeclaration<'a>,
         ) {
-            self.ranges.push((
-                declaration.span.start as usize,
-                declaration.span.end as usize,
-                String::new(),
-            ));
+            self.ranges.push(SourceReplacement::delete(declaration.span));
         }
 
         fn visit_ts_type_parameter_instantiation(
             &mut self,
             instantiation: &oxc_ast::ast::TSTypeParameterInstantiation<'a>,
         ) {
-            self.ranges.push((
-                instantiation.span.start as usize,
-                instantiation.span.end as usize,
-                String::new(),
-            ));
+            self.ranges.push(SourceReplacement::delete(instantiation.span));
         }
     }
 
@@ -495,9 +505,7 @@ impl<'a> OxcStateArgument<'a> {
     fn render(self, source: &str) -> Result<String, CompileError> {
         match self {
             Self::ProxyLike(expression) | Self::Other(expression) => {
-                let mut codegen = Codegen::new()
-                    .with_options(codegen_options())
-                    .with_source_text(source);
+                let mut codegen = oxc_codegen_for(source);
                 codegen.print_expression(expression);
                 let text = codegen.into_source_text();
                 // OXC wraps standalone object/sequence expressions in parens;
@@ -540,10 +548,11 @@ fn effect_call_callee_span(statement: &Statement<'_>) -> Option<(Span, &'static 
             Some((id.span, "$.user_effect"))
         }
         OxcExpression::StaticMemberExpression(member) => {
-            if let OxcExpression::Identifier(obj) = &member.object {
-                if obj.name.as_str() == "$effect" && member.property.name.as_str() == "pre" {
-                    return Some((member.span, "$.user_pre_effect"));
-                }
+            if let OxcExpression::Identifier(obj) = &member.object
+                && obj.name.as_str() == "$effect"
+                && member.property.name.as_str() == "pre"
+            {
+                return Some((member.span, "$.user_pre_effect"));
             }
             None
         }
@@ -563,7 +572,7 @@ fn render_effect_statement(
     let Some((callee_span, replacement)) = effect_call_callee_span(statement) else {
         return Ok(None);
     };
-    let replacements = vec![(callee_span.start as usize, callee_span.end as usize, replacement.to_string())];
+    let replacements = vec![SourceReplacement::from_span(callee_span, replacement.to_string())];
     let rendered = replace_source_ranges(source, statement.span(), replacements)?;
     Ok(Some(rendered))
 }
@@ -571,23 +580,23 @@ fn render_effect_statement(
 fn replace_source_ranges(
     source: &str,
     container_span: Span,
-    mut replacements: Vec<(usize, usize, String)>,
+    mut replacements: Vec<SourceReplacement>,
 ) -> Result<String, CompileError> {
-    replacements.sort_unstable_by_key(|(start, _, _)| *start);
+    replacements.sort_unstable_by_key(|r| r.start);
     let mut output = String::new();
     let mut cursor = container_span.start as usize;
     let end = container_span.end as usize;
-    for (start, range_end, replacement) in replacements {
-        if start < cursor || range_end > end {
+    for r in &replacements {
+        if r.start < cursor || r.end > end {
             return Err(CompileError::internal(
                 "invalid replacement range while rewriting module source",
             ));
         }
-        output.push_str(source.get(cursor..start).ok_or_else(|| {
+        output.push_str(source.get(cursor..r.start).ok_or_else(|| {
             CompileError::internal("invalid source slice while rewriting module source")
         })?);
-        output.push_str(&replacement);
-        cursor = range_end;
+        output.push_str(&r.text);
+        cursor = r.end;
     }
     output.push_str(source.get(cursor..end).ok_or_else(|| {
         CompileError::internal("invalid source slice while rewriting module source")

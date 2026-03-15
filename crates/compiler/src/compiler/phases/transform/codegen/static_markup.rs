@@ -1,7 +1,7 @@
-use crate::api::modern::{modern_node_end, modern_node_start};
 use crate::api::{FragmentStrategy, GenerateTarget};
+use crate::ast::common::Span;
 use crate::ast::modern::{
-    Attribute, AttributeValue, AttributeValueList, Fragment, Node, RegularElement, Root,
+    Attribute, AttributeValue, AttributeValueKind, Fragment, Node, RegularElement, Root,
 };
 use crate::compiler::phases::transform::codegen::ComponentCodegenContext;
 use camino::Utf8Path;
@@ -164,8 +164,8 @@ fn extract_static_markup_template_from_root(source: &str, root: &Root) -> Option
 
     let mut markup = String::new();
     for node in nodes {
-        let start = modern_node_start(node);
-        let end = modern_node_end(node);
+        let start = node.start();
+        let end = node.end();
         markup.push_str(source.get(start..end)?);
     }
     Some(markup)
@@ -202,11 +202,11 @@ fn modern_element_is_static_markup(element: &RegularElement) -> bool {
 fn modern_attribute_is_static_markup(attribute: &Attribute) -> bool {
     match attribute {
         Attribute::Attribute(attribute) => match &attribute.value {
-            AttributeValueList::Boolean(_) => true,
-            AttributeValueList::Values(values) => values
+            AttributeValueKind::Boolean(_) => true,
+            AttributeValueKind::Values(values) => values
                 .iter()
                 .all(|value| matches!(value, AttributeValue::Text(_))),
-            AttributeValueList::ExpressionTag(_) => false,
+            AttributeValueKind::ExpressionTag(_) => false,
         },
         Attribute::SpreadAttribute(_)
         | Attribute::BindDirective(_)
@@ -376,9 +376,9 @@ fn serialize_html_attribute(
     output.push_str(attribute.name.as_ref());
 
     match &attribute.value {
-        AttributeValueList::Boolean(true) => {}
-        AttributeValueList::Boolean(false) => return None,
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Boolean(true) => {}
+        AttributeValueKind::Boolean(false) => return None,
+        AttributeValueKind::Values(values) => {
             output.push_str("=\"");
             let append_scoped_hash = attribute.name.as_ref() == "class" && scoped_hash.is_some();
             for value in values.iter() {
@@ -397,7 +397,7 @@ fn serialize_html_attribute(
             }
             output.push('"');
         }
-        AttributeValueList::ExpressionTag(_) => return None,
+        AttributeValueKind::ExpressionTag(_) => return None,
     }
 
     Some(attribute.name.as_ref() == "class")
@@ -439,7 +439,7 @@ fn build_tree_value(
     scoped_element_starts: &[usize],
 ) -> Option<TreeValue> {
     match node {
-        Node::Text(text) => Some(TreeValue::String(text.data.as_ref().to_string())),
+        Node::Text(text) => Some(TreeValue::String(text.data.to_string())),
         Node::Comment(comment) => {
             let mut html_comment = String::from("<!--");
             html_comment.push_str(comment.data.as_ref());
@@ -453,7 +453,7 @@ fn build_tree_value(
             )?;
             let children = build_tree_values(&element.fragment, css_hash, scoped_element_starts)?;
             Some(TreeValue::Element(TreeElementValue {
-                tag: element.name.as_ref().to_string(),
+                tag: element.name.to_string(),
                 attributes,
                 children,
             }))
@@ -482,15 +482,15 @@ fn serialize_tree_attributes(
         };
 
         let key = if is_js_identifier(attribute.name.as_ref()) {
-            attribute.name.as_ref().to_string()
+            attribute.name.to_string()
         } else {
             js_single_quoted_string(attribute.name.as_ref())
         };
 
         let value = match &attribute.value {
-            AttributeValueList::Boolean(true) => String::from("true"),
-            AttributeValueList::Boolean(false) => return None,
-            AttributeValueList::Values(values) => {
+            AttributeValueKind::Boolean(true) => String::from("true"),
+            AttributeValueKind::Boolean(false) => return None,
+            AttributeValueKind::Values(values) => {
                 let mut value_text = String::new();
                 for value in values.iter() {
                     let AttributeValue::Text(text) = value else {
@@ -509,7 +509,7 @@ fn serialize_tree_attributes(
                 }
                 js_single_quoted_string(&value_text)
             }
-            AttributeValueList::ExpressionTag(_) => return None,
+            AttributeValueKind::ExpressionTag(_) => return None,
         };
         rendered_class |= attribute.name.as_ref() == "class";
 

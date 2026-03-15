@@ -6,10 +6,10 @@ use oxc_ast::ast::{
     ChainElement, Declaration, Expression as OxcExpression, Statement as OxcStatement,
 };
 use oxc_span::GetSpan;
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 use crate::ast::modern::{
-    Alternate, Attribute, AttributeValue, AttributeValueList, AwaitBlock, DebugTag, Expression,
+    Alternate, Attribute, AttributeValue, AttributeValueKind, AwaitBlock, DebugTag, Expression,
     Fragment, IfBlock, KeyBlock, NamedAttribute, Node, RegularElement, RenderTag, Root,
     SvelteBoundary, SvelteElement, SvelteFragment, SvelteHead, TitleElement,
 };
@@ -22,12 +22,14 @@ pub(crate) trait RenderBackend {
     const TEMPLATE: &'static str;
 }
 
+#[derive(Debug)]
 pub(crate) struct ClientRenderBackend;
 
 impl RenderBackend for ClientRenderBackend {
     const TEMPLATE: &'static str = TEMPLATE_COMPONENT_CLIENT;
 }
 
+#[derive(Debug)]
 pub(crate) struct ServerRenderBackend;
 
 impl RenderBackend for ServerRenderBackend {
@@ -294,12 +296,12 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
     ) -> Option<()> {
         let attribute_name = escape_js_template_literal(attribute.name.as_ref());
         match &attribute.value {
-            AttributeValueList::Boolean(true) => {
+            AttributeValueKind::Boolean(true) => {
                 self.push_line(indent, &format!("$$renderer.push(` {attribute_name}`);"));
                 Some(())
             }
-            AttributeValueList::Boolean(false) => None,
-            AttributeValueList::ExpressionTag(tag) => {
+            AttributeValueKind::Boolean(false) => None,
+            AttributeValueKind::ExpressionTag(tag) => {
                 let expression = tag.expression.render()?;
                 self.push_line(indent, &format!("$$renderer.push(` {attribute_name}=\"`);"));
                 self.push_line(
@@ -309,7 +311,7 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
                 self.push_line(indent, "$$renderer.push(`\"`);");
                 Some(())
             }
-            AttributeValueList::Values(values) => {
+            AttributeValueKind::Values(values) => {
                 self.push_line(indent, &format!("$$renderer.push(` {attribute_name}=\"`);"));
                 for value in values.iter() {
                     match value {
@@ -395,7 +397,7 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
                         has_children_prop = true;
                     }
                     let value = self.attribute_value_expression(&named.value)?;
-                    current.push((named.name.as_ref().to_string(), value));
+                    current.push((named.name.to_string(), value));
                 }
                 Attribute::SpreadAttribute(spread) => {
                     flush_props_group(&mut parts, &mut current);
@@ -404,7 +406,7 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
                 Attribute::BindDirective(directive) if directive.name.as_ref() == "this" => {}
                 Attribute::BindDirective(directive) => {
                     let value = directive.expression.render()?;
-                    current.push((directive.name.as_ref().to_string(), value));
+                    current.push((directive.name.to_string(), value));
                 }
                 Attribute::ClassDirective(directive) => {
                     let value = directive.expression.render()?;
@@ -460,12 +462,12 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
         Some(render_props_parts(&parts))
     }
 
-    fn attribute_value_expression(&self, value: &AttributeValueList) -> Option<String> {
+    fn attribute_value_expression(&self, value: &AttributeValueKind) -> Option<String> {
         match value {
-            AttributeValueList::Boolean(true) => Some("true".to_string()),
-            AttributeValueList::Boolean(false) => Some("false".to_string()),
-            AttributeValueList::ExpressionTag(tag) => tag.expression.render(),
-            AttributeValueList::Values(values) => {
+            AttributeValueKind::Boolean(true) => Some("true".to_string()),
+            AttributeValueKind::Boolean(false) => Some("false".to_string()),
+            AttributeValueKind::ExpressionTag(tag) => tag.expression.render(),
+            AttributeValueKind::Values(values) => {
                 if values.is_empty() {
                     return Some("''".to_string());
                 }
@@ -510,7 +512,7 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
                     if named.name.as_ref() == "name" {
                         name = value;
                     } else if named.name.as_ref() != "slot" {
-                        current.push((named.name.as_ref().to_string(), value));
+                        current.push((named.name.to_string(), value));
                     }
                 }
                 Attribute::SpreadAttribute(spread) => {
@@ -520,7 +522,7 @@ impl<'a, B: RenderBackend> GenericRenderer<'a, B> {
                 Attribute::BindDirective(directive) if directive.name.as_ref() == "this" => {}
                 Attribute::BindDirective(directive) => {
                     current.push((
-                        directive.name.as_ref().to_string(),
+                        directive.name.to_string(),
                         directive.expression.render()?,
                     ));
                 }
@@ -962,7 +964,7 @@ struct ParsedScript {
     statements: Vec<String>,
 }
 
-fn parse_script(program: &ParsedJsProgram, mode: ScriptParseMode) -> Option<ParsedScript> {
+fn parse_script(program: &JsProgram, mode: ScriptParseMode) -> Option<ParsedScript> {
     let mut imports = Vec::new();
     let mut statements = Vec::new();
 
@@ -1133,21 +1135,21 @@ fn render_tag_call_parts(expression: &Expression) -> Option<(String, Vec<String>
 }
 
 pub(crate) fn program_statement_source<'a>(
-    program: &'a ParsedJsProgram,
+    program: &'a JsProgram,
     statement: &OxcStatement<'a>,
 ) -> Option<&'a str> {
     snippet(program.source(), statement.span())
 }
 
 pub(crate) fn program_spanned_source<'a>(
-    program: &'a ParsedJsProgram,
+    program: &'a JsProgram,
     node: &impl GetSpan,
 ) -> Option<&'a str> {
     snippet(program.source(), node.span())
 }
 
 fn export_named_instance_declaration_source<'a>(
-    program: &'a ParsedJsProgram,
+    program: &'a JsProgram,
     declaration: &Declaration<'a>,
 ) -> Option<&'a str> {
     match declaration {
