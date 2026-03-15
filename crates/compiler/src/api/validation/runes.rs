@@ -1,9 +1,10 @@
 use super::*;
 use crate::api::validation::scope::extend_name_set_with_oxc_pattern_bindings;
 use crate::ast::modern::{
-    Attribute, AttributeValue, AttributeValueList, EachBlock, Expression, Fragment, Node, Search,
+    Attribute, AttributeValue, AttributeValueKind, EachBlock, Expression, Fragment, Node, Search,
 };
 use crate::names::NameStack;
+use crate::source::{NamedSpan, SourceSpan};
 use crate::{SourceId, SourceText};
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, BlockStatement, CallExpression, CatchClause, ChainElement,
@@ -15,196 +16,546 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_span::{GetSpan, Span};
 use oxc_syntax::scope::ScopeFlags;
 use std::collections::HashMap;
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
-pub(super) fn detect_runes_mode_invalid_import(source: &str, root: &Root) -> Option<CompileError> {
-    let script = root.instance.as_ref()?;
-    let offset = script.content_start;
-    if let Some((start, end)) = find_before_update_import_in_program(&script.content) {
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::RunesModeInvalidImportBeforeUpdate,
-            start + offset,
-            end + offset,
-        ));
-    }
-    None
-}
-
-pub(super) fn detect_legacy_export_invalid(source: &str, root: &Root) -> Option<CompileError> {
-    let script = root.instance.as_ref()?;
-    let offset = script.content_start;
-    if let Some((start, end)) = find_legacy_export_let_in_program(&script.content) {
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::LegacyExportInvalid,
-            start + offset,
-            end + offset,
-        ));
-    }
-    None
-}
-
-pub(super) fn detect_dollar_prefix_invalid(source: &str, root: &Root) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
+impl ComponentValidator<'_> {
+    pub(super) fn runes_mode_invalid_import(&self) -> Option<CompileError> {
+        let script = self.root.instance.as_ref()?;
         let offset = script.content_start;
-        if let Some((start, end)) = find_dollar_prefix_invalid_in_program(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::DollarPrefixInvalid,
-                start + offset,
-                end + offset,
+        if let Some(span) = find_before_update_import_in_program(&script.content) {
+            return Some(span.offset(offset).to_compile_error(
+                self.source,
+                DiagnosticKind::RunesModeInvalidImportBeforeUpdate,
             ));
         }
-    }
-    None
-}
-
-pub(super) fn detect_store_invalid_scoped_subscription(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    if let Some(instance) = root.instance.as_ref()
-        && let Some((start, end)) =
-            find_store_invalid_scoped_subscription_in_program(&instance.content)
-    {
-        let offset = instance.content_start;
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::StoreInvalidScopedSubscription,
-            start + offset,
-            end + offset,
-        ));
+        None
     }
 
-    let (start, end) =
-        find_store_invalid_scoped_subscription(&root.fragment, &mut AliasStack::default())?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::StoreInvalidScopedSubscription,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_store_invalid_subscription_component(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let module = root.module.as_ref()?;
-    let offset = module.content_start;
-    let (start, end) = find_store_invalid_subscription(&module.content)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::StoreInvalidSubscription,
-        start + offset,
-        end + offset,
-    ))
-}
-
-pub(super) fn detect_dollar_binding_error_component(
-    source: &str,
-    options: &CompileOptions,
-    root: &Root,
-) -> Option<CompileError> {
-    let runes_mode = is_runes_mode(options, root);
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
+    pub(super) fn legacy_export_invalid(&self) -> Option<CompileError> {
+        let script = self.root.instance.as_ref()?;
         let offset = script.content_start;
-        if let Some((start, _end)) =
-            find_dollar_binding_invalid_declaration(&script.content, runes_mode)
+        if let Some(span) = find_legacy_export_let_in_program(&script.content) {
+            return Some(span.offset(offset).to_compile_error(
+                self.source,
+                DiagnosticKind::LegacyExportInvalid,
+            ));
+        }
+        None
+    }
+
+    pub(super) fn dollar_prefix_invalid(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_dollar_prefix_invalid_in_program(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::DollarPrefixInvalid,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn store_invalid_scoped_subscription(&self) -> Option<CompileError> {
+        if let Some(instance) = self.root.instance.as_ref()
+            && let Some(span) =
+                find_store_invalid_scoped_subscription_in_program(&instance.content)
         {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::DollarBindingInvalid,
-                start + offset,
-                start + offset + 1,
+            let offset = instance.content_start;
+            return Some(span.offset(offset).to_compile_error(
+                self.source,
+                DiagnosticKind::StoreInvalidScopedSubscription,
             ));
         }
-    }
-    None
-}
 
-pub(super) fn detect_global_reference_invalid_markup(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    // Collect declarations from both module and instance scripts
-    let mut all_declared = NameSet::default();
-    for script in [&root.module, &root.instance] {
-        if let Some(script) = script.as_ref() {
-            all_declared.extend(collect_declared_names_in_program(&script.content));
+        let span =
+            find_store_invalid_scoped_subscription(&self.root.fragment, &mut AliasStack::default())?;
+        Some(span.to_compile_error(
+            self.source,
+            DiagnosticKind::StoreInvalidScopedSubscription,
+        ))
+    }
+
+    pub(super) fn store_invalid_subscription(&self) -> Option<CompileError> {
+        let module = self.root.module.as_ref()?;
+        let offset = module.content_start;
+        let span = find_store_invalid_subscription(&module.content)?;
+        Some(span.offset(offset).to_compile_error(
+            self.source,
+            DiagnosticKind::StoreInvalidSubscription,
+        ))
+    }
+
+    pub(super) fn dollar_binding_error(&self, options: &CompileOptions) -> Option<CompileError> {
+        let runes_mode = is_runes_mode(options, self.root);
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) =
+                find_dollar_binding_invalid_declaration(&script.content, runes_mode)
+            {
+                return Some(SourceSpan::new(span.start + offset, span.start + offset + 1).to_compile_error(
+                    self.source,
+                    DiagnosticKind::DollarBindingInvalid,
+                ));
+            }
         }
+        None
     }
-    let (ident, start, end) = find_invalid_global_reference_in_fragment_with_declared(
-        &root.fragment,
-        runes_mode,
-        &all_declared,
-    )?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::GlobalReferenceInvalid { ident },
-        start,
-        end,
-    ))
-}
 
-pub(super) fn detect_state_in_each_header_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let (start, end) = find_state_in_each_header_fragment(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::StateInvalidPlacement,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_rune_missing_parentheses(source: &str, root: &Root) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        let Some((start, end)) = find_rune_missing_parentheses_in_program(&script.content) else {
-            continue;
-        };
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::RuneMissingParentheses,
-            start + offset,
-            end + offset,
-        ));
+    pub(super) fn global_reference_invalid_markup(&self, runes_mode: bool) -> Option<CompileError> {
+        // Collect declarations from both module and instance scripts
+        let mut all_declared = NameSet::default();
+        for script in [&self.root.module, &self.root.instance] {
+            if let Some(script) = script.as_ref() {
+                all_declared.extend(collect_declared_names_in_program(&script.content));
+            }
+        }
+        let named = find_invalid_global_reference_in_fragment_with_declared(
+            &self.root.fragment,
+            runes_mode,
+            &all_declared,
+        )?;
+        Some(named.span.to_compile_error(
+            self.source,
+            DiagnosticKind::GlobalReferenceInvalid { ident: named.name },
+        ))
     }
-    None
-}
 
-pub(super) fn detect_each_item_invalid_assignment(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let mut scope = ScopeStack::default();
-    let (start, end) = find_each_item_invalid_assignment(&root.fragment, &mut scope)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::EachItemInvalidAssignment,
-        start,
-        end,
-    ))
+    pub(super) fn state_in_each_header(&self) -> Option<CompileError> {
+        let span = find_state_in_each_header_fragment(&self.root.fragment)?;
+        Some(span.to_compile_error(
+            self.source,
+            DiagnosticKind::StateInvalidPlacement,
+        ))
+    }
+
+    pub(super) fn rune_missing_parentheses(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            let Some(span) = find_rune_missing_parentheses_in_program(&script.content) else {
+                continue;
+            };
+            return Some(span.offset(offset).to_compile_error(
+                self.source,
+                DiagnosticKind::RuneMissingParentheses,
+            ));
+        }
+        None
+    }
+
+    pub(super) fn each_item_invalid_assignment(&self) -> Option<CompileError> {
+        let mut scope = ScopeStack::default();
+        let span = find_each_item_invalid_assignment(&self.root.fragment, &mut scope)?;
+        Some(span.to_compile_error(
+            self.source,
+            DiagnosticKind::EachItemInvalidAssignment,
+        ))
+    }
+
+    pub(super) fn render_tag_errors(&self) -> Option<CompileError> {
+        let error = find_render_tag_error_in_fragment(&self.root.fragment)?;
+        Some(error.span.to_compile_error(self.source, error.kind))
+    }
+
+    pub(super) fn class_state_field_error(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            let Some(error) = find_class_state_field_error_oxc(&script.content) else {
+                continue;
+            };
+            return Some(error.span.offset(offset).to_compile_error(self.source, error.kind));
+        }
+        None
+    }
+
+    pub(super) fn rune_argument_count_errors(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            let Some((kind, span)) = find_invalid_rune_argument_count(&script.content) else {
+                continue;
+            };
+            return Some(span.offset(offset).to_compile_error(self.source, kind));
+        }
+        None
+    }
+
+    pub(super) fn rune_invalid_spread(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            let Some(named) = find_rune_invalid_spread(&script.content) else {
+                continue;
+            };
+            return Some(compile_error_custom_runes(
+                self.source,
+                "rune_invalid_spread",
+                format!("`{}` cannot be called with a spread argument", named.name),
+                named.span.start + offset,
+                named.span.end + offset,
+            ));
+        }
+
+        None
+    }
+
+    pub(super) fn props_duplicate(&self) -> Option<CompileError> {
+        let mut count = 0usize;
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_first_call_span_by_name(&script.content, "$props") {
+                count += count_calls_by_name(&script.content, "$props");
+                if count > 1 {
+                    return Some(span.offset(offset).to_compile_error(
+                        self.source,
+                        DiagnosticKind::PropsDuplicate,
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn props_illegal_name(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_props_illegal_name(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::PropsIllegalName,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn bindable_invalid_arguments(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) =
+                find_invalid_call_arg_count(&script.content, "$bindable", |c| c <= 1)
+            {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::RuneInvalidArgumentsLengthBindable,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn props_invalid_arguments(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) =
+                find_invalid_call_arg_count(&script.content, "$props", |c| c == 0)
+            {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::RuneInvalidArgumentsProps,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn props_invalid_placement(&self) -> Option<CompileError> {
+        let instance = self.root.instance.as_ref()?;
+        let offset = instance.content_start;
+        let span = find_props_invalid_placement_component(&instance.content)?;
+        Some(span.offset(offset).to_compile_error(
+            self.source,
+            DiagnosticKind::PropsInvalidPlacement,
+        ))
+    }
+
+    pub(super) fn bindable_invalid_location(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_bindable_invalid_location(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::BindableInvalidLocation,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn derived_invalid_placement(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_invalid_initializer_placement(&script.content, "$derived")
+            {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::StateInvalidPlacementDerived,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn effect_invalid_placement(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_effect_invalid_placement(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::EffectInvalidPlacement,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn host_invalid_placement(&self) -> Option<CompileError> {
+        if self.root
+            .options
+            .as_ref()
+            .and_then(|options| options.custom_element.as_ref())
+            .is_some()
+        {
+            return None;
+        }
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_first_call_span_by_name(&script.content, "$host") {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::HostInvalidPlacement,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn state_invalid_placement_general(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_invalid_initializer_placement(&script.content, "$state") {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::StateInvalidPlacement,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn state_invalid_placement(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_static_state_call(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::StateInvalidPlacement,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn invalid_rune_name(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(named) = find_invalid_rune_name(&script.content) {
+                return Some(named.span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::RuneInvalidName { name: named.name },
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn constant_assignment(&self) -> Option<CompileError> {
+        let mut immutables = NameSet::default();
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            collect_script_immutable_bindings(&script.content, &mut immutables);
+        }
+
+        let mut found = None;
+        self.root.fragment.walk(
+            &mut found,
+            |entry, found| {
+                if found.is_some() {
+                    return Search::Found(());
+                }
+                let Some(node) = entry.as_node() else {
+                    return Search::Continue;
+                };
+                let find_with_offset = |expr: &Expression| {
+                    find_constant_assignment_in_expression(expr, &immutables)
+                        .map(|s| s.offset(expr.start))
+                };
+                let span = match node {
+                    Node::ExpressionTag(tag) => find_with_offset(&tag.expression),
+                    Node::RenderTag(tag) => find_with_offset(&tag.expression),
+                    Node::HtmlTag(tag) => find_with_offset(&tag.expression),
+                    Node::ConstTag(tag) => find_with_offset(&tag.declaration),
+                    Node::EachBlock(block) => find_with_offset(&block.expression)
+                        .or_else(|| {
+                            block
+                                .key
+                                .as_ref()
+                                .and_then(|key| find_with_offset(key))
+                        })
+                        .or_else(|| {
+                            block
+                                .context
+                                .as_ref()
+                                .and_then(|context| find_with_offset(context))
+                        }),
+                    Node::AwaitBlock(block) => find_with_offset(&block.expression)
+                        .or_else(|| {
+                            block
+                                .value
+                                .as_ref()
+                                .and_then(|value| find_with_offset(value))
+                        })
+                        .or_else(|| {
+                            block
+                                .error
+                                .as_ref()
+                                .and_then(|error| find_with_offset(error))
+                        }),
+                    Node::SnippetBlock(block) => block
+                        .parameters
+                        .iter()
+                        .find_map(|parameter| find_with_offset(parameter)),
+                    Node::KeyBlock(block) => find_with_offset(&block.expression),
+                    _ => None,
+                };
+                if let Some(span) = span {
+                    *found = Some(span);
+                    Search::Found(())
+                } else {
+                    Search::Continue
+                }
+            },
+            |_, _| {},
+        );
+
+        let span = found?;
+        Some(span.to_compile_error(
+            self.source,
+            DiagnosticKind::ConstantAssignment,
+        ))
+    }
+
+    pub(super) fn constant_assignment_in_scripts(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_constant_assignment_in_program(&script.content) {
+                return Some(span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::ConstantAssignment,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn global_reference_invalid_in_scripts(&self, check_store_refs: bool) -> Option<CompileError> {
+        // Collect all top-level declarations across both scripts so that
+        // store subscriptions like `$foo` in the instance can find `foo`
+        // declared/imported in the module script (and vice versa).
+        let mut all_declared = NameSet::default();
+        for script in [&self.root.module, &self.root.instance] {
+            if let Some(script) = script.as_ref() {
+                let names = collect_declared_names_in_program(&script.content);
+                all_declared.extend(names);
+            }
+        }
+        // In legacy mode, `$:` reactive labels create store subscriptions
+        // (e.g. `$: $foo;` declares `$foo`). Add these to the declared set
+        // so they aren't flagged as invalid global references.
+        if let Some(instance) = self.root.instance.as_ref() {
+            collect_dollar_label_store_subscriptions(&mut all_declared, instance.oxc_program());
+        }
+
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(named) =
+                find_global_reference_invalid_in_program_with_extra_declared(
+                    &script.content,
+                    &all_declared,
+                    check_store_refs,
+                )
+            {
+                return Some(named.span.offset(offset).to_compile_error(
+                    self.source,
+                    DiagnosticKind::GlobalReferenceInvalid { ident: named.name },
+                ));
+            }
+        }
+        None
+    }
 }
 
 fn find_each_item_invalid_assignment(
     fragment: &Fragment,
     scope: &mut ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     fragment.walk(
         scope,
         |entry, scope| {
@@ -298,12 +649,12 @@ fn find_each_item_invalid_assignment(
 fn assignment_to_each_scoped_name_in_attributes(
     attributes: &[Attribute],
     scope: &ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     for attribute in attributes.iter() {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) =
@@ -313,7 +664,7 @@ fn assignment_to_each_scoped_name_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) =
                         assignment_to_each_scoped_name_in_expression(&tag.expression, scope)
                     {
@@ -327,7 +678,7 @@ fn assignment_to_each_scoped_name_in_attributes(
                     .identifier_name()
                     .is_some_and(|name| scope.contains(name.as_ref()))
                 {
-                    return Some((attribute.start, attribute.end));
+                    return Some(SourceSpan::new(attribute.start, attribute.end));
                 }
                 if let Some(span) =
                     assignment_to_each_scoped_name_in_expression(&attribute.expression, scope)
@@ -347,8 +698,8 @@ fn assignment_to_each_scoped_name_in_attributes(
                 }
             }
             Attribute::StyleDirective(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) =
@@ -358,7 +709,7 @@ fn assignment_to_each_scoped_name_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) =
                         assignment_to_each_scoped_name_in_expression(&tag.expression, scope)
                     {
@@ -395,10 +746,10 @@ fn assignment_to_each_scoped_name_in_attributes(
 fn assignment_to_each_scoped_name_in_expression(
     expression: &Expression,
     scope: &ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     struct Visitor<'a> {
         scope: &'a ScopeStack,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -453,611 +804,124 @@ fn assignment_to_each_scoped_name_in_expression(
     None
 }
 
-pub(super) fn detect_render_tag_errors_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let error = find_render_tag_error_in_fragment(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        error.kind,
-        error.start,
-        error.end,
-    ))
-}
 
-pub(super) fn detect_class_state_field_error_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        let Some(error) = find_class_state_field_error_oxc(&script.content) else {
-            continue;
-        };
-        return Some(compile_error_with_range(
-            source,
-            error.kind,
-            error.start + offset,
-            error.end + offset,
-        ));
-    }
-    None
-}
-
-pub(super) fn detect_rune_argument_count_errors_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        let Some((kind, start, end)) = find_invalid_rune_argument_count(&script.content) else {
-            continue;
-        };
-        return Some(compile_error_with_range(source, kind, start + offset, end + offset));
-    }
-    None
-}
-
-pub(super) fn detect_rune_invalid_spread_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        let Some((name, start, end)) = find_rune_invalid_spread(&script.content) else {
-            continue;
-        };
-        return Some(compile_error_custom_runes(
-            source,
-            "rune_invalid_spread",
-            format!("`{name}` cannot be called with a spread argument"),
-            start + offset,
-            end + offset,
-        ));
+impl ScriptValidator<'_> {
+    pub(super) fn invalid_name(&self) -> Option<CompileError> {
+        let named = find_invalid_rune_name(self.program())?;
+        Some(named.span.to_compile_error(
+            self.source(),
+            DiagnosticKind::RuneInvalidName { name: named.name },
+        ))
     }
 
-    None
-}
-
-pub(super) fn detect_props_duplicate_from_root(source: &str, root: &Root) -> Option<CompileError> {
-    let mut count = 0usize;
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_first_call_span_by_name(&script.content, "$props") {
-            count += count_calls_by_name(&script.content, "$props");
-            if count > 1 {
-                return Some(compile_error_with_range(
-                    source,
-                    CompilerDiagnosticKind::PropsDuplicate,
-                    start + offset,
-                    end + offset,
-                ));
-            }
-        }
+    pub(super) fn renamed_effect_active(&self) -> Option<CompileError> {
+        let span = find_renamed_effect_active_oxc(self.program())?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::RuneRenamedEffectActive,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_props_illegal_name_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_props_illegal_name(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::PropsIllegalName,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn store_invalid_subscription_module(&self) -> Option<CompileError> {
+        let span = find_store_invalid_subscription(self.program())?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::StoreInvalidSubscriptionModule,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_bindable_invalid_arguments_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) =
-            find_invalid_call_arg_count(&script.content, "$bindable", |c| c <= 1)
-        {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::RuneInvalidArgumentsLengthBindable,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn dollar_binding_error(&self, runes_mode: bool) -> Option<CompileError> {
+        detect_dollar_binding_error_in_program(self.source(), self.program(), runes_mode)
     }
-    None
-}
 
-pub(super) fn detect_props_invalid_arguments_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) =
-            find_invalid_call_arg_count(&script.content, "$props", |c| c == 0)
-        {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::RuneInvalidArgumentsProps,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn constant_assignment(&self) -> Option<CompileError> {
+        let span = find_constant_assignment_in_program(self.program())?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::ConstantAssignment,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_props_invalid_placement_component(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let instance = root.instance.as_ref()?;
-    let offset = instance.content_start;
-    let (start, end) = find_props_invalid_placement_component(&instance.content)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::PropsInvalidPlacement,
-        start + offset,
-        end + offset,
-    ))
-}
-
-pub(super) fn detect_bindable_invalid_location_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_bindable_invalid_location(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::BindableInvalidLocation,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn bindable_invalid_location(&self) -> Option<CompileError> {
+        let span = find_bindable_invalid_location(self.program())?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::BindableInvalidLocation,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_derived_invalid_placement_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_invalid_initializer_placement(&script.content, "$derived")
-        {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::StateInvalidPlacementDerived,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn rune_argument_count(&self) -> Option<CompileError> {
+        let (kind, span) = find_invalid_rune_argument_count(self.program())?;
+        Some(span.to_compile_error(self.source(), kind))
     }
-    None
-}
 
-pub(super) fn detect_effect_invalid_placement_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_effect_invalid_placement(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::EffectInvalidPlacement,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn state_invalid_placement(&self) -> Option<CompileError> {
+        detect_initializer_placement(
+            self.source(),
+            self.program(),
+            "$state",
+            DiagnosticKind::StateInvalidPlacement,
+        )
     }
-    None
-}
 
-pub(super) fn detect_host_invalid_placement_component(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    if root
-        .options
-        .as_ref()
-        .and_then(|options| options.custom_element.as_ref())
-        .is_some()
-    {
-        return None;
+    pub(super) fn derived_invalid_placement(&self) -> Option<CompileError> {
+        detect_initializer_placement(
+            self.source(),
+            self.program(),
+            "$derived",
+            DiagnosticKind::StateInvalidPlacementDerived,
+        )
     }
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_first_call_span_by_name(&script.content, "$host") {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::HostInvalidPlacement,
-                start + offset,
-                end + offset,
-            ));
-        }
+
+    pub(super) fn effect_invalid_placement(&self) -> Option<CompileError> {
+        let span = find_effect_invalid_placement(self.program())?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::EffectInvalidPlacement,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_state_invalid_placement_general_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_invalid_initializer_placement(&script.content, "$state") {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::StateInvalidPlacement,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn host_invalid_placement(&self) -> Option<CompileError> {
+        let span = find_first_call_span_by_name(self.program(), "$host")?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::HostInvalidPlacement,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_state_invalid_placement_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_static_state_call(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::StateInvalidPlacement,
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn class_state_field_error(&self) -> Option<CompileError> {
+        let error = find_class_state_field_error_oxc(self.program())?;
+        Some(error.span.to_compile_error(self.source(), error.kind))
     }
-    None
-}
 
-pub(super) fn detect_invalid_rune_name_component(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((name, start, end)) = find_invalid_rune_name(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::RuneInvalidName { name },
-                start + offset,
-                end + offset,
-            ));
-        }
+    pub(super) fn props_invalid_placement_module(&self) -> Option<CompileError> {
+        let span = find_first_call_span_by_name(self.program(), "$props")?;
+        Some(span.to_compile_error(
+            self.source(),
+            DiagnosticKind::PropsInvalidPlacement,
+        ))
     }
-    None
-}
 
-pub(super) fn detect_invalid_name(source: &str, program: &ParsedJsProgram) -> Option<CompileError> {
-    let (name, start, end) = find_invalid_rune_name(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::RuneInvalidName { name },
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_renamed_effect_active(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_renamed_effect_active_oxc(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::RuneRenamedEffectActive,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_store_invalid_subscription_module(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_store_invalid_subscription(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::StoreInvalidSubscriptionModule,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_dollar_binding_error(
-    source: &str,
-    program: &ParsedJsProgram,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    detect_dollar_binding_error_in_program(source, program, runes_mode)
-}
-
-pub(super) fn detect_constant_assignment(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_constant_assignment_in_program(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::ConstantAssignment,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_bindable_invalid_location(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_bindable_invalid_location(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::BindableInvalidLocation,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_rune_argument_count(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (kind, start, end) = find_invalid_rune_argument_count(program)?;
-    Some(compile_error_with_range(source, kind, start, end))
-}
-
-pub(super) fn detect_state_invalid_placement(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    detect_initializer_placement(
-        source,
-        program,
-        "$state",
-        CompilerDiagnosticKind::StateInvalidPlacement,
-    )
-}
-
-pub(super) fn detect_derived_invalid_placement(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    detect_initializer_placement(
-        source,
-        program,
-        "$derived",
-        CompilerDiagnosticKind::StateInvalidPlacementDerived,
-    )
-}
-
-pub(super) fn detect_effect_invalid_placement(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_effect_invalid_placement(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::EffectInvalidPlacement,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_host_invalid_placement(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_first_call_span_by_name(program, "$host")?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::HostInvalidPlacement,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_class_state_field_error(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let error = find_class_state_field_error_oxc(program)?;
-    Some(compile_error_with_range(
-        source,
-        error.kind,
-        error.start,
-        error.end,
-    ))
-}
-
-pub(super) fn detect_props_invalid_placement_module(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_first_call_span_by_name(program, "$props")?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::PropsInvalidPlacement,
-        start,
-        end,
-    ))
+    pub(super) fn global_reference_invalid_module(&self) -> Option<CompileError> {
+        let named = find_global_reference_invalid_in_program(self.program())?;
+        Some(named.span.to_compile_error(
+            self.source(),
+            DiagnosticKind::GlobalReferenceInvalid { ident: named.name },
+        ))
+    }
 }
 
 fn detect_initializer_placement(
     source: &str,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     call_name: &str,
-    kind: CompilerDiagnosticKind,
+    kind: DiagnosticKind,
 ) -> Option<CompileError> {
-    let (start, end) = find_invalid_initializer_placement(program, call_name)?;
-    Some(compile_error_with_range(source, kind, start, end))
+    let span = find_invalid_initializer_placement(program, call_name)?;
+    Some(span.to_compile_error(source, kind))
 }
 
-pub(super) fn detect_constant_assignment_component(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let mut immutables = NameSet::default();
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        collect_script_immutable_bindings(&script.content, &mut immutables);
-    }
-
-    let mut found = None;
-    root.fragment.walk(
-        &mut found,
-        |entry, found| {
-            if found.is_some() {
-                return Search::Found(());
-            }
-            let Some(node) = entry.as_node() else {
-                return Search::Continue;
-            };
-            let find_with_offset = |expr: &Expression| {
-                find_constant_assignment_in_expression(expr, &immutables)
-                    .map(|(s, e)| (s + expr.start, e + expr.start))
-            };
-            let span = match node {
-                Node::ExpressionTag(tag) => find_with_offset(&tag.expression),
-                Node::RenderTag(tag) => find_with_offset(&tag.expression),
-                Node::HtmlTag(tag) => find_with_offset(&tag.expression),
-                Node::ConstTag(tag) => find_with_offset(&tag.declaration),
-                Node::EachBlock(block) => find_with_offset(&block.expression)
-                    .or_else(|| {
-                        block
-                            .key
-                            .as_ref()
-                            .and_then(|key| find_with_offset(key))
-                    })
-                    .or_else(|| {
-                        block
-                            .context
-                            .as_ref()
-                            .and_then(|context| find_with_offset(context))
-                    }),
-                Node::AwaitBlock(block) => find_with_offset(&block.expression)
-                    .or_else(|| {
-                        block
-                            .value
-                            .as_ref()
-                            .and_then(|value| find_with_offset(value))
-                    })
-                    .or_else(|| {
-                        block
-                            .error
-                            .as_ref()
-                            .and_then(|error| find_with_offset(error))
-                    }),
-                Node::SnippetBlock(block) => block
-                    .parameters
-                    .iter()
-                    .find_map(|parameter| find_with_offset(parameter)),
-                Node::KeyBlock(block) => find_with_offset(&block.expression),
-                _ => None,
-            };
-            if let Some(span) = span {
-                *found = Some(span);
-                Search::Found(())
-            } else {
-                Search::Continue
-            }
-        },
-        |_, _| {},
-    );
-
-    let (start, end) = found?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::ConstantAssignment,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_constant_assignment_in_scripts(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_constant_assignment_in_program(&script.content) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::ConstantAssignment,
-                start + offset,
-                end + offset,
-            ));
-        }
-    }
-    None
-}
-
-fn find_before_update_import_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_before_update_import_in_program(program: &JsProgram) -> Option<SourceSpan> {
     for statement in &program.program().body {
         let Statement::ImportDeclaration(declaration) = statement else {
             continue;
@@ -1081,7 +945,7 @@ fn find_before_update_import_in_program(program: &ParsedJsProgram) -> Option<(us
     None
 }
 
-fn find_legacy_export_let_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_legacy_export_let_in_program(program: &JsProgram) -> Option<SourceSpan> {
     for statement in &program.program().body {
         let Statement::ExportNamedDeclaration(declaration) = statement else {
             continue;
@@ -1096,14 +960,14 @@ fn find_legacy_export_let_in_program(program: &ParsedJsProgram) -> Option<(usize
         if variable.kind != VariableDeclarationKind::Let {
             continue;
         }
-        let (start, statement_end) = span_range(declaration.span);
-        let end = (start + "export let".len()).min(statement_end);
-        return Some((start, end));
+        let decl_span = span_range(declaration.span);
+        let end = (decl_span.start + "export let".len()).min(decl_span.end);
+        return Some(SourceSpan::new(decl_span.start, end));
     }
     None
 }
 
-fn find_dollar_prefix_invalid_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_dollar_prefix_invalid_in_program(program: &JsProgram) -> Option<SourceSpan> {
     for statement in &program.program().body {
         match statement {
             Statement::VariableDeclaration(declaration) => {
@@ -1132,20 +996,20 @@ fn find_dollar_prefix_invalid_in_program(program: &ParsedJsProgram) -> Option<(u
 
 fn find_invalid_dollar_in_variable_declaration(
     declaration: &VariableDeclaration<'_>,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     for declarator in &declaration.declarations {
         let Some(name) = declarator.id.get_binding_identifier() else {
             continue;
         };
         if is_dollar_prefixed_invalid_identifier(name.name.as_str()) {
-            return Some((name.span.start as usize, name.span.start as usize + 1));
+            return Some(SourceSpan::new(name.span.start as usize, name.span.start as usize + 1));
         }
     }
     None
 }
 
-fn span_range(span: Span) -> (usize, usize) {
-    (span.start as usize, span.end as usize)
+fn span_range(span: Span) -> SourceSpan {
+    SourceSpan::from_oxc(span)
 }
 
 /// Check if any identifier in an assignment target refers to an immutable binding.
@@ -1208,7 +1072,7 @@ fn has_immutable_maybe_default_target(
 
 fn oxc_callee_name(callee: &OxcExpression<'_>) -> Option<String> {
     match callee.get_inner_expression() {
-        OxcExpression::Identifier(reference) => Some(reference.name.as_str().to_owned()),
+        OxcExpression::Identifier(reference) => Some(reference.name.to_string()),
         OxcExpression::StaticMemberExpression(member) => {
             let object = member.object.get_inner_expression();
             let OxcExpression::Identifier(object) = object else {
@@ -1246,9 +1110,8 @@ fn module_export_name_as_str<'a>(name: &'a ModuleExportName<'a>) -> Option<&'a s
 
 #[derive(Debug)]
 struct ClassStateFieldError {
-    kind: CompilerDiagnosticKind,
-    start: usize,
-    end: usize,
+    kind: DiagnosticKind,
+    span: SourceSpan,
 }
 
 fn is_dollar_prefixed_invalid_identifier(name: &str) -> bool {
@@ -1259,9 +1122,9 @@ fn is_dollar_prefixed_invalid_identifier(name: &str) -> bool {
     second == b'_' || second.is_ascii_alphabetic()
 }
 
-fn find_rune_invalid_spread(program: &ParsedJsProgram) -> Option<(Arc<str>, usize, usize)> {
+fn find_rune_invalid_spread(program: &JsProgram) -> Option<NamedSpan> {
     struct Visitor {
-        found: Option<(Arc<str>, usize, usize)>,
+        found: Option<NamedSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -1281,8 +1144,7 @@ fn find_rune_invalid_spread(program: &ParsedJsProgram) -> Option<(Arc<str>, usiz
                 return;
             }
             if it.arguments.iter().any(|argument| argument.is_spread()) {
-                let (start, end) = span_range(it.span);
-                self.found = Some((Arc::from(name), start, end));
+                self.found = Some(NamedSpan::new(Arc::from(name), span_range(it.span)));
                 return;
             }
             walk::walk_call_expression(self, it);
@@ -1294,10 +1156,10 @@ fn find_rune_invalid_spread(program: &ParsedJsProgram) -> Option<(Arc<str>, usiz
     visitor.found
 }
 
-fn find_first_call_span_by_name(program: &ParsedJsProgram, name: &str) -> Option<(usize, usize)> {
+fn find_first_call_span_by_name(program: &JsProgram, name: &str) -> Option<SourceSpan> {
     struct Visitor<'n> {
         name: &'n str,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -1318,7 +1180,7 @@ fn find_first_call_span_by_name(program: &ParsedJsProgram, name: &str) -> Option
     visitor.found
 }
 
-fn count_calls_by_name(program: &ParsedJsProgram, name: &str) -> usize {
+fn count_calls_by_name(program: &JsProgram, name: &str) -> usize {
     struct Visitor<'n> {
         name: &'n str,
         count: usize,
@@ -1338,9 +1200,9 @@ fn count_calls_by_name(program: &ParsedJsProgram, name: &str) -> usize {
     visitor.count
 }
 
-fn find_props_illegal_name(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_props_illegal_name(program: &JsProgram) -> Option<SourceSpan> {
     let mut props_rest_bindings = NameSet::default();
-    let mut found = None::<(usize, usize)>;
+    let mut found = None::<SourceSpan>;
     for statement in &program.program().body {
         let Statement::VariableDeclaration(declaration) = statement else {
             continue;
@@ -1391,7 +1253,7 @@ fn find_props_illegal_name(program: &ParsedJsProgram) -> Option<(usize, usize)> 
 
     struct Visitor {
         props_rest_bindings: NameSet,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -1430,14 +1292,14 @@ fn find_props_illegal_name(program: &ParsedJsProgram) -> Option<(usize, usize)> 
 }
 
 fn find_invalid_call_arg_count(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     name: &str,
     is_valid: impl Fn(usize) -> bool,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     struct Visitor<'n, F> {
         name: &'n str,
         is_valid: F,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a, F: Fn(usize) -> bool> Visit<'a> for Visitor<'_, F> {
@@ -1465,10 +1327,10 @@ fn find_invalid_call_arg_count(
 }
 
 fn find_invalid_rune_argument_count(
-    program: &ParsedJsProgram,
-) -> Option<(CompilerDiagnosticKind, usize, usize)> {
+    program: &JsProgram,
+) -> Option<(DiagnosticKind, SourceSpan)> {
     struct Visitor {
-        found: Option<(CompilerDiagnosticKind, usize, usize)>,
+        found: Option<(DiagnosticKind, SourceSpan)>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -1484,8 +1346,7 @@ fn find_invalid_rune_argument_count(
                 walk::walk_call_expression(self, it);
                 return;
             };
-            let (start, end) = span_range(it.span);
-            self.found = Some((kind, start, end));
+            self.found = Some((kind, span_range(it.span)));
         }
     }
 
@@ -1494,29 +1355,29 @@ fn find_invalid_rune_argument_count(
     visitor.found
 }
 
-fn invalid_rune_argument_kind(name: &str, arg_count: usize) -> Option<CompilerDiagnosticKind> {
+fn invalid_rune_argument_kind(name: &str, arg_count: usize) -> Option<DiagnosticKind> {
     match name {
         "$derived" if arg_count != 1 => {
-            Some(CompilerDiagnosticKind::RuneInvalidArgumentsLengthDerived)
+            Some(DiagnosticKind::RuneInvalidArgumentsLengthDerived)
         }
         "$effect" if arg_count != 1 => {
-            Some(CompilerDiagnosticKind::RuneInvalidArgumentsLengthEffect)
+            Some(DiagnosticKind::RuneInvalidArgumentsLengthEffect)
         }
         "$state.raw" if arg_count > 1 => {
-            Some(CompilerDiagnosticKind::RuneInvalidArgumentsLengthStateRaw)
+            Some(DiagnosticKind::RuneInvalidArgumentsLengthStateRaw)
         }
         "$state.snapshot" if arg_count != 1 => {
-            Some(CompilerDiagnosticKind::RuneInvalidArgumentsLengthStateSnapshot)
+            Some(DiagnosticKind::RuneInvalidArgumentsLengthStateSnapshot)
         }
-        "$state" if arg_count > 1 => Some(CompilerDiagnosticKind::RuneInvalidArgumentsLengthState),
+        "$state" if arg_count > 1 => Some(DiagnosticKind::RuneInvalidArgumentsLengthState),
         _ => None,
     }
 }
 
 fn collect_top_level_initializer_call_spans(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     call_name: &str,
-) -> std::collections::BTreeSet<(usize, usize)> {
+) -> std::collections::BTreeSet<SourceSpan> {
     let mut spans = std::collections::BTreeSet::new();
     for statement in &program.program().body {
         let variable = match statement {
@@ -1542,33 +1403,13 @@ fn collect_top_level_initializer_call_spans(
     spans
 }
 
-fn collect_top_level_expression_call_spans(
-    program: &ParsedJsProgram,
-    call_name: &str,
-) -> std::collections::BTreeSet<(usize, usize)> {
-    let mut spans = std::collections::BTreeSet::new();
-    for statement in &program.program().body {
-        let Statement::ExpressionStatement(expression) = statement else {
-            continue;
-        };
-        let OxcExpression::CallExpression(call) = expression.expression.get_inner_expression()
-        else {
-            continue;
-        };
-        if oxc_callee_name(&call.callee).as_deref() == Some(call_name) {
-            spans.insert(span_range(call.span));
-        }
-    }
-    spans
-}
-
 fn collect_all_expression_statement_call_spans(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     call_name: &str,
-) -> std::collections::BTreeSet<(usize, usize)> {
+) -> std::collections::BTreeSet<SourceSpan> {
     struct Visitor<'a> {
         call_name: &'a str,
-        spans: std::collections::BTreeSet<(usize, usize)>,
+        spans: std::collections::BTreeSet<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -1594,14 +1435,14 @@ fn collect_all_expression_statement_call_spans(
 }
 
 fn collect_allowed_initializer_call_spans(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     call_name: &str,
-) -> std::collections::BTreeSet<(usize, usize)> {
+) -> std::collections::BTreeSet<SourceSpan> {
     let mut spans = collect_top_level_initializer_call_spans(program, call_name);
 
     struct Visitor<'a> {
         call_name: &'a str,
-        spans: &'a mut std::collections::BTreeSet<(usize, usize)>,
+        spans: &'a mut std::collections::BTreeSet<SourceSpan>,
     }
 
     impl<'a, 'b> Visit<'a> for Visitor<'b> {
@@ -1653,8 +1494,8 @@ fn collect_allowed_initializer_call_spans(
 }
 
 fn collect_allowed_bindable_call_spans(
-    program: &ParsedJsProgram,
-) -> std::collections::BTreeSet<(usize, usize)> {
+    program: &JsProgram,
+) -> std::collections::BTreeSet<SourceSpan> {
     let mut spans = std::collections::BTreeSet::new();
     for statement in &program.program().body {
         let Statement::VariableDeclaration(declaration) = statement else {
@@ -1681,7 +1522,7 @@ fn collect_allowed_bindable_call_spans(
 
 fn collect_bindable_spans_from_object_pattern(
     pattern: &oxc_ast::ast::ObjectPattern<'_>,
-    spans: &mut std::collections::BTreeSet<(usize, usize)>,
+    spans: &mut std::collections::BTreeSet<SourceSpan>,
 ) {
     for property in &pattern.properties {
         collect_bindable_spans_from_pattern(&property.value, spans);
@@ -1693,7 +1534,7 @@ fn collect_bindable_spans_from_object_pattern(
 
 fn collect_bindable_spans_from_pattern(
     pattern: &BindingPattern<'_>,
-    spans: &mut std::collections::BTreeSet<(usize, usize)>,
+    spans: &mut std::collections::BTreeSet<SourceSpan>,
 ) {
     match pattern {
         BindingPattern::AssignmentPattern(pattern) => {
@@ -1719,26 +1560,26 @@ fn collect_bindable_spans_from_pattern(
     }
 }
 
-fn find_props_invalid_placement_component(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_props_invalid_placement_component(program: &JsProgram) -> Option<SourceSpan> {
     let allowed = collect_top_level_initializer_call_spans(program, "$props");
     find_first_call_span_by_name(program, "$props").filter(|span| !allowed.contains(span))
 }
 
-fn find_bindable_invalid_location(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_bindable_invalid_location(program: &JsProgram) -> Option<SourceSpan> {
     let allowed = collect_allowed_bindable_call_spans(program);
     find_first_call_span_by_name(program, "$bindable").filter(|span| !allowed.contains(span))
 }
 
 fn find_invalid_initializer_placement(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     call_name: &str,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     let allowed = collect_allowed_initializer_call_spans(program, call_name);
 
     struct Visitor<'n> {
         name: &'n str,
-        allowed: &'n std::collections::BTreeSet<(usize, usize)>,
-        found: Option<(usize, usize)>,
+        allowed: &'n std::collections::BTreeSet<SourceSpan>,
+        found: Option<SourceSpan>,
         function_depth: usize,
         in_constructor: bool,
     }
@@ -1807,13 +1648,13 @@ fn find_invalid_initializer_placement(
     visitor.found
 }
 
-fn find_effect_invalid_placement(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_effect_invalid_placement(program: &JsProgram) -> Option<SourceSpan> {
     // Collect all $effect() calls that are direct expression statements (allowed at any depth).
     let allowed = collect_all_expression_statement_call_spans(program, "$effect");
 
     struct Visitor<'a> {
-        allowed: &'a std::collections::BTreeSet<(usize, usize)>,
-        found: Option<(usize, usize)>,
+        allowed: &'a std::collections::BTreeSet<SourceSpan>,
+        found: Option<SourceSpan>,
         scopes: Vec<NameSet>,
     }
 
@@ -1886,7 +1727,7 @@ fn find_effect_invalid_placement(program: &ParsedJsProgram) -> Option<(usize, us
     visitor.found
 }
 
-fn find_static_state_call(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_static_state_call(program: &JsProgram) -> Option<SourceSpan> {
     for statement in &program.program().body {
         let Statement::ClassDeclaration(class) = statement else {
             continue;
@@ -1912,9 +1753,9 @@ fn find_static_state_call(program: &ParsedJsProgram) -> Option<(usize, usize)> {
     None
 }
 
-fn find_rune_missing_parentheses_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_rune_missing_parentheses_in_program(program: &JsProgram) -> Option<SourceSpan> {
     struct Visitor {
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -1966,9 +1807,9 @@ fn find_rune_missing_parentheses_in_program(program: &ParsedJsProgram) -> Option
     visitor.found
 }
 
-fn find_invalid_rune_name(program: &ParsedJsProgram) -> Option<(Arc<str>, usize, usize)> {
+fn find_invalid_rune_name(program: &JsProgram) -> Option<NamedSpan> {
     struct Visitor {
-        found: Option<(Arc<str>, usize, usize)>,
+        found: Option<NamedSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -1985,22 +1826,18 @@ fn find_invalid_rune_name(program: &ParsedJsProgram) -> Option<(Arc<str>, usize,
                 return;
             };
             if object.name.as_str() == "$state" && !matches!(property_name, "raw" | "snapshot") {
-                let (start, end) = span_range(it.span());
-                self.found = Some((
+                self.found = Some(NamedSpan::new(
                     Arc::from(format!("{}.{}", object.name, property_name)),
-                    start,
-                    end,
+                    span_range(it.span()),
                 ));
                 return;
             }
             if object.name.as_str() == "$effect"
                 && !matches!(property_name, "active" | "pre" | "tracking" | "root")
             {
-                let (start, end) = span_range(it.span());
-                self.found = Some((
+                self.found = Some(NamedSpan::new(
                     Arc::from(format!("{}.{}", object.name, property_name)),
-                    start,
-                    end,
+                    span_range(it.span()),
                 ));
                 return;
             }
@@ -2014,9 +1851,9 @@ fn find_invalid_rune_name(program: &ParsedJsProgram) -> Option<(Arc<str>, usize,
     visitor.found
 }
 
-fn find_renamed_effect_active_oxc(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_renamed_effect_active_oxc(program: &JsProgram) -> Option<SourceSpan> {
     struct Visitor {
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -2041,7 +1878,7 @@ fn find_renamed_effect_active_oxc(program: &ParsedJsProgram) -> Option<(usize, u
     visitor.found
 }
 
-fn collect_script_immutable_bindings(program: &ParsedJsProgram, out: &mut NameSet) {
+fn collect_script_immutable_bindings(program: &JsProgram, out: &mut NameSet) {
     for statement in &program.program().body {
         match statement {
             Statement::ImportDeclaration(declaration) => {
@@ -2084,14 +1921,14 @@ fn collect_script_immutable_bindings(program: &ParsedJsProgram, out: &mut NameSe
     }
 }
 
-fn find_constant_assignment_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_constant_assignment_in_program(program: &JsProgram) -> Option<SourceSpan> {
     let mut immutables = NameSet::default();
     collect_script_immutable_bindings(program, &mut immutables);
 
     struct Visitor<'a> {
         immutables: &'a NameSet,
         locals: Vec<NameSet>,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visitor<'a> {
@@ -2193,7 +2030,7 @@ fn find_constant_assignment_in_program(program: &ParsedJsProgram) -> Option<(usi
     visitor.found
 }
 
-fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassStateFieldError> {
+fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFieldError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FieldOrigin {
         /// Field declaration with no initializer (e.g., `count;`)
@@ -2205,7 +2042,7 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
 
     #[derive(Clone, Copy)]
     struct RecordedField {
-        span: Span,
+        _span: Span,
         origin: FieldOrigin,
     }
 
@@ -2347,11 +2184,9 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
                                     OxcExpression::ThisExpression(_)
                                 )
                             {
-                                let (start, end) = span_range(assignment.right.span());
                                 return Some(ClassStateFieldError {
-                                    kind: CompilerDiagnosticKind::StateInvalidPlacement,
-                                    start,
-                                    end,
+                                    kind: DiagnosticKind::StateInvalidPlacement,
+                                    span: span_range(assignment.right.span()),
                                 });
                             }
                         }
@@ -2370,41 +2205,37 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
                                 info.fields.insert(
                                     name,
                                     RecordedField {
-                                        span: assignment.span,
+                                        _span: assignment.span,
                                         origin: FieldOrigin::StateField,
                                     },
                                 );
                                 return None;
                             }
                             FieldOrigin::InitializedField | FieldOrigin::StateField => {
-                                let (start, end) = span_range(assignment.span);
                                 let kind = if existing.origin == FieldOrigin::StateField {
-                                    CompilerDiagnosticKind::StateFieldDuplicate { name }
+                                    DiagnosticKind::StateFieldDuplicate { name }
                                 } else {
-                                    CompilerDiagnosticKind::DuplicateClassField { name }
+                                    DiagnosticKind::DuplicateClassField { name }
                                 };
                                 return Some(ClassStateFieldError {
                                     kind,
-                                    start,
-                                    end,
+                                    span: span_range(assignment.span),
                                 });
                             }
                         }
                     }
 
                     if let Some(previous) = info.pending_assignments.remove(name.as_ref()) {
-                        let (start, end) = span_range(previous);
                         return Some(ClassStateFieldError {
-                            kind: CompilerDiagnosticKind::StateFieldInvalidAssignment,
-                            start,
-                            end,
+                            kind: DiagnosticKind::StateFieldInvalidAssignment,
+                            span: span_range(previous),
                         });
                     }
 
                     info.fields.insert(
                         name,
                         RecordedField {
-                            span: assignment.span,
+                            _span: assignment.span,
                             origin: FieldOrigin::StateField,
                         },
                     );
@@ -2435,11 +2266,9 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
                     };
                     let key = Arc::<str>::from(name);
                     if info.fields.contains_key(key.as_ref()) {
-                        let (start, end) = span_range(property.span);
                         return Some(ClassStateFieldError {
-                            kind: CompilerDiagnosticKind::DuplicateClassField { name: key },
-                            start,
-                            end,
+                            kind: DiagnosticKind::DuplicateClassField { name: key },
+                            span: span_range(property.span),
                         });
                     }
                     let origin = match &property.value {
@@ -2452,7 +2281,7 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
                     info.fields.insert(
                         key,
                         RecordedField {
-                            span: property.span,
+                            _span: property.span,
                             origin,
                         },
                     );
@@ -2470,7 +2299,7 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
                         info.fields.insert(
                             Arc::<str>::from(name),
                             RecordedField {
-                                span: property.span,
+                                _span: property.span,
                                 origin: FieldOrigin::PlainField,
                             },
                         );
@@ -2524,11 +2353,11 @@ fn find_class_state_field_error_oxc(program: &ParsedJsProgram) -> Option<ClassSt
 pub(super) fn find_constant_assignment_in_expression(
     expression: &Expression,
     outer_immutables: &NameSet,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     struct Visitor<'a> {
         outer_immutables: &'a NameSet,
         locals: Vec<NameSet>,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visitor<'a> {
@@ -2675,9 +2504,9 @@ fn compile_error_custom_runes(
     }
 }
 
-fn find_store_invalid_subscription(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_store_invalid_subscription(program: &JsProgram) -> Option<SourceSpan> {
     struct Visitor {
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -2706,27 +2535,25 @@ fn find_store_invalid_subscription(program: &ParsedJsProgram) -> Option<(usize, 
 
 fn detect_dollar_binding_error_in_program(
     source: &str,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     runes_mode: bool,
 ) -> Option<CompileError> {
-    if let Some((start, _end)) = find_dollar_binding_invalid_declaration(program, runes_mode) {
-        return Some(compile_error_with_range(
+    if let Some(span) = find_dollar_binding_invalid_declaration(program, runes_mode) {
+        return Some(SourceSpan::new(span.start, span.start + 1).to_compile_error(
             source,
-            CompilerDiagnosticKind::DollarBindingInvalid,
-            start,
-            start + 1,
+            DiagnosticKind::DollarBindingInvalid,
         ));
     }
     None
 }
 
 fn find_dollar_binding_invalid_declaration(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     runes_mode: bool,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     struct Visitor {
         runes_mode: bool,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -2799,76 +2626,18 @@ fn find_dollar_binding_invalid_declaration(
     visitor.found
 }
 
-pub(super) fn detect_global_reference_invalid_in_scripts(
-    source: &str,
-    root: &Root,
-    check_store_refs: bool,
-) -> Option<CompileError> {
-    // Collect all top-level declarations across both scripts so that
-    // store subscriptions like `$foo` in the instance can find `foo`
-    // declared/imported in the module script (and vice versa).
-    let mut all_declared = NameSet::default();
-    for script in [&root.module, &root.instance] {
-        if let Some(script) = script.as_ref() {
-            let names = collect_declared_names_in_program(&script.content);
-            all_declared.extend(names);
-        }
-    }
-    // In legacy mode, `$:` reactive labels create store subscriptions
-    // (e.g. `$: $foo;` declares `$foo`). Add these to the declared set
-    // so they aren't flagged as invalid global references.
-    if let Some(instance) = root.instance.as_ref() {
-        collect_dollar_label_store_subscriptions(&mut all_declared, instance.oxc_program());
-    }
-
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((ident, start, end)) =
-            find_global_reference_invalid_in_program_with_extra_declared(
-                &script.content,
-                &all_declared,
-                check_store_refs,
-            )
-        {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::GlobalReferenceInvalid { ident },
-                start + offset,
-                end + offset,
-            ));
-        }
-    }
-    None
-}
-
-pub(super) fn detect_global_reference_invalid_module(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (ident, start, end) = find_global_reference_invalid_in_program(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::GlobalReferenceInvalid { ident },
-        start,
-        end,
-    ))
-}
-
 fn find_global_reference_invalid_in_program(
-    program: &ParsedJsProgram,
-) -> Option<(Arc<str>, usize, usize)> {
+    program: &JsProgram,
+) -> Option<NamedSpan> {
     // Module files (.svelte.js) are always runes mode
     find_global_reference_invalid_in_program_with_extra_declared(program, &NameSet::default(), true)
 }
 
 fn find_global_reference_invalid_in_program_with_extra_declared(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     extra_declared: &NameSet,
     runes_mode: bool,
-) -> Option<(Arc<str>, usize, usize)> {
+) -> Option<NamedSpan> {
     let mut declared = collect_declared_names_in_program(program);
     declared.extend(extra_declared.iter().cloned());
 
@@ -2876,7 +2645,7 @@ fn find_global_reference_invalid_in_program_with_extra_declared(
         declared: &'a NameSet,
         runes_mode: bool,
         scopes: Vec<NameSet>,
-        found: Option<(Arc<str>, usize, usize)>,
+        found: Option<NamedSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -2980,8 +2749,7 @@ fn find_global_reference_invalid_in_program_with_extra_declared(
             {
                 return;
             }
-            let (start, end) = span_range(it.span);
-            self.found = Some((Arc::from(name), start, end));
+            self.found = Some(NamedSpan::new(Arc::from(name), span_range(it.span)));
         }
     }
 
@@ -2999,14 +2767,14 @@ fn find_invalid_global_reference_in_expression(
     expression: &Expression,
     declared: &NameSet,
     runes_mode: bool,
-) -> Option<(Arc<str>, usize, usize)> {
+) -> Option<NamedSpan> {
     let oxc_expr = expression.oxc_expression()?;
     let offset = expression.start;
 
     struct Visitor<'a> {
         declared: &'a NameSet,
         runes_mode: bool,
-        found: Option<(Arc<str>, usize, usize)>,
+        found: Option<NamedSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -3040,8 +2808,7 @@ fn find_invalid_global_reference_in_expression(
             if !alias.is_empty() && self.declared.contains(alias) {
                 return;
             }
-            let (start, end) = span_range(it.span);
-            self.found = Some((Arc::from(name), start, end));
+            self.found = Some(NamedSpan::new(Arc::from(name), span_range(it.span)));
         }
     }
 
@@ -3053,14 +2820,14 @@ fn find_invalid_global_reference_in_expression(
     visitor.visit_expression(oxc_expr);
     visitor
         .found
-        .map(|(name, start, end)| (name, start + offset, end + offset))
+        .map(|named| NamedSpan::new(named.name, named.span.offset(offset)))
 }
 
 fn find_invalid_global_reference_in_fragment_with_declared(
     fragment: &Fragment,
     runes_mode: bool,
     declared: &NameSet,
-) -> Option<(Arc<str>, usize, usize)> {
+) -> Option<NamedSpan> {
     fragment.find_map(|entry| {
         let node = entry.as_node()?;
         match node {
@@ -3081,7 +2848,7 @@ fn find_invalid_global_reference_in_fragment_with_declared(
     })
 }
 
-fn find_state_in_each_header_fragment(fragment: &Fragment) -> Option<(usize, usize)> {
+fn find_state_in_each_header_fragment(fragment: &Fragment) -> Option<SourceSpan> {
     fragment.find_map(|entry| {
         let node = entry.as_node()?;
         let Node::EachBlock(block) = node else {
@@ -3099,11 +2866,11 @@ fn find_state_in_each_header_fragment(fragment: &Fragment) -> Option<(usize, usi
     })
 }
 
-fn find_state_call_in_expression(expression: &Expression) -> Option<(usize, usize)> {
+fn find_state_call_in_expression(expression: &Expression) -> Option<SourceSpan> {
     let expression = expression.oxc_expression()?;
 
     struct Visitor {
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor {
@@ -3153,7 +2920,7 @@ fn find_render_tag_error_in_fragment(fragment: &Fragment) -> Option<RenderTagDia
 fn find_store_invalid_scoped_subscription(
     fragment: &Fragment,
     scoped_aliases: &mut AliasStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     fragment.walk(
         scoped_aliases,
         |entry, scoped_aliases| {
@@ -3269,12 +3036,12 @@ fn find_store_invalid_scoped_subscription(
 fn find_store_invalid_scoped_subscription_in_attributes(
     attributes: &[Attribute],
     scoped_aliases: &AliasStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     for attribute in attributes.iter() {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) = find_store_invalid_scoped_subscription_in_expression(
@@ -3286,7 +3053,7 @@ fn find_store_invalid_scoped_subscription_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) = find_store_invalid_scoped_subscription_in_expression(
                         &tag.expression,
                         scoped_aliases,
@@ -3309,8 +3076,8 @@ fn find_store_invalid_scoped_subscription_in_attributes(
                 }
             }
             Attribute::StyleDirective(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) = find_store_invalid_scoped_subscription_in_expression(
@@ -3322,7 +3089,7 @@ fn find_store_invalid_scoped_subscription_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) = find_store_invalid_scoped_subscription_in_expression(
                         &tag.expression,
                         scoped_aliases,
@@ -3363,13 +3130,13 @@ fn find_store_invalid_scoped_subscription_in_attributes(
 fn find_store_invalid_scoped_subscription_in_expression(
     expression: &Expression,
     scoped_aliases: &AliasStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     let expression = expression.oxc_expression()?;
 
     struct Visitor<'a> {
         aliases: &'a AliasStack,
         js_scopes: Vec<NameSet>,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl Visitor<'_> {
@@ -3447,7 +3214,7 @@ fn find_store_invalid_scoped_subscription_in_expression(
     visitor.found
 }
 
-fn find_state_call_in_each_binding_shape(block: &EachBlock) -> Option<(usize, usize)> {
+fn find_state_call_in_each_binding_shape(block: &EachBlock) -> Option<SourceSpan> {
     if !block.has_as_clause {
         return None;
     }
@@ -3456,18 +3223,18 @@ fn find_state_call_in_each_binding_shape(block: &EachBlock) -> Option<(usize, us
     if context.identifier_name().as_deref() != Some("$state") {
         return None;
     }
-    Some((context.start, key.end))
+    Some(SourceSpan::new(context.start, key.end))
 }
 
 fn find_store_invalid_scoped_subscription_in_program(
-    program: &ParsedJsProgram,
-) -> Option<(usize, usize)> {
+    program: &JsProgram,
+) -> Option<SourceSpan> {
     let declared = collect_declared_names_in_program(program);
 
     struct Visitor<'a> {
         declared: &'a NameSet,
         scopes: Vec<NameSet>,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -3668,7 +3435,7 @@ fn collect_names_from_assignment_target_maybe_default(
     }
 }
 
-fn collect_declared_names_in_program(program: &ParsedJsProgram) -> NameSet {
+fn collect_declared_names_in_program(program: &JsProgram) -> NameSet {
     let mut names = NameSet::default();
     collect_declared_names_in_statements(&mut names, &program.program().body);
     names
@@ -3734,7 +3501,7 @@ fn collect_declared_names_in_statements(names: &mut NameSet, statements: &[State
 
 fn collect_binding_identifier_spans(
     pattern: &BindingPattern<'_>,
-    names: &mut Vec<(String, (usize, usize))>,
+    names: &mut Vec<(String, SourceSpan)>,
 ) {
     match pattern {
         BindingPattern::BindingIdentifier(identifier) => {
@@ -3767,21 +3534,20 @@ fn scoped_store_identifier_span(
     start: usize,
     end: usize,
     scoped_aliases: &AliasStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     let alias = identifier.strip_prefix('$')?;
     if alias.is_empty() {
         return None;
     }
     if scoped_aliases.contains(alias) {
-        return Some((start, end));
+        return Some(SourceSpan::new(start, end));
     }
     None
 }
 
 struct RenderTagDiagnostic {
-    kind: CompilerDiagnosticKind,
-    start: usize,
-    end: usize,
+    kind: DiagnosticKind,
+    span: SourceSpan,
 }
 
 fn validate_render_tag(tag: &crate::ast::modern::RenderTag) -> Option<RenderTagDiagnostic> {
@@ -3790,28 +3556,24 @@ fn validate_render_tag(tag: &crate::ast::modern::RenderTag) -> Option<RenderTagD
         Some(OxcExpression::ChainExpression(chain)) => {
             let ChainElement::CallExpression(call) = &chain.expression else {
                 return Some(RenderTagDiagnostic {
-                    kind: CompilerDiagnosticKind::RenderTagInvalidExpression,
-                    start: tag.start,
-                    end: tag.end,
+                    kind: DiagnosticKind::RenderTagInvalidExpression,
+                    span: SourceSpan::new(tag.start, tag.end),
                 });
             };
             (call, true)
         }
         _ => {
             return Some(RenderTagDiagnostic {
-                kind: CompilerDiagnosticKind::RenderTagInvalidExpression,
-                start: tag.start,
-                end: tag.end,
+                kind: DiagnosticKind::RenderTagInvalidExpression,
+                span: SourceSpan::new(tag.start, tag.end),
             });
         }
     };
 
     if call.arguments.iter().any(|argument| argument.is_spread()) {
-        let (start, end) = span_range(call.span);
         return Some(RenderTagDiagnostic {
-            kind: CompilerDiagnosticKind::RenderTagInvalidSpreadArgument,
-            start,
-            end,
+            kind: DiagnosticKind::RenderTagInvalidSpreadArgument,
+            span: span_range(call.span),
         });
     }
 
@@ -3820,9 +3582,8 @@ fn validate_render_tag(tag: &crate::ast::modern::RenderTag) -> Option<RenderTagD
         && matches!(member.property.name.as_str(), "apply" | "bind" | "call")
     {
         return Some(RenderTagDiagnostic {
-            kind: CompilerDiagnosticKind::RenderTagInvalidCallExpression,
-            start: tag.start,
-            end: tag.end,
+            kind: DiagnosticKind::RenderTagInvalidCallExpression,
+            span: SourceSpan::new(tag.start, tag.end),
         });
     }
 

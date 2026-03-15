@@ -1,5 +1,6 @@
 use super::*;
 use crate::ast::modern::{Fragment, Node};
+use crate::source::{NamedSpan, SourceSpan};
 use crate::{SourceId, SourceText};
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
@@ -10,7 +11,7 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_span::{GetSpan, Span};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExportMode {
@@ -18,91 +19,86 @@ pub(super) enum ExportMode {
     Module,
 }
 
-pub(super) fn detect_import_svelte_internal_forbidden(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        if let Some((start, end)) = find_import_svelte_internal_in_program(script.content.as_ref())
-        {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::ImportSvelteInternalForbidden,
-                start + offset,
-                end + offset,
-            ));
+impl ComponentValidator<'_> {
+    pub(super) fn import_svelte_internal_forbidden(&self) -> Option<CompileError> {
+        for script in [&self.root.module, &self.root.instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            if let Some(span) = find_import_svelte_internal_in_program(script.content.as_ref()) {
+                return Some(
+                    span.offset(offset)
+                        .to_compile_error(self.source, DiagnosticKind::ImportSvelteInternalForbidden),
+                );
+            }
         }
+        None
     }
-    None
-}
 
-pub(super) fn detect_import_svelte_internal(
-    source: &str,
-    program: &ParsedJsProgram,
-) -> Option<CompileError> {
-    let (start, end) = find_import_svelte_internal_in_program(program)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::ImportSvelteInternalForbidden,
-        start,
-        end,
-    ))
-}
+    pub(super) fn export_rules_in_module_scripts(&self) -> Option<CompileError> {
+        if let Some(instance) = self.root.instance.as_ref()
+            && let Some(span) = find_any_export_default(instance.content.as_ref())
+        {
+            let offset = instance.content_start;
+            return Some(
+                span.offset(offset)
+                    .to_compile_error(self.source, DiagnosticKind::ModuleIllegalDefaultExport),
+            );
+        }
 
-pub(super) fn detect_export_rules_in_module_scripts(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    if let Some(instance) = root.instance.as_ref()
-        && let Some((start, end)) = find_any_export_default(instance.content.as_ref())
-    {
+        let module = self.root.module.as_ref()?;
+        let mut exportable_snippets = NameSet::default();
+        collect_exportable_snippet_names(&self.root.fragment, &mut exportable_snippets);
+        detect_export_rules_impl(
+            self.source,
+            module.content.as_ref(),
+            &exportable_snippets,
+            ExportMode::Component,
+            module.content_start,
+        )
+    }
+
+    pub(super) fn declaration_duplicate_module_import(&self) -> Option<CompileError> {
+        let module = self.root.module.as_ref()?;
+        let instance = self.root.instance.as_ref()?;
+
+        let imported = collect_module_import_local_names(module.content.as_ref());
+        if imported.is_empty() {
+            return None;
+        }
+
         let offset = instance.content_start;
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::ModuleIllegalDefaultExport,
-            start + offset,
-            end + offset,
-        ));
+        let span = find_duplicate_module_import_declaration(instance.content.as_ref(), &imported)?;
+        Some(compile_error_custom_imports(
+            self.source,
+            "declaration_duplicate_module_import",
+            "Cannot declare a variable with the same name as an import inside `<script module>`",
+            span.start + offset,
+            span.end + offset,
+        ))
     }
-
-    let module = root.module.as_ref()?;
-    let mut exportable_snippets = NameSet::default();
-    collect_exportable_snippet_names(&root.fragment, &mut exportable_snippets);
-    detect_export_rules(
-        source,
-        module.content.as_ref(),
-        &exportable_snippets,
-        ExportMode::Component,
-        module.content_start,
-    )
 }
 
-pub(super) fn detect_declaration_duplicate_module_import(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let module = root.module.as_ref()?;
-    let instance = root.instance.as_ref()?;
-
-    let imported = collect_module_import_local_names(module.content.as_ref());
-    if imported.is_empty() {
-        return None;
+impl ScriptValidator<'_> {
+    pub(super) fn import_svelte_internal(&self) -> Option<CompileError> {
+        let span = find_import_svelte_internal_in_program(self.program())?;
+        Some(span.to_compile_error(self.source(), DiagnosticKind::ImportSvelteInternalForbidden))
     }
 
-    let offset = instance.content_start;
-    let (start, end) =
-        find_duplicate_module_import_declaration(instance.content.as_ref(), &imported)?;
-    Some(compile_error_custom_imports(
-        source,
-        "declaration_duplicate_module_import",
-        "Cannot declare a variable with the same name as an import inside `<script module>`",
-        start + offset,
-        end + offset,
-    ))
+    pub(super) fn export_rules(
+        &self,
+        additional_exportables: &NameSet,
+        mode: ExportMode,
+    ) -> Option<CompileError> {
+        detect_export_rules_impl(
+            self.source(),
+            self.program(),
+            additional_exportables,
+            mode,
+            self.offset(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,23 +116,21 @@ struct RuneDecl {
     exported_direct: bool,
 }
 
-pub(super) fn detect_export_rules(
+fn detect_export_rules_impl(
     source: &str,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     additional_exportables: &NameSet,
     mode: ExportMode,
     offset: usize,
 ) -> Option<CompileError> {
     let body = &program.program().body;
     if mode == ExportMode::Component
-        && let Some((start, end)) = find_illegal_default_export_in_body(body)
+        && let Some(span) = find_illegal_default_export_in_body(body)
     {
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::ModuleIllegalDefaultExport,
-            start + offset,
-            end + offset,
-        ));
+        return Some(
+            span.offset(offset)
+                .to_compile_error(source, DiagnosticKind::ModuleIllegalDefaultExport),
+        );
     }
 
     let rune_decls = collect_rune_decls(body);
@@ -149,26 +143,22 @@ pub(super) fn detect_export_rules(
         if decl.exported_direct {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::DerivedInvalidExport,
+                DiagnosticKind::DerivedInvalidExport,
                 decl.statement_start + offset,
                 decl.statement_end + offset,
             ));
         }
-        if let Some((start, end)) = find_export_default_of(body, decl.name.as_ref()) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::DerivedInvalidExport,
-                start + offset,
-                end + offset,
-            ));
+        if let Some(span) = find_export_default_of(body, decl.name.as_ref()) {
+            return Some(
+                span.offset(offset)
+                    .to_compile_error(source, DiagnosticKind::DerivedInvalidExport),
+            );
         }
-        if let Some((start, end)) = find_export_list_name(body, decl.name.as_ref()) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::DerivedInvalidExport,
-                start + offset,
-                end + offset,
-            ));
+        if let Some(span) = find_export_list_name(body, decl.name.as_ref()) {
+            return Some(
+                span.offset(offset)
+                    .to_compile_error(source, DiagnosticKind::DerivedInvalidExport),
+            );
         }
     }
 
@@ -178,7 +168,7 @@ pub(super) fn detect_export_rules(
     {
         let reassigned = reassignments
             .get(decl.name.as_ref())
-            .is_some_and(|(start, _)| *start > decl.statement_end);
+            .is_some_and(|s| s.start > decl.statement_end);
         if !reassigned {
             continue;
         }
@@ -186,42 +176,38 @@ pub(super) fn detect_export_rules(
         if decl.exported_direct {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::StateInvalidExport,
+                DiagnosticKind::StateInvalidExport,
                 decl.statement_start + offset,
                 decl.statement_end + offset,
             ));
         }
-        if let Some((start, end)) = find_export_default_of(body, decl.name.as_ref()) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::StateInvalidExport,
-                start + offset,
-                end + offset,
-            ));
+        if let Some(span) = find_export_default_of(body, decl.name.as_ref()) {
+            return Some(
+                span.offset(offset)
+                    .to_compile_error(source, DiagnosticKind::StateInvalidExport),
+            );
         }
-        if let Some((start, end)) = find_export_list_name(body, decl.name.as_ref()) {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::StateInvalidExport,
-                start + offset,
-                end + offset,
-            ));
+        if let Some(span) = find_export_list_name(body, decl.name.as_ref()) {
+            return Some(
+                span.offset(offset)
+                    .to_compile_error(source, DiagnosticKind::StateInvalidExport),
+            );
         }
     }
 
-    if let Some((name, start, end)) = find_undefined_export_name(body, additional_exportables) {
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::ExportUndefined { name },
-            start + offset,
-            end + offset,
-        ));
+    if let Some(named) = find_undefined_export_name(body, additional_exportables) {
+        return Some(
+            named
+                .span
+                .offset(offset)
+                .to_compile_error(source, DiagnosticKind::ExportUndefined { name: named.name }),
+        );
     }
 
     None
 }
 
-fn find_import_svelte_internal_in_program(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_import_svelte_internal_in_program(program: &JsProgram) -> Option<SourceSpan> {
     for statement in &program.program().body {
         let Statement::ImportDeclaration(declaration) = statement else {
             continue;
@@ -230,7 +216,7 @@ fn find_import_svelte_internal_in_program(program: &ParsedJsProgram) -> Option<(
         if !import_source.contains("svelte/internal/") {
             continue;
         }
-        return Some(span_range(declaration.source.span));
+        return Some(SourceSpan::from_oxc(declaration.source.span));
     }
     None
 }
@@ -279,7 +265,7 @@ fn collect_rune_decls_from_variable_declaration(
     let Some(statement_span) = statement_span.or_else(|| Some(declaration.span)) else {
         return;
     };
-    let (statement_start, statement_end) = span_range(statement_span);
+    let span = SourceSpan::from_oxc(statement_span);
 
     for declarator in &declaration.declarations {
         let Some(name) = binding_pattern_identifier_name(&declarator.id) else {
@@ -299,22 +285,24 @@ fn collect_rune_decls_from_variable_declaration(
         out.push(RuneDecl {
             kind,
             name: Arc::from(name),
-            statement_start,
-            statement_end,
+            statement_start: span.start,
+            statement_end: span.end,
             exported_direct,
         });
     }
 }
 
-fn collect_reassignments(program: &ParsedJsProgram) -> BTreeMap<Arc<str>, (usize, usize)> {
+fn collect_reassignments(program: &JsProgram) -> BTreeMap<Arc<str>, SourceSpan> {
     struct ReassignmentVisitor {
-        out: BTreeMap<Arc<str>, (usize, usize)>,
+        out: BTreeMap<Arc<str>, SourceSpan>,
     }
 
     impl<'a> Visit<'a> for ReassignmentVisitor {
         fn visit_assignment_expression(&mut self, it: &oxc_ast::ast::AssignmentExpression<'a>) {
             if let Some((name, span)) = assignment_target_identifier_name_and_span(&it.left) {
-                self.out.entry(Arc::from(name)).or_insert(span_range(span));
+                self.out
+                    .entry(Arc::from(name))
+                    .or_insert(SourceSpan::from_oxc(span));
             }
             walk::walk_assignment_expression(self, it);
         }
@@ -323,7 +311,7 @@ fn collect_reassignments(program: &ParsedJsProgram) -> BTreeMap<Arc<str>, (usize
             if let Some(name) = it.argument.get_identifier_name() {
                 self.out
                     .entry(Arc::from(name))
-                    .or_insert(span_range(it.argument.span()));
+                    .or_insert(SourceSpan::from_oxc(it.argument.span()));
             }
             walk::walk_update_expression(self, it);
         }
@@ -336,27 +324,27 @@ fn collect_reassignments(program: &ParsedJsProgram) -> BTreeMap<Arc<str>, (usize
     visitor.out
 }
 
-fn find_export_default_of(body: &[Statement<'_>], name: &str) -> Option<(usize, usize)> {
+fn find_export_default_of(body: &[Statement<'_>], name: &str) -> Option<SourceSpan> {
     for statement in body {
         let Statement::ExportDefaultDeclaration(declaration) = statement else {
             continue;
         };
         if export_default_identifier_name(&declaration.declaration) == Some(name) {
-            return Some(span_range(declaration.span));
+            return Some(SourceSpan::from_oxc(declaration.span));
         }
     }
     None
 }
 
-fn find_any_export_default(program: &ParsedJsProgram) -> Option<(usize, usize)> {
+fn find_any_export_default(program: &JsProgram) -> Option<SourceSpan> {
     find_illegal_default_export_in_body(&program.program().body)
 }
 
-fn find_illegal_default_export_in_body(body: &[Statement<'_>]) -> Option<(usize, usize)> {
+fn find_illegal_default_export_in_body(body: &[Statement<'_>]) -> Option<SourceSpan> {
     for statement in body {
         match statement {
             Statement::ExportDefaultDeclaration(declaration) => {
-                return Some(span_range(declaration.span));
+                return Some(SourceSpan::from_oxc(declaration.span));
             }
             Statement::ExportNamedDeclaration(declaration) if declaration.source.is_none() => {
                 let exports_default = declaration
@@ -364,7 +352,7 @@ fn find_illegal_default_export_in_body(body: &[Statement<'_>]) -> Option<(usize,
                     .iter()
                     .any(|specifier| specifier.exported.name().as_ref() == "default");
                 if exports_default {
-                    return Some(span_range(declaration.span));
+                    return Some(SourceSpan::from_oxc(declaration.span));
                 }
             }
             _ => {}
@@ -374,7 +362,7 @@ fn find_illegal_default_export_in_body(body: &[Statement<'_>]) -> Option<(usize,
     None
 }
 
-fn find_export_list_name(body: &[Statement<'_>], name: &str) -> Option<(usize, usize)> {
+fn find_export_list_name(body: &[Statement<'_>], name: &str) -> Option<SourceSpan> {
     for statement in body {
         let Statement::ExportNamedDeclaration(declaration) = statement else {
             continue;
@@ -384,7 +372,7 @@ fn find_export_list_name(body: &[Statement<'_>], name: &str) -> Option<(usize, u
         }
         for specifier in &declaration.specifiers {
             if module_export_name_as_str(&specifier.local) == Some(name) {
-                return Some(span_range(specifier.local.span()));
+                return Some(SourceSpan::from_oxc(specifier.local.span()));
             }
         }
     }
@@ -394,7 +382,7 @@ fn find_export_list_name(body: &[Statement<'_>], name: &str) -> Option<(usize, u
 fn find_undefined_export_name(
     body: &[Statement<'_>],
     additional_exportables: &NameSet,
-) -> Option<(Arc<str>, usize, usize)> {
+) -> Option<NamedSpan> {
     let declared = collect_declared_names(body);
     for statement in body {
         let Statement::ExportNamedDeclaration(declaration) = statement else {
@@ -410,8 +398,8 @@ fn find_undefined_export_name(
             if declared.contains(name) || additional_exportables.contains(name) {
                 continue;
             }
-            let (start, end) = span_range(specifier.local.span());
-            return Some((Arc::from(name), start, end));
+            let span = SourceSpan::from_oxc(specifier.local.span());
+            return Some(NamedSpan::new(Arc::from(name), span));
         }
     }
     None
@@ -427,7 +415,7 @@ fn collect_exportable_snippet_names(fragment: &Fragment, out: &mut NameSet) {
 fn collect_exportable_snippet_names_in_node(node: &Node, out: &mut NameSet) {
     match node {
         Node::SnippetBlock(block) => {
-            if let Some(name) = expression_identifier_name(&block.expression) {
+            if let Some(name) = block.expression.identifier_name() {
                 out.insert(name);
             }
         }
@@ -543,7 +531,7 @@ fn collect_declared_names_from_variable(
     }
 }
 
-fn collect_module_import_local_names(program: &ParsedJsProgram) -> NameSet {
+fn collect_module_import_local_names(program: &JsProgram) -> NameSet {
     let mut names = NameSet::default();
 
     for statement in &program.program().body {
@@ -565,9 +553,9 @@ fn collect_module_import_local_names(program: &ParsedJsProgram) -> NameSet {
 }
 
 fn find_duplicate_module_import_declaration(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     imported: &NameSet,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     for statement in &program.program().body {
         let Statement::VariableDeclaration(declaration) = statement else {
             continue;
@@ -585,11 +573,13 @@ fn find_duplicate_module_import_declaration(
 fn find_duplicate_import_binding_span(
     pattern: &BindingPattern<'_>,
     imported: &NameSet,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     match pattern {
         BindingPattern::BindingIdentifier(identifier) => {
             let name = identifier.name.as_str();
-            imported.contains(name).then(|| span_range(identifier.span))
+            imported
+                .contains(name)
+                .then(|| SourceSpan::from_oxc(identifier.span))
         }
         BindingPattern::AssignmentPattern(pattern) => {
             find_duplicate_import_binding_span(&pattern.left, imported)
@@ -617,10 +607,6 @@ fn find_duplicate_import_binding_span(
             None
         }
     }
-}
-
-fn span_range(span: Span) -> (usize, usize) {
-    (span.start as usize, span.end as usize)
 }
 
 fn compile_error_custom_imports(
@@ -688,7 +674,7 @@ fn export_default_identifier_name<'a>(
 
 fn callee_name(callee: &OxcExpression<'_>) -> Option<String> {
     match callee.get_inner_expression() {
-        OxcExpression::Identifier(reference) => Some(reference.name.as_str().to_owned()),
+        OxcExpression::Identifier(reference) => Some(reference.name.to_string()),
         OxcExpression::StaticMemberExpression(member) => {
             let object = member.object.get_inner_expression();
             let OxcExpression::Identifier(object) = object else {

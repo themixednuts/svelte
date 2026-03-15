@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-pub(super) use super::modern::expression_identifier_name;
 use super::*;
 use crate::ast::modern::Root;
 use crate::compiler::phases::parse::ParsedModuleProgram;
-use crate::error::CompilerDiagnosticKind;
+use crate::error::DiagnosticKind;
 use crate::{SourceId, SourceText};
 
 mod css;
@@ -21,9 +20,72 @@ pub(crate) use self::scope::{
 };
 pub(super) use crate::names::{NameMark, NameSet, NameStack, OrderedNames};
 
+/// Validation context for a parsed Svelte component.
+///
+/// Bundles `source` and `root` together so that the 60+ `detect_*` free
+/// functions can become methods, eliminating repeated parameter threading.
+/// Each validation sub-module (runes, template, css, imports, snippet) adds
+/// its own `impl ComponentValidator<'_>` block.
+pub(crate) struct ComponentValidator<'a> {
+    source: &'a str,
+    root: &'a Root,
+}
+
+impl<'a> ComponentValidator<'a> {
+    pub(crate) fn new(source: &'a str, root: &'a Root) -> Self {
+        Self { source, root }
+    }
+
+    pub(super) fn source(&self) -> &str {
+        self.source
+    }
+
+    pub(super) fn root(&self) -> &Root {
+        self.root
+    }
+}
+
+/// Validation context for a parsed JavaScript/TypeScript module program.
+///
+/// Bundles `source`, `program`, and an optional byte `offset` (for script
+/// blocks embedded in `.svelte` files) so that module-level `detect_*` free
+/// functions can become methods. Each sub-module adds its own
+/// `impl ScriptValidator<'_>` block.
+pub(crate) struct ScriptValidator<'a> {
+    source: &'a str,
+    program: &'a svelte_syntax::JsProgram,
+    offset: usize,
+}
+
+impl<'a> ScriptValidator<'a> {
+    pub(crate) fn new(
+        source: &'a str,
+        program: &'a svelte_syntax::JsProgram,
+        offset: usize,
+    ) -> Self {
+        Self {
+            source,
+            program,
+            offset,
+        }
+    }
+
+    pub(super) fn source(&self) -> &str {
+        self.source
+    }
+
+    pub(super) fn program(&self) -> &svelte_syntax::JsProgram {
+        self.program
+    }
+
+    pub(super) fn offset(&self) -> usize {
+        self.offset
+    }
+}
+
 pub(super) fn compile_error_with_range(
     source: &str,
-    kind: CompilerDiagnosticKind,
+    kind: DiagnosticKind,
     start: usize,
     end: usize,
 ) -> CompileError {
@@ -51,16 +113,15 @@ pub(crate) fn collect_error_mode_downgraded_warnings(
         return Vec::new();
     }
 
+    let v = ComponentValidator::new(source, root);
     let mut warnings = Vec::new();
     let runes_mode = infer_runes_mode(options, root);
 
-    if let Some(error) = template::detect_constant_binding_from_root(source, root) {
+    if let Some(error) = v.constant_binding() {
         warnings.push(downgrade_constant_assignment_warning(error));
     }
 
-    if let Some(error) =
-        template::detect_bind_invalid_value_warn_mode_from_root(source, root, runes_mode)
-    {
+    if let Some(error) = v.bind_invalid_value_warn_mode(runes_mode) {
         warnings.push(error);
     }
 
@@ -72,9 +133,10 @@ pub(crate) fn validate_component_template(
     options: &CompileOptions,
     root: &Root,
 ) -> Option<CompileError> {
+    let v = ComponentValidator::new(source, root);
     let runes_mode = infer_runes_mode(options, root);
-    let each_context_error = template::detect_each_context_error(source, root);
-    let parse_error = template::detect_parse_error_from_root(source, root, runes_mode);
+    let each_context_error = v.each_context_error();
+    let parse_error = v.parse_error(runes_mode);
     let defer_block_unexpected_character = matches!(
         parse_error.as_ref().map(|error| error.code.as_ref()),
         Some("block_unexpected_character")
@@ -96,129 +158,117 @@ pub(crate) fn validate_component_template(
         return Some(error);
     }
 
-    if let Some(error) = template::detect_svelte_meta_structure_errors(source, root) {
+    if let Some(error) = v.svelte_meta_structure_errors() {
         return Some(error);
     }
 
-    if let Some(error) =
-        template::detect_template_directive_errors_from_root(source, root, runes_mode)
+    if let Some(error) = v.template_directive_errors(runes_mode)
         && !(is_error_mode_warn(options) && error.code.as_ref() == "constant_binding")
     {
         return Some(error);
     }
-    if let Some(error) = template::detect_script_duplicate_from_root(source, root) {
+    if let Some(error) = v.script_duplicate() {
         return Some(error);
     }
-    if let Some(error) = template::detect_typescript_invalid_features_from_root(source, root) {
+    if let Some(error) = v.typescript_invalid_features() {
         return Some(error);
     }
-    if let Some(error) = template::detect_svelte_options_invalid_namespace_from_root(source, root) {
+    if let Some(error) = v.svelte_options_invalid_namespace() {
         return Some(error);
     }
-    if let Some(error) =
-        template::detect_svelte_options_invalid_custom_element_from_root(source, root)
-    {
+    if let Some(error) = v.svelte_options_invalid_custom_element() {
         return Some(error);
     }
-    if let Some(error) = template::detect_svelte_head_illegal_attribute_from_root(source, root) {
+    if let Some(error) = v.svelte_head_illegal_attribute() {
         return Some(error);
     }
-    if let Some(error) = template::detect_tag_invalid_name(source, root) {
+    if let Some(error) = v.tag_invalid_name() {
         return Some(error);
     }
-    if let Some(error) = template::detect_let_directive_invalid_placement_from_root(source, root) {
+    if let Some(error) = v.let_directive_invalid_placement() {
         return Some(error);
     }
-    if let Some(error) = template::detect_svelte_fragment_invalid_placement_from_root(source, root)
-    {
+    if let Some(error) = v.svelte_fragment_invalid_placement() {
         return Some(error);
     }
-    if let Some(error) = template::detect_style_directive_invalid_modifier_from_root(source, root) {
+    if let Some(error) = v.style_directive_invalid_modifier() {
         return Some(error);
     }
-    if let Some(error) = template::detect_snippet_shadowing_prop_from_root(source, root) {
+    if let Some(error) = v.snippet_shadowing_prop() {
         return Some(error);
     }
-    if let Some(error) = template::detect_text_content_model_errors_from_root(source, root) {
+    if let Some(error) = v.text_content_model_errors() {
         return Some(error);
     }
-    if let Some(error) =
-        template::detect_mixed_event_handler_syntax_from_root(source, root, runes_mode)
-    {
+    if let Some(error) = v.mixed_event_handler_syntax(runes_mode) {
         return Some(error);
     }
-    if let Some(error) = template::detect_svelte_self_invalid_placement(source, root) {
+    if let Some(error) = v.svelte_self_invalid_placement() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_dollar_prefix_invalid(source, root) {
+    if let Some(error) = v.dollar_prefix_invalid() {
         return Some(error);
     }
     // Check scoped store subscriptions before global reference check, since
     // `$x` where `x` is a scoped binding is a store error, not a global error.
-    if let Some(error) = runes::detect_store_invalid_scoped_subscription(source, root) {
+    if let Some(error) = v.store_invalid_scoped_subscription() {
         return Some(error);
     }
     // `$` and `$$*` names are always illegal regardless of runes mode.
     // `$foo` store subscriptions in template expressions are only flagged in runes mode.
     // In legacy mode, `$foo` in templates is a valid store auto-subscription.
-    if let Some(error) =
-        runes::detect_global_reference_invalid_markup(source, root, runes_mode)
-    {
+    if let Some(error) = v.global_reference_invalid_markup(runes_mode) {
         return Some(error);
     }
-    if let Some(error) = template::detect_missing_directive_name(source, root) {
+    if let Some(error) = v.missing_directive_name() {
         return Some(error);
     }
-    if let Some(error) = template::detect_directive_invalid_value(source, root) {
+    if let Some(error) = v.directive_invalid_value() {
         return Some(error);
     }
-    if let Some(error) = template::detect_empty_attribute_shorthand(source, root) {
+    if let Some(error) = v.empty_attribute_shorthand() {
         return Some(error);
     }
-    if let Some(error) = template::detect_attribute_syntax(source, root) {
+    if let Some(error) = v.attribute_syntax() {
         return Some(error);
     }
-    if let Some(error) = template::detect_attribute_invalid_name(source, root) {
+    if let Some(error) = v.attribute_invalid_name() {
         return Some(error);
     }
-    if let Some(error) = template::detect_duplicate_attributes(source, root) {
+    if let Some(error) = v.duplicate_attributes() {
         return Some(error);
     }
-    if let Some(error) = template::detect_each_key_without_as(source, root) {
+    if let Some(error) = v.each_key_without_as() {
         return Some(error);
     }
-    if let Some(error) = template::detect_invalid_arguments_usage(source, root) {
+    if let Some(error) = v.invalid_arguments_usage() {
         return Some(error);
     }
-    if let Some(error) = template::detect_debug_tag_invalid_arguments_from_root(source, root) {
+    if let Some(error) = v.debug_tag_invalid_arguments() {
         return Some(error);
     }
-    if let Some(error) = template::detect_reactive_declaration_cycle_from_root(source, root) {
+    if let Some(error) = v.reactive_declaration_cycle() {
         return Some(error);
     }
-    if let Some(error) = template::detect_slot_attribute_errors_from_root(source, root) {
+    if let Some(error) = v.slot_attribute_errors() {
         return Some(error);
     }
-    if let Some(error) =
-        template::detect_const_tag_errors_from_root(source, root, options.experimental.r#async)
-    {
+    if let Some(error) = v.const_tag_errors(options.experimental.r#async) {
         return Some(error);
     }
-    if let Some(error) = runes::detect_render_tag_errors_from_root(source, root) {
+    if let Some(error) = v.render_tag_errors() {
         return Some(error);
     }
     if !is_error_mode_warn(options)
-        && let Some(error) = template::detect_bind_invalid_value_from_root(source, root, runes_mode)
+        && let Some(error) = v.bind_invalid_value(runes_mode)
     {
         return Some(error);
     }
-    if let Some(error) =
-        template::detect_additional_template_structure_errors_from_root(source, root)
-    {
+    if let Some(error) = v.additional_template_structure_errors() {
         return Some(error);
     }
 
-    if let Some(error) = template::detect_parse_error_from_root(source, root, runes_mode) {
+    if let Some(error) = v.parse_error(runes_mode) {
         return Some(error);
     }
 
@@ -226,45 +276,48 @@ pub(crate) fn validate_component_template(
 }
 
 pub(crate) fn validate_component_css(source: &str, root: &Root) -> Option<CompileError> {
-    if let Some(error) = css::detect_css_compiler_errors(source, root) {
+    let v = ComponentValidator::new(source, root);
+    if let Some(error) = v.css_compiler_errors() {
         return Some(error);
     }
-    if let Some(error) = css::detect_multiple_top_level_styles(source, root) {
+    if let Some(error) = v.multiple_top_level_styles() {
         return Some(error);
     }
     None
 }
 
 pub(crate) fn validate_component_imports(source: &str, root: &Root) -> Option<CompileError> {
-    if let Some(error) = imports::detect_import_svelte_internal_forbidden(source, root) {
+    let v = ComponentValidator::new(source, root);
+    if let Some(error) = v.import_svelte_internal_forbidden() {
         return Some(error);
     }
-    if let Some(error) = imports::detect_export_rules_in_module_scripts(source, root) {
+    if let Some(error) = v.export_rules_in_module_scripts() {
         return Some(error);
     }
-    if let Some(error) = imports::detect_declaration_duplicate_module_import(source, root) {
+    if let Some(error) = v.declaration_duplicate_module_import() {
         return Some(error);
     }
     None
 }
 
 pub(crate) fn validate_component_snippets(source: &str, root: &Root) -> Option<CompileError> {
-    if let Some(error) = snippet::detect_malformed_snippet_headers(source, root) {
+    let v = ComponentValidator::new(source, root);
+    if let Some(error) = v.malformed_snippet_headers() {
         return Some(error);
     }
-    if let Some(error) = snippet::detect_snippet_parameter_assignment(source, root) {
+    if let Some(error) = v.snippet_parameter_assignment() {
         return Some(error);
     }
-    if let Some(error) = snippet::detect_snippet_invalid_rest_parameter(source, root) {
+    if let Some(error) = v.snippet_invalid_rest_parameter() {
         return Some(error);
     }
-    if let Some(error) = snippet::detect_snippet_children_conflict(source, root) {
+    if let Some(error) = v.snippet_children_conflict() {
         return Some(error);
     }
-    if let Some(error) = snippet::detect_snippet_invalid_export(source, root) {
+    if let Some(error) = v.snippet_invalid_export() {
         return Some(error);
     }
-    if let Some(error) = snippet::detect_slot_snippet_conflict(source, root) {
+    if let Some(error) = v.slot_snippet_conflict() {
         return Some(error);
     }
     None
@@ -275,98 +328,99 @@ pub(crate) fn validate_component_runes(
     options: &CompileOptions,
     root: &Root,
 ) -> Option<CompileError> {
-    if let Some(error) = runes::detect_store_invalid_subscription_component(source, root) {
+    let v = ComponentValidator::new(source, root);
+    if let Some(error) = v.store_invalid_subscription() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_store_invalid_scoped_subscription(source, root) {
+    if let Some(error) = v.store_invalid_scoped_subscription() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_dollar_prefix_invalid(source, root) {
+    if let Some(error) = v.dollar_prefix_invalid() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_state_invalid_placement_from_root(source, root) {
+    if let Some(error) = v.state_invalid_placement() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_dollar_binding_error_component(source, options, root) {
+    if let Some(error) = v.dollar_binding_error(options) {
         return Some(error);
     }
-    if let Some(error) = runes::detect_invalid_rune_name_component(source, root) {
+    if let Some(error) = v.invalid_rune_name() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_render_tag_errors_from_root(source, root) {
+    if let Some(error) = v.render_tag_errors() {
         return Some(error);
     }
-    if let Some(error) = runes::detect_rune_missing_parentheses(source, root) {
+    if let Some(error) = v.rune_missing_parentheses() {
         return Some(error);
     }
 
     let runes_mode = infer_runes_mode(options, root);
     if runes_mode {
-        if let Some(error) = runes::detect_runes_mode_invalid_import(source, root) {
+        if let Some(error) = v.runes_mode_invalid_import() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_props_duplicate_from_root(source, root) {
+        if let Some(error) = v.props_duplicate() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_legacy_export_invalid(source, root) {
+        if let Some(error) = v.legacy_export_invalid() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_each_item_invalid_assignment(source, root) {
+        if let Some(error) = v.each_item_invalid_assignment() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_props_illegal_name_from_root(source, root) {
+        if let Some(error) = v.props_illegal_name() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_bindable_invalid_arguments_from_root(source, root) {
+        if let Some(error) = v.bindable_invalid_arguments() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_rune_argument_count_errors_from_root(source, root) {
+        if let Some(error) = v.rune_argument_count_errors() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_rune_invalid_spread_from_root(source, root) {
+        if let Some(error) = v.rune_invalid_spread() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_props_invalid_arguments_from_root(source, root) {
+        if let Some(error) = v.props_invalid_arguments() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_props_invalid_placement_component(source, root) {
+        if let Some(error) = v.props_invalid_placement() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_bindable_invalid_location_from_root(source, root) {
+        if let Some(error) = v.bindable_invalid_location() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_derived_invalid_placement_from_root(source, root) {
+        if let Some(error) = v.derived_invalid_placement() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_effect_invalid_placement_from_root(source, root) {
+        if let Some(error) = v.effect_invalid_placement() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_host_invalid_placement_component(source, root) {
+        if let Some(error) = v.host_invalid_placement() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_class_state_field_error_from_root(source, root) {
+        if let Some(error) = v.class_state_field_error() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_state_invalid_placement_general_from_root(source, root) {
+        if let Some(error) = v.state_invalid_placement_general() {
             return Some(error);
         }
-        if let Some(error) = runes::detect_state_in_each_header_from_root(source, root) {
+        if let Some(error) = v.state_in_each_header() {
             return Some(error);
         }
     }
 
     if !is_error_mode_warn(options)
-        && let Some(error) = runes::detect_constant_assignment_component(source, root)
+        && let Some(error) = v.constant_assignment()
     {
         return Some(error);
     }
     if !is_error_mode_warn(options)
-        && let Some(error) = runes::detect_constant_assignment_in_scripts(source, root)
+        && let Some(error) = v.constant_assignment_in_scripts()
     {
         return Some(error);
     }
     let check_store_refs = options.runes != Some(false);
-    if let Some(error) = runes::detect_global_reference_invalid_in_scripts(source, root, check_store_refs) {
+    if let Some(error) = v.global_reference_invalid_in_scripts(check_store_refs) {
         return Some(error);
     }
     None
@@ -374,30 +428,24 @@ pub(crate) fn validate_component_runes(
 
 pub(crate) fn validate_module_program(parsed: &ParsedModuleProgram<'_>) -> Option<CompileError> {
     let source = parsed.source_text();
-    let program = parsed.program();
+    let sv = ScriptValidator::new(source.text, parsed.program(), 0);
     earliest([
-        imports::detect_import_svelte_internal(source.text, program),
-        runes::detect_dollar_binding_error(source.text, program, true),
-        runes::detect_store_invalid_subscription_module(source.text, program),
-        runes::detect_constant_assignment(source.text, program),
-        runes::detect_bindable_invalid_location(source.text, program),
-        runes::detect_rune_argument_count(source.text, program),
-        runes::detect_props_invalid_placement_module(source.text, program),
-        runes::detect_state_invalid_placement(source.text, program),
-        runes::detect_derived_invalid_placement(source.text, program),
-        runes::detect_effect_invalid_placement(source.text, program),
-        runes::detect_host_invalid_placement(source.text, program),
-        runes::detect_class_state_field_error(source.text, program),
-        runes::detect_invalid_name(source.text, program),
-        runes::detect_renamed_effect_active(source.text, program),
-        runes::detect_global_reference_invalid_module(source.text, program),
-        imports::detect_export_rules(
-            source.text,
-            program,
-            &NameSet::default(),
-            imports::ExportMode::Module,
-            0,
-        ),
+        sv.import_svelte_internal(),
+        sv.dollar_binding_error(true),
+        sv.store_invalid_subscription_module(),
+        sv.constant_assignment(),
+        sv.bindable_invalid_location(),
+        sv.rune_argument_count(),
+        sv.props_invalid_placement_module(),
+        sv.state_invalid_placement(),
+        sv.derived_invalid_placement(),
+        sv.effect_invalid_placement(),
+        sv.host_invalid_placement(),
+        sv.class_state_field_error(),
+        sv.invalid_name(),
+        sv.renamed_effect_active(),
+        sv.global_reference_invalid_module(),
+        sv.export_rules(&NameSet::default(), imports::ExportMode::Module),
     ])
 }
 

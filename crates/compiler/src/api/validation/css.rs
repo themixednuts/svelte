@@ -3,86 +3,99 @@ use crate::ast::modern::{
     Css, CssBlock, CssBlockChild, CssDeclaration, CssNameSelector, CssNode, CssPseudoClassSelector,
     CssRelativeSelector, CssRule, CssSelectorList, CssSimpleSelector,
 };
+use crate::source::SourceSpan;
 use crate::{SourceId, SourceText};
 
-pub(super) fn detect_css_compiler_errors(source: &str, root: &Root) -> Option<CompileError> {
-    if let Some(css) = root.css.as_ref()
-        && let Some(error) = detect_css_high_priority_structure_errors(source, css)
-    {
-        return Some(error);
-    }
-
-    let mut deferred_parse_error = None::<(CompilerDiagnosticKind, usize, usize)>;
-    for (_style_start, style_end, content_start, content_end) in
-        crate::compiler::phases::parse::style_block_ranges(root)
-    {
-        let content = source.get(content_start..content_end).unwrap_or_default();
-        if let Err(error) =
-            lightningcss::stylesheet::StyleSheet::parse(content, LightningParserOptions::default())
+impl ComponentValidator<'_> {
+    pub(super) fn css_compiler_errors(&self) -> Option<CompileError> {
+        if let Some(css) = self.root.css.as_ref()
+            && let Some(error) = detect_css_high_priority_structure_errors(self.source, css)
         {
-            let parser_offset = error
-                .loc
-                .as_ref()
-                .map(|loc| css_error_offset(content, loc.line, loc.column))
-                .unwrap_or(content.len());
-            let mut start = (content_start + parser_offset).min(content_end);
-            let is_bad_string = matches!(
-                &error.kind,
-                lightningcss::error::ParserError::UnexpectedToken(
-                    lightningcss::properties::custom::Token::BadString(_)
-                        | lightningcss::properties::custom::Token::BadUrl(_),
-                )
-            );
-            if is_bad_string {
-                start = style_end;
-            }
-
-            let kind = match &error.kind {
-                lightningcss::error::ParserError::EndOfInput => {
-                    CompilerDiagnosticKind::CssExpectedIdentifier
-                }
-                lightningcss::error::ParserError::UnexpectedToken(
-                    lightningcss::properties::custom::Token::BadString(_)
-                    | lightningcss::properties::custom::Token::BadUrl(_),
-                ) => CompilerDiagnosticKind::UnexpectedEof,
-                lightningcss::error::ParserError::SelectorError(
-                    lightningcss::error::SelectorError::DanglingCombinator
-                    | lightningcss::error::SelectorError::EmptySelector,
-                ) => CompilerDiagnosticKind::CssSelectorInvalid,
-                _ => CompilerDiagnosticKind::CssExpectedIdentifier,
-            };
-            let end = if kind == CompilerDiagnosticKind::CssSelectorInvalid
-                && source
-                    .as_bytes()
-                    .get(start)
-                    .is_some_and(|byte| matches!(byte, b'>' | b'+' | b'~' | b'|'))
-            {
-                start.saturating_add(1).min(style_end)
-            } else {
-                start
-            };
-
-            if root.css.is_some() && !is_bad_string {
-                deferred_parse_error.get_or_insert((kind, start, end));
-                continue;
-            }
-
-            return Some(compile_error_with_range(source, kind, start, end));
-        }
-    }
-
-    if let Some(css) = root.css.as_ref() {
-        if let Some((kind, start, end)) = deferred_parse_error
-            && !css_uses_extended_syntax(css)
-        {
-            return Some(compile_error_with_range(source, kind, start, end));
-        }
-        if let Some(error) = detect_css_selector_structure_errors(source, css) {
             return Some(error);
         }
+
+        let mut deferred_parse_error = None::<(DiagnosticKind, usize, usize)>;
+        for (_style_start, style_end, content_start, content_end) in
+            crate::compiler::phases::parse::style_block_ranges(self.root)
+        {
+            let content = self.source.get(content_start..content_end).unwrap_or_default();
+            if let Err(error) =
+                lightningcss::stylesheet::StyleSheet::parse(content, LightningParserOptions::default())
+            {
+                let parser_offset = error
+                    .loc
+                    .as_ref()
+                    .map(|loc| css_error_offset(content, loc.line, loc.column))
+                    .unwrap_or(content.len());
+                let mut start = (content_start + parser_offset).min(content_end);
+                let is_bad_string = matches!(
+                    &error.kind,
+                    lightningcss::error::ParserError::UnexpectedToken(
+                        lightningcss::properties::custom::Token::BadString(_)
+                            | lightningcss::properties::custom::Token::BadUrl(_),
+                    )
+                );
+                if is_bad_string {
+                    start = style_end;
+                }
+
+                let kind = match &error.kind {
+                    lightningcss::error::ParserError::EndOfInput => {
+                        DiagnosticKind::CssExpectedIdentifier
+                    }
+                    lightningcss::error::ParserError::UnexpectedToken(
+                        lightningcss::properties::custom::Token::BadString(_)
+                        | lightningcss::properties::custom::Token::BadUrl(_),
+                    ) => DiagnosticKind::UnexpectedEof,
+                    lightningcss::error::ParserError::SelectorError(
+                        lightningcss::error::SelectorError::DanglingCombinator
+                        | lightningcss::error::SelectorError::EmptySelector,
+                    ) => DiagnosticKind::CssSelectorInvalid,
+                    _ => DiagnosticKind::CssExpectedIdentifier,
+                };
+                let end = if kind == DiagnosticKind::CssSelectorInvalid
+                    && self.source
+                        .as_bytes()
+                        .get(start)
+                        .is_some_and(|byte| matches!(byte, b'>' | b'+' | b'~' | b'|'))
+                {
+                    start.saturating_add(1).min(style_end)
+                } else {
+                    start
+                };
+
+                if self.root.css.is_some() && !is_bad_string {
+                    deferred_parse_error.get_or_insert((kind, start, end));
+                    continue;
+                }
+
+                return Some(compile_error_with_range(self.source, kind, start, end));
+            }
+        }
+
+        if let Some(css) = self.root.css.as_ref() {
+            if let Some((kind, start, end)) = deferred_parse_error
+                && !css_uses_extended_syntax(css)
+            {
+                return Some(compile_error_with_range(self.source, kind, start, end));
+            }
+            if let Some(error) = detect_css_selector_structure_errors(self.source, css) {
+                return Some(error);
+            }
+        }
+
+        None
     }
 
-    None
+    pub(super) fn multiple_top_level_styles(&self) -> Option<CompileError> {
+        let duplicate = self.root.styles.get(1)?;
+        Some(compile_error_with_range(
+            self.source,
+            DiagnosticKind::StyleDuplicate,
+            duplicate.start,
+            duplicate.start,
+        ))
+    }
 }
 
 fn detect_css_high_priority_structure_errors(source: &str, css: &Css) -> Option<CompileError> {
@@ -152,7 +165,7 @@ fn detect_css_high_priority_errors_in_selector_list(
                 {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssGlobalInvalidPlacement,
+                        DiagnosticKind::CssGlobalInvalidPlacement,
                         pseudo.start,
                         pseudo.end,
                     ));
@@ -161,7 +174,7 @@ fn detect_css_high_priority_errors_in_selector_list(
                 if let Some(type_selector) = first_type_selector_after(relative, global_idx + 1) {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssTypeSelectorInvalidPlacement,
+                        DiagnosticKind::CssTypeSelectorInvalidPlacement,
                         type_selector.start,
                         type_selector.end,
                     ));
@@ -359,12 +372,12 @@ fn detect_css_selector_errors_in_rule(
                         && selector_idx == 0
                         && !context.parent_rule_exists
                     {
-                        let (start, end) = css_simple_selector_span(&relative.selectors[1]);
+                        let span = css_simple_selector_span(&relative.selectors[1]);
                         return Some(compile_error_with_range(
                             source,
-                            CompilerDiagnosticKind::CssGlobalBlockInvalidModifierStart,
-                            start,
-                            end,
+                            DiagnosticKind::CssGlobalBlockInvalidModifierStart,
+                            span.start,
+                            span.end,
                         ));
                     }
 
@@ -376,7 +389,7 @@ fn detect_css_selector_errors_in_rule(
                     {
                         return Some(compile_error_with_range(
                             source,
-                            CompilerDiagnosticKind::CssGlobalBlockInvalidCombinator,
+                            DiagnosticKind::CssGlobalBlockInvalidCombinator,
                             relative.start,
                             relative.end,
                         ));
@@ -387,7 +400,7 @@ fn detect_css_selector_errors_in_rule(
                     if is_lone_global && rule.prelude.children.len() > 1 {
                         return Some(compile_error_with_range(
                             source,
-                            CompilerDiagnosticKind::CssGlobalBlockInvalidList,
+                            DiagnosticKind::CssGlobalBlockInvalidList,
                             rule.prelude.start,
                             rule.prelude.end,
                         ));
@@ -398,18 +411,18 @@ fn detect_css_selector_errors_in_rule(
                     {
                         return Some(compile_error_with_range(
                             source,
-                            CompilerDiagnosticKind::CssGlobalBlockInvalidDeclaration,
+                            DiagnosticKind::CssGlobalBlockInvalidDeclaration,
                             declaration.start,
                             declaration.end,
                         ));
                     }
                 } else {
-                    let (start, end) = css_simple_selector_span(&relative.selectors[global_idx]);
+                    let span = css_simple_selector_span(&relative.selectors[global_idx]);
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssGlobalBlockInvalidModifier,
-                        start,
-                        end,
+                        DiagnosticKind::CssGlobalBlockInvalidModifier,
+                        span.start,
+                        span.end,
                     ));
                 }
             }
@@ -418,7 +431,7 @@ fn detect_css_selector_errors_in_rule(
         if rule_is_global_block && !complex_is_global_block {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::CssGlobalBlockInvalidList,
+                DiagnosticKind::CssGlobalBlockInvalidList,
                 rule.prelude.start,
                 rule.prelude.end,
             ));
@@ -436,7 +449,7 @@ fn detect_css_selector_errors_in_rule(
             if !top_level_nesting_selector_allowed(rule, nesting) {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::CssNestingSelectorInvalidPlacement,
+                    DiagnosticKind::CssNestingSelectorInvalidPlacement,
                     nesting.start,
                     nesting.end,
                 ));
@@ -444,7 +457,7 @@ fn detect_css_selector_errors_in_rule(
         } else if context.parent_rule_is_top_level_global_block {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::CssGlobalBlockInvalidModifierStart,
+                DiagnosticKind::CssGlobalBlockInvalidModifierStart,
                 nesting.start,
                 nesting.end,
             ));
@@ -477,7 +490,7 @@ fn detect_css_errors_in_selector_list(
             let combinator_end = combinator.end.max(combinator.start.saturating_add(1));
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::CssSelectorInvalid,
+                DiagnosticKind::CssSelectorInvalid,
                 combinator.start,
                 combinator_end,
             ));
@@ -494,7 +507,7 @@ fn detect_css_errors_in_selector_list(
         {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::CssGlobalBlockInvalidPlacement,
+                DiagnosticKind::CssGlobalBlockInvalidPlacement,
                 pseudo.start,
                 pseudo.end,
             ));
@@ -504,7 +517,7 @@ fn detect_css_errors_in_selector_list(
             if relative.selectors.is_empty() {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::CssSelectorInvalid,
+                    DiagnosticKind::CssSelectorInvalid,
                     relative.end,
                     relative.end,
                 ));
@@ -520,7 +533,7 @@ fn detect_css_errors_in_selector_list(
                 if !css_global_selector_is_single_selector(args) && !global_is_standalone {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssGlobalInvalidSelector,
+                        DiagnosticKind::CssGlobalInvalidSelector,
                         pseudo.start,
                         pseudo.end,
                     ));
@@ -531,7 +544,7 @@ fn detect_css_errors_in_selector_list(
                 {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssGlobalInvalidPlacement,
+                        DiagnosticKind::CssGlobalInvalidPlacement,
                         pseudo.start,
                         pseudo.end,
                     ));
@@ -540,7 +553,7 @@ fn detect_css_errors_in_selector_list(
                 if global_idx > 0 && css_global_selector_contains_type(args) {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssGlobalInvalidSelectorList,
+                        DiagnosticKind::CssGlobalInvalidSelectorList,
                         pseudo.start,
                         pseudo.end,
                     ));
@@ -549,7 +562,7 @@ fn detect_css_errors_in_selector_list(
                 if let Some(type_selector) = first_type_selector_after(relative, global_idx + 1) {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::CssTypeSelectorInvalidPlacement,
+                        DiagnosticKind::CssTypeSelectorInvalidPlacement,
                         type_selector.start,
                         type_selector.end,
                     ));
@@ -719,29 +732,25 @@ fn first_css_declaration_in_block(block: &CssBlock) -> Option<&CssDeclaration> {
     None
 }
 
-fn css_simple_selector_span(selector: &CssSimpleSelector) -> (usize, usize) {
+fn css_simple_selector_span(selector: &CssSimpleSelector) -> SourceSpan {
     match selector {
         CssSimpleSelector::TypeSelector(selector)
         | CssSimpleSelector::IdSelector(selector)
         | CssSimpleSelector::ClassSelector(selector)
         | CssSimpleSelector::PseudoElementSelector(selector)
-        | CssSimpleSelector::NestingSelector(selector) => (selector.start, selector.end),
-        CssSimpleSelector::PseudoClassSelector(selector) => (selector.start, selector.end),
-        CssSimpleSelector::AttributeSelector(selector) => (selector.start, selector.end),
+        | CssSimpleSelector::NestingSelector(selector) => {
+            SourceSpan::new(selector.start, selector.end)
+        }
+        CssSimpleSelector::PseudoClassSelector(selector) => {
+            SourceSpan::new(selector.start, selector.end)
+        }
+        CssSimpleSelector::AttributeSelector(selector) => {
+            SourceSpan::new(selector.start, selector.end)
+        }
         CssSimpleSelector::Nth(selector) | CssSimpleSelector::Percentage(selector) => {
-            (selector.start, selector.end)
+            SourceSpan::new(selector.start, selector.end)
         }
     }
-}
-
-pub(super) fn detect_multiple_top_level_styles(source: &str, root: &Root) -> Option<CompileError> {
-    let duplicate = root.styles.get(1)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::StyleDuplicate,
-        duplicate.start,
-        duplicate.start,
-    ))
 }
 
 fn compile_error_custom_css(

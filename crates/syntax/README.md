@@ -11,12 +11,12 @@ components into JavaScript or CSS. For compilation, use `svelte-compiler`.
 
 ```toml
 [dependencies]
-svelte-syntax = "0.1.2"
+svelte-syntax = "0.1.4"
 ```
 
 ## Quick start
 
-Parse a Svelte component into the modern AST:
+Parse a Svelte component into the modern AST (Svelte 5 runes mode):
 
 ```rust
 use svelte_syntax::{parse, ParseMode, ParseOptions};
@@ -56,45 +56,44 @@ assert!(!cst.has_error());
 
 ### AST parsing
 
-- `parse` — parse a component into a `Document` containing either a modern or
-  legacy AST root.
-- `parse_modern_root` — parse directly into a `modern::Root` with typed script,
-  template, and style blocks.
+- `parse` — parse a component into a `Document` containing a modern
+  (Svelte 5 runes) or legacy (Svelte 3/4) AST root.
+- `parse_modern_root` — parse directly into a `modern::Root` with typed
+  script, template, and style blocks.
 - `parse_modern_root_incremental` — reparse using a previous AST and CST,
-  reusing unchanged subtrees via `Arc` sharing.
+  reusing unchanged subtrees for speed.
 - `parse_css` — parse a standalone CSS stylesheet.
 
 ### CST parsing
 
-- `parse_svelte` — parse source into a tree-sitter `Document` for low-level
-  syntax tree inspection.
-- `parse_svelte_incremental` — incremental CST reparse using a previous tree
-  and a `CstEdit`.
-- `CstParser` — configurable tree-sitter parser with typestate for language
-  selection.
+- `parse_svelte` — parse source into a tree-sitter concrete syntax tree for
+  low-level inspection.
+- `parse_svelte_incremental` — incremental reparse using a previous tree and
+  a `CstEdit`.
+- `CstParser` — configurable tree-sitter parser with language selection.
 
 ### JavaScript handles
 
-- `JsProgram` — self-contained OXC program AST that owns its source and
-  allocator. Access the parsed `Program` without reparsing.
-- `JsExpression` — same pattern for a single JS/TS expression.
+- `JsProgram` — a parsed JavaScript/TypeScript program. Owns its source so
+  you can access the AST without reparsing.
+- `JsExpression` — same idea for a single JS/TS expression.
 
 ### Arena AST
 
-- `SvelteAst` — arena-allocated AST with stable `NodeId` values, parent
-  pointers, and position queries. Designed for language servers, linters, and
-  formatters that need fast navigation and incremental updates.
+- `SvelteAst` — arena-allocated AST with stable node IDs, parent pointers,
+  and position queries. Designed for language servers, linters, and formatters
+  that need fast navigation and incremental updates.
 
 ### Utilities
 
-- `SourceText` — borrowed source text with filename, UTF-16 offset conversion,
-  and line/column lookups.
+- `SourceText` — borrowed source text with filename, UTF-16 offset
+  conversion, and line/column lookups.
 - `BytePos`, `Span`, `SourceId` — lightweight position primitives.
 - Element and attribute classification helpers: `classify_element_name`,
   `classify_attribute_name`, `is_component_name`, `is_void_element_name`,
   and others.
-- `CompileError` and `CompilerDiagnosticKind` — structured error types with
-  source positions and diagnostic codes.
+- `CompileError` — structured error type with source positions and diagnostic
+  codes.
 
 ## License
 

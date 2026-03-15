@@ -49,7 +49,7 @@
 //!
 //! Both the CST and AST support incremental reparsing. Provide the previous
 //! parse result and a [`CstEdit`] describing the change, and unchanged
-//! subtrees are reused via `Arc` sharing:
+//! subtrees are reused automatically:
 //!
 //! ```
 //! use svelte_syntax::{
@@ -89,7 +89,7 @@ pub use cst::{CstEdit, CstParser, Document, Language, parse_svelte, parse_svelte
 
 // --- Errors ---
 
-pub use error::{CompileError, CompilerDiagnosticKind, LineColumn, SourcePosition};
+pub use error::{CompileError, DiagnosticKind, LineColumn, SourcePosition};
 
 // --- JavaScript handles ---
 

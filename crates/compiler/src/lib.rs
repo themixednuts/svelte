@@ -60,7 +60,7 @@ pub use api::{
     VERSION, Warning, WarningFilterCallback,
 };
 pub use cst::parse_svelte;
-pub use error::{CompileError, CompilerDiagnosticKind, SourceLocation, SourcePosition};
+pub use error::{CompileError, DiagnosticKind, LineColumn, SourcePosition};
 pub use primitives::{BytePos, SourceId, Span};
 pub use source::SourceText;
 

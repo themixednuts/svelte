@@ -1,1 +1,1 @@
-pub use svelte_syntax::{CompileError, CompilerDiagnosticKind, SourceLocation, SourcePosition};
+pub use svelte_syntax::{CompileError, DiagnosticKind, LineColumn, SourcePosition};

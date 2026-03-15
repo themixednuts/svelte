@@ -1,115 +1,92 @@
 use super::*;
 use crate::api::validation::scope::extend_name_set_with_oxc_pattern_bindings;
 use crate::ast::modern::{
-    Alternate, Attribute, AttributeValue, AttributeValueList, Expression, Fragment, IfBlock, Node,
+    Alternate, Attribute, AttributeValue, AttributeValueKind, Expression, Fragment, IfBlock, Node,
     Search, SnippetBlock, SnippetHeaderErrorKind,
 };
+use crate::source::{NamedSpan, SourceSpan};
 use oxc_ast::ast::Statement;
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::GetSpan;
 use std::sync::Arc;
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
-pub(super) fn detect_snippet_invalid_export(source: &str, root: &Root) -> Option<CompileError> {
-    let module = root.module.as_ref()?;
-    let offset = module.content_start;
-    let (exported_name, export_start, export_end) = first_exported_name(&module.content)?;
-    let snippet = find_snippet_block_by_name(&root.fragment, exported_name.as_ref())?;
+impl ComponentValidator<'_> {
+    pub(super) fn snippet_invalid_export(&self) -> Option<CompileError> {
+        let module = self.root.module.as_ref()?;
+        let offset = module.content_start;
+        let named = first_exported_name(&module.content)?;
+        let snippet = find_snippet_block_by_name(&self.root.fragment, named.name.as_ref())?;
 
-    let mut instance_names = NameSet::default();
-    if let Some(instance) = root.instance.as_ref() {
-        collect_instance_binding_names(&instance.content, &mut instance_names);
-    }
-    if instance_names.is_empty() {
-        return None;
-    }
-
-    if fragment_references_any_name(&snippet.body, &instance_names) {
-        return Some(compile_error_with_range(
-            source,
-            CompilerDiagnosticKind::SnippetInvalidExport,
-            export_start + offset,
-            export_end + offset,
-        ));
-    }
-
-    None
-}
-
-pub(super) fn detect_malformed_snippet_headers(source: &str, root: &Root) -> Option<CompileError> {
-    let error = root.fragment.find_map(|entry| {
-        let node = entry.as_node()?;
-        let Node::SnippetBlock(block) = node else {
+        let mut instance_names = NameSet::default();
+        if let Some(instance) = self.root.instance.as_ref() {
+            collect_instance_binding_names(&instance.content, &mut instance_names);
+        }
+        if instance_names.is_empty() {
             return None;
+        }
+
+        if fragment_references_any_name(&snippet.body, &instance_names) {
+            return Some(
+                named
+                    .span
+                    .offset(offset)
+                    .to_compile_error(self.source, DiagnosticKind::SnippetInvalidExport),
+            );
+        }
+
+        None
+    }
+
+    pub(super) fn malformed_snippet_headers(&self) -> Option<CompileError> {
+        let error = self.root.fragment.find_map(|entry| {
+            let node = entry.as_node()?;
+            let Node::SnippetBlock(block) = node else {
+                return None;
+            };
+            block.header_error.as_ref()
+        })?;
+
+        let kind = match error.kind {
+            SnippetHeaderErrorKind::ExpectedRightBrace => {
+                DiagnosticKind::ExpectedTokenRightBrace
+            }
+            SnippetHeaderErrorKind::ExpectedRightParen => {
+                DiagnosticKind::ExpectedTokenRightParen
+            }
         };
-        block.header_error.as_ref()
-    })?;
 
-    let kind = match error.kind {
-        SnippetHeaderErrorKind::ExpectedRightBrace => {
-            CompilerDiagnosticKind::ExpectedTokenRightBrace
-        }
-        SnippetHeaderErrorKind::ExpectedRightParen => {
-            CompilerDiagnosticKind::ExpectedTokenRightParen
-        }
-    };
+        Some(compile_error_with_range(
+            self.source,
+            kind,
+            error.start,
+            error.end,
+        ))
+    }
 
-    Some(compile_error_with_range(
-        source,
-        kind,
-        error.start,
-        error.end,
-    ))
+    pub(super) fn snippet_parameter_assignment(&self) -> Option<CompileError> {
+        let mut scope = ScopeStack::default();
+        let span = find_snippet_parameter_assignment(&self.root.fragment, &mut scope)?;
+        Some(span.to_compile_error(self.source, DiagnosticKind::SnippetParameterAssignment))
+    }
+
+    pub(super) fn snippet_invalid_rest_parameter(&self) -> Option<CompileError> {
+        let span = find_invalid_rest_parameter(&self.root.fragment)?;
+        Some(span.to_compile_error(self.source, DiagnosticKind::SnippetInvalidRestParameter))
+    }
+
+    pub(super) fn snippet_children_conflict(&self) -> Option<CompileError> {
+        let span = find_children_snippet_conflict(&self.root.fragment)?;
+        Some(span.to_compile_error(self.source, DiagnosticKind::SnippetConflict))
+    }
+
+    pub(super) fn slot_snippet_conflict(&self) -> Option<CompileError> {
+        let span = find_slot_snippet_conflict(&self.root.fragment)?;
+        Some(span.to_compile_error(self.source, DiagnosticKind::SlotSnippetConflict))
+    }
 }
 
-pub(super) fn detect_snippet_parameter_assignment(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let mut scope = ScopeStack::default();
-    let (start, end) = find_snippet_parameter_assignment(&root.fragment, &mut scope)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::SnippetParameterAssignment,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_snippet_invalid_rest_parameter(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let (rest_start, rest_end) = find_invalid_rest_parameter(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::SnippetInvalidRestParameter,
-        rest_start,
-        rest_end,
-    ))
-}
-
-pub(super) fn detect_snippet_children_conflict(source: &str, root: &Root) -> Option<CompileError> {
-    let (block_start, block_end) = find_children_snippet_conflict(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::SnippetConflict,
-        block_start,
-        block_end,
-    ))
-}
-
-pub(super) fn detect_slot_snippet_conflict(source: &str, root: &Root) -> Option<CompileError> {
-    let (slot_start, slot_end) = find_slot_snippet_conflict(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::SlotSnippetConflict,
-        slot_start,
-        slot_end,
-    ))
-}
-
-fn find_invalid_rest_parameter(fragment: &Fragment) -> Option<(usize, usize)> {
+fn find_invalid_rest_parameter(fragment: &Fragment) -> Option<SourceSpan> {
     fragment.find_map(|entry| {
         let node = entry.as_node()?;
         let Node::SnippetBlock(block) = node else {
@@ -119,11 +96,13 @@ fn find_invalid_rest_parameter(fragment: &Fragment) -> Option<(usize, usize)> {
     })
 }
 
-fn rest_parameter_span(parameter: &Expression) -> Option<(usize, usize)> {
-    parameter.is_rest_parameter().then_some((parameter.start, parameter.end))
+fn rest_parameter_span(parameter: &Expression) -> Option<SourceSpan> {
+    parameter
+        .is_rest_parameter()
+        .then_some(SourceSpan::new(parameter.start, parameter.end))
 }
 
-fn find_children_snippet_conflict(fragment: &Fragment) -> Option<(usize, usize)> {
+fn find_children_snippet_conflict(fragment: &Fragment) -> Option<SourceSpan> {
     fragment.find_map(|entry| {
         let node = entry.as_node()?;
         match node {
@@ -141,16 +120,16 @@ fn find_children_snippet_conflict(fragment: &Fragment) -> Option<(usize, usize)>
     })
 }
 
-fn children_snippet_conflict(nodes: &[Node]) -> Option<(usize, usize)> {
+fn children_snippet_conflict(nodes: &[Node]) -> Option<SourceSpan> {
     let snippet = nodes.iter().find_map(children_snippet)?;
-    has_implicit_children(nodes).then_some((snippet.start, snippet.end))
+    has_implicit_children(nodes).then_some(SourceSpan::new(snippet.start, snippet.end))
 }
 
 fn children_snippet(node: &Node) -> Option<&SnippetBlock> {
     let Node::SnippetBlock(block) = node else {
         return None;
     };
-    let name = expression_identifier_name(&block.expression)?;
+    let name = block.expression.identifier_name()?;
     (name.as_ref() == "children").then_some(block)
 }
 
@@ -162,20 +141,20 @@ fn has_implicit_children(nodes: &[Node]) -> bool {
     })
 }
 
-fn find_slot_snippet_conflict(fragment: &Fragment) -> Option<(usize, usize)> {
+fn find_slot_snippet_conflict(fragment: &Fragment) -> Option<SourceSpan> {
     let has_render = fragment.find_map(|entry| match entry.as_node()? {
-        Node::RenderTag(tag) => Some((tag.start, tag.end)),
+        Node::RenderTag(tag) => Some(SourceSpan::new(tag.start, tag.end)),
         _ => None,
     });
-    let (slot_start, slot_end) = fragment.find_map(|entry| match entry.as_node()? {
-        Node::SlotElement(slot) => Some((slot.start, slot.end)),
+    let slot_span = fragment.find_map(|entry| match entry.as_node()? {
+        Node::SlotElement(slot) => Some(SourceSpan::new(slot.start, slot.end)),
         _ => None,
     })?;
 
-    has_render.map(|_| (slot_start, slot_end))
+    has_render.map(|_| slot_span)
 }
 
-fn first_exported_name(program: &ParsedJsProgram) -> Option<(Arc<str>, usize, usize)> {
+fn first_exported_name(program: &JsProgram) -> Option<NamedSpan> {
     for statement in &program.program().body {
         let Statement::ExportNamedDeclaration(declaration) = statement else {
             continue;
@@ -185,8 +164,8 @@ fn first_exported_name(program: &ParsedJsProgram) -> Option<(Arc<str>, usize, us
         }
         for specifier in &declaration.specifiers {
             let name = Arc::from(specifier.local.name().as_str());
-            let span = specifier.span();
-            return Some((name, span.start as usize, span.end as usize));
+            let span = SourceSpan::from_oxc(specifier.span());
+            return Some(NamedSpan::new(name, span));
         }
     }
     None
@@ -198,7 +177,7 @@ fn find_snippet_block_by_name<'a>(fragment: &'a Fragment, name: &str) -> Option<
         let Node::SnippetBlock(block) = node else {
             return None;
         };
-        let snippet_name = expression_identifier_name(&block.expression)?;
+        let snippet_name = block.expression.identifier_name()?;
         (snippet_name.as_ref() == name).then_some(block)
     })
 }
@@ -206,7 +185,7 @@ fn find_snippet_block_by_name<'a>(fragment: &'a Fragment, name: &str) -> Option<
 fn find_snippet_parameter_assignment(
     fragment: &Fragment,
     scope: &mut ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     fragment.walk(
         scope,
         |entry, scope| {
@@ -226,7 +205,7 @@ fn find_snippet_parameter_assignment(
                 Node::DebugTag(tag) => tag.identifiers.iter().find_map(|identifier| {
                     scope
                         .contains(identifier.name.as_ref())
-                        .then_some((identifier.start, identifier.end))
+                        .then_some(SourceSpan::new(identifier.start, identifier.end))
                 }),
                 Node::ExpressionTag(tag) => {
                     assignment_to_scoped_name_in_expression(&tag.expression, scope)
@@ -292,12 +271,12 @@ fn find_snippet_parameter_assignment(
 fn assignment_to_scoped_name_in_attributes(
     attributes: &[Attribute],
     scope: &ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     for attribute in attributes.iter() {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) =
@@ -307,7 +286,7 @@ fn assignment_to_scoped_name_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) =
                         assignment_to_scoped_name_in_expression(&tag.expression, scope)
                     {
@@ -319,7 +298,7 @@ fn assignment_to_scoped_name_in_attributes(
                 if let Some(name) = attribute.expression.identifier_name()
                     && scope.contains(name.as_ref())
                 {
-                    return Some((attribute.start, attribute.end));
+                    return Some(SourceSpan::new(attribute.start, attribute.end));
                 }
                 if let Some(span) =
                     assignment_to_scoped_name_in_expression(&attribute.expression, scope)
@@ -339,8 +318,8 @@ fn assignment_to_scoped_name_in_attributes(
                 }
             }
             Attribute::StyleDirective(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value
                             && let Some(span) =
@@ -350,7 +329,7 @@ fn assignment_to_scoped_name_in_attributes(
                         }
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     if let Some(span) =
                         assignment_to_scoped_name_in_expression(&tag.expression, scope)
                     {
@@ -386,10 +365,10 @@ fn assignment_to_scoped_name_in_attributes(
 fn assignment_to_scoped_name_in_expression(
     expression: &Expression,
     scope: &ScopeStack,
-) -> Option<(usize, usize)> {
+) -> Option<SourceSpan> {
     struct Visitor<'a> {
         scope: &'a ScopeStack,
-        found: Option<(usize, usize)>,
+        found: Option<SourceSpan>,
     }
 
     impl<'a> Visit<'a> for Visitor<'_> {
@@ -400,7 +379,7 @@ fn assignment_to_scoped_name_in_expression(
             if let Some(ident) = it.left.get_identifier_name()
                 && self.scope.contains(ident)
             {
-                self.found = Some((it.span.start as usize, it.span.end as usize));
+                self.found = Some(SourceSpan::new(it.span.start as usize, it.span.end as usize));
                 return;
             }
             walk::walk_assignment_expression(self, it);
@@ -414,7 +393,7 @@ fn assignment_to_scoped_name_in_expression(
                 &it.argument
                 && self.scope.contains(identifier.name.as_str())
             {
-                self.found = Some((it.span.start as usize, it.span.end as usize));
+                self.found = Some(SourceSpan::new(it.span.start as usize, it.span.end as usize));
                 return;
             }
             walk::walk_update_expression(self, it);
@@ -444,7 +423,7 @@ fn assignment_to_scoped_name_in_expression(
     None
 }
 
-fn collect_instance_binding_names(program: &ParsedJsProgram, out: &mut NameSet) {
+fn collect_instance_binding_names(program: &JsProgram, out: &mut NameSet) {
     for statement in &program.program().body {
         let Statement::VariableDeclaration(declaration) = statement else {
             continue;

@@ -1,5 +1,4 @@
 use super::*;
-use crate::api::modern::expression_identifier_name;
 use crate::api::validation::extend_name_set_with_oxc_pattern_bindings;
 use crate::api::{
     ElementKind, classify_element_name, is_custom_element_name, is_valid_component_name,
@@ -7,7 +6,7 @@ use crate::api::{
 };
 use crate::ast::common::{AttrErrorKind, AttributeValueSyntax, ParseErrorKind, Span};
 use crate::ast::modern::{
-    Alternate, Attribute, AttributeValue, AttributeValueList, Component, ConstTag, DebugTag,
+    Alternate, Attribute, AttributeValue, AttributeValueKind, Component, ConstTag, DebugTag,
     DirectiveAttribute, DirectiveValueSyntax, EachBlock, Element, Entry, Expression, Fragment,
     IfBlock, NamedAttribute, Node, RegularElement, Script, ScriptContext, Search, SnippetBlock,
     SvelteElement, TransitionDirective,
@@ -26,52 +25,576 @@ use std::{
     ops::ControlFlow,
     sync::Arc,
 };
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
-pub(super) fn detect_svelte_meta_structure_errors(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_svelte_meta_structure_errors_from_root(source, root)
-}
-
-pub(super) fn detect_parse_error_from_root(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    if let Some(error) = root.errors.iter().find(|error| {
-        matches!(
-            error.kind,
-            ParseErrorKind::BlockInvalidContinuationPlacement
-        )
-    }) {
-        return parse_error(source, error, runes_mode);
+impl ComponentValidator<'_> {
+    pub(super) fn svelte_meta_structure_errors(&self) -> Option<CompileError> {
+        detect_svelte_meta_structure_errors_from_root(self.source(), self.root())
     }
 
-    // BlockUnexpectedCharacter (e.g. `{ #if}` with space) causes secondary structural
-    // errors in tree-sitter. When present, it takes priority: report it in runes mode,
-    // suppress all errors in legacy mode (matching JS compiler behavior).
-    let has_block_whitespace_error = root
-        .errors
-        .iter()
-        .any(|error| matches!(error.kind, ParseErrorKind::BlockUnexpectedCharacter));
+    pub(super) fn parse_error(
+        &self,
+        runes_mode: bool,
+    ) -> Option<CompileError> {
+        if let Some(error) = self.root().errors.iter().find(|error| {
+            matches!(
+                error.kind,
+                ParseErrorKind::BlockInvalidContinuationPlacement
+            )
+        }) {
+            return parse_error(self.source(), error, runes_mode);
+        }
 
-    if has_block_whitespace_error {
+        // BlockUnexpectedCharacter (e.g. `{ #if}` with space) causes secondary structural
+        // errors in tree-sitter. When present, it takes priority: report it in runes mode,
+        // suppress all errors in legacy mode (matching JS compiler behavior).
+        let has_block_whitespace_error = self.root()
+            .errors
+            .iter()
+            .any(|error| matches!(error.kind, ParseErrorKind::BlockUnexpectedCharacter));
+
+        if has_block_whitespace_error {
+            if !runes_mode {
+                return None;
+            }
+            return self.root()
+                .errors
+                .iter()
+                .find(|error| matches!(error.kind, ParseErrorKind::BlockUnexpectedCharacter))
+                .and_then(|error| parse_error(self.source(), error, true));
+        }
+
+        self.root().errors
+            .iter()
+            .find_map(|error| parse_error(self.source(), error, runes_mode))
+    }
+
+    pub(super) fn tag_invalid_name(&self) -> Option<CompileError> {
+        let (start, end) = self.root().fragment.find_map(|entry| match entry.as_node()? {
+            Node::RegularElement(element) if !is_valid_element_name(element.name.as_ref()) => {
+                opening_tag_name_range(self.source(), element.start)
+            }
+            Node::Component(component) if !is_valid_component_name(component.name.as_ref()) => {
+                opening_tag_name_range(self.source(), component.start)
+            }
+            _ => None,
+        })?;
+
+        Some(compile_error_with_range(
+            self.source(),
+            DiagnosticKind::TagInvalidName,
+            start,
+            end,
+        ))
+    }
+
+    pub(super) fn svelte_self_invalid_placement(&self) -> Option<CompileError> {
+        let (start, end) = find_invalid_svelte_self_in_fragment(&self.root().fragment, 0, false)?;
+        Some(compile_error_with_range(
+            self.source(),
+            DiagnosticKind::SvelteSelfInvalidPlacement,
+            start,
+            end,
+        ))
+    }
+
+    pub(super) fn each_key_without_as(&self) -> Option<CompileError> {
+        let (start, end) = find_each_key_without_as_in_fragment(&self.root().fragment)?;
+        Some(compile_error_with_range(
+            self.source(),
+            DiagnosticKind::EachKeyWithoutAs,
+            start,
+            end,
+        ))
+    }
+
+    pub(super) fn each_context_error(&self) -> Option<CompileError> {
+        let error = self.root().fragment.find_map(|entry| match entry.as_node()? {
+            Node::EachBlock(block) => block.context_error.as_ref(),
+            _ => None,
+        })?;
+
+        match &error.kind {
+            ParseErrorKind::UnexpectedReservedWord { word } => Some(compile_error_custom(
+                self.source(),
+                "unexpected_reserved_word",
+                format!("'{word}' is a reserved word in JavaScript and cannot be used here"),
+                error.start,
+                error.end,
+            )),
+            ParseErrorKind::JsParseError { message } => {
+                if reserved_word_from_message(message.as_ref()).is_some() {
+                    return Some(compile_error_custom(
+                        self.source(),
+                        "unexpected_reserved_word",
+                        message.as_ref(),
+                        error.start,
+                        error.end,
+                    ));
+                }
+                Some(compile_error_custom(
+                    self.source(),
+                    "js_parse_error",
+                    message.as_ref(),
+                    error.start,
+                    error.end,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn invalid_arguments_usage(&self) -> Option<CompileError> {
+        for script in [&self.root().module, &self.root().instance] {
+            let Some(script) = script.as_ref() else {
+                continue;
+            };
+            let offset = script.content_start;
+            struct ArgumentsVisitor {
+                function_depth: usize,
+                found: Option<(usize, usize)>,
+            }
+            impl<'a> Visit<'a> for ArgumentsVisitor {
+                fn visit_function_body(&mut self, body: &oxc_ast::ast::FunctionBody<'a>) {
+                    self.function_depth += 1;
+                    walk::walk_function_body(self, body);
+                    self.function_depth -= 1;
+                }
+
+                fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
+                    if self.found.is_none() && self.function_depth == 0 && ident.name == "arguments" {
+                        let span = ident.span();
+                        self.found = Some((span.start as usize, span.end as usize));
+                    }
+                }
+            }
+            let mut visitor = ArgumentsVisitor {
+                function_depth: 0,
+                found: None,
+            };
+            visitor.visit_program(script.content.program());
+            if let Some((start, end)) = visitor.found {
+                return Some(compile_error_with_range(
+                    self.source(),
+                    DiagnosticKind::InvalidArgumentsUsage,
+                    start + offset,
+                    end + offset,
+                ));
+            }
+        }
+        None
+    }
+
+    pub(super) fn reactive_declaration_cycle(&self) -> Option<CompileError> {
+        let script = self.root().instance.as_ref()?;
+        let offset = script.content_start;
+        let statements = collect_reactive_statements(&script.content);
+        if statements.len() < 2 {
+            return None;
+        }
+
+        let names = statements
+            .iter()
+            .flat_map(|statement| statement.assignments.iter().cloned())
+            .fold(OrderedNames::default(), |mut names, name| {
+                names.extend([name]);
+                names
+            });
+        let (names, name_set) = names.into_parts();
+
+        let mut graph = HashMap::<Arc<str>, OrderedNames>::new();
+        for statement in &statements {
+            for assignment in &statement.assignments {
+                let edges = graph.entry(assignment.clone()).or_default();
+                for dependency in &statement.dependencies {
+                    if statement.assignment_set.contains(dependency.as_ref())
+                        || !name_set.contains(dependency.as_ref())
+                    {
+                        continue;
+                    }
+                    edges.extend([dependency.clone()]);
+                }
+            }
+        }
+
+        let graph = freeze_name_graph(graph);
+        let mut stack = Vec::<Arc<str>>::new();
+        let mut active = NameSet::default();
+        let mut visited = NameSet::default();
+        for name in &names {
+            if let Some(cycle) =
+                find_reactive_cycle(name.as_ref(), &graph, &mut visited, &mut active, &mut stack)
+            {
+                let statement = statements
+                    .iter()
+                    .find(|statement| statement.assignment_set.contains(cycle[0].as_ref()))?;
+                return Some(compile_error_custom(
+                    self.source(),
+                    "reactive_declaration_cycle",
+                    format!(
+                        "Cyclical dependency detected: {}",
+                        cycle
+                            .iter()
+                            .map(Arc::as_ref)
+                            .collect::<Vec<_>>()
+                            .join(" \u{2192} ")
+                    ),
+                    statement.start + offset,
+                    statement.end + offset,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn missing_directive_name(&self) -> Option<CompileError> {
+        detect_missing_directive_name_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn directive_invalid_value(&self) -> Option<CompileError> {
+        detect_invalid_directive_value_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn empty_attribute_shorthand(&self) -> Option<CompileError> {
+        let start = self.root().fragment.find_map(|entry| {
+            let el = entry.as_node()?.as_element()?;
+            el.attributes()
+                .iter()
+                .find_map(empty_attribute_shorthand_start)
+        })?;
+
+        Some(compile_error_with_range(
+            self.source(),
+            DiagnosticKind::AttributeEmptyShorthand,
+            start,
+            start,
+        ))
+    }
+
+    pub(super) fn duplicate_attributes(&self) -> Option<CompileError> {
+        self.root().fragment.find_map(|entry| {
+            let element = entry.as_node()?.as_element()?;
+            duplicate_attribute_error(self.source(), element.attributes())
+        })
+    }
+
+    pub(super) fn debug_tag_invalid_arguments(&self) -> Option<CompileError> {
+        let (start, end) = find_debug_tag_invalid_argument_in_fragment(&self.root().fragment)?;
+        Some(compile_error_with_range(
+            self.source(),
+            DiagnosticKind::DebugTagInvalidArguments,
+            start,
+            end,
+        ))
+    }
+
+    pub(super) fn template_directive_errors(
+        &self,
+        runes_mode: bool,
+    ) -> Option<CompileError> {
+        let mut context = ValidationContext {
+            imports: collect_imported_bindings(self.root()),
+            immutable: NameStack::from_items(collect_script_constant_bindings(self.root())),
+            snippets: NameStack::default(),
+            each: NameStack::default(),
+            runes: runes_mode,
+        };
+        detect_template_directive_errors_in_fragment(self.source(), &self.root().fragment, None, &mut context)
+    }
+
+    pub(super) fn slot_attribute_errors(&self) -> Option<CompileError> {
+        detect_slot_attribute_errors_in_fragment(self.source(), &self.root().fragment, &mut Vec::new())
+    }
+
+    pub(super) fn const_tag_errors(
+        &self,
+        async_mode: bool,
+    ) -> Option<CompileError> {
+        detect_const_tag_errors_in_fragment(
+            self.source(),
+            &self.root().fragment,
+            ConstOwner::Root,
+            &ConstScope::default(),
+            async_mode,
+        )
+    }
+
+    pub(super) fn bind_invalid_value(
+        &self,
+        runes_mode: bool,
+    ) -> Option<CompileError> {
+        let mut bindable = NameStack::from_items(collect_bindable_bindings(self.root(), runes_mode));
+        detect_bind_invalid_value_in_fragment(self.source(), &self.root().fragment, &mut bindable)
+    }
+
+    pub(super) fn bind_invalid_value_warn_mode(
+        &self,
+        runes_mode: bool,
+    ) -> Option<CompileError> {
+        let mut bindable = NameStack::from_items(collect_bindable_bindings(self.root(), runes_mode));
+        bindable.extend(collect_script_constant_bindings(self.root()));
+        detect_bind_invalid_value_in_fragment(self.source(), &self.root().fragment, &mut bindable)
+    }
+
+    pub(super) fn constant_binding(&self) -> Option<CompileError> {
+        let immutable = NameStack::from_items(collect_script_constant_bindings(self.root()));
+        let mut scope = NameStack::default();
+        detect_constant_binding_in_fragment(self.source(), &self.root().fragment, &immutable, &mut scope)
+    }
+
+    pub(super) fn script_duplicate(&self) -> Option<CompileError> {
+        let mut saw_default = false;
+        let mut saw_module = false;
+
+        for script in scripts(self.root()) {
+            let context = match script_kind(self.source(), script) {
+                Ok(context) => context,
+                Err(error) => return Some(error),
+            };
+            match context {
+                ScriptContext::Default => {
+                    if saw_default {
+                        return Some(compile_error_custom(
+                            self.source(),
+                            "script_duplicate",
+                            "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
+                            script.start,
+                            script.start,
+                        ));
+                    }
+                    saw_default = true;
+                }
+                ScriptContext::Module => {
+                    if saw_module {
+                        return Some(compile_error_custom(
+                            self.source(),
+                            "script_duplicate",
+                            "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
+                            script.start,
+                            script.start,
+                        ));
+                    }
+                    saw_module = true;
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn typescript_invalid_features(&self) -> Option<CompileError> {
+        for script in scripts(self.root()) {
+            if !script_has_typescript_lang(script) {
+                continue;
+            }
+            let offset = script.content_start;
+            if let Some(issue) = find_typescript_invalid_feature(&script.content) {
+                return Some(compile_error_custom(
+                    self.source(),
+                    "typescript_invalid_feature",
+                    format!(
+                        "TypeScript language features like {} are not natively supported, and their use is generally discouraged. Outside of `<script>` tags, these features are not supported. For use within `<script>` tags, you will need to use a preprocessor to convert it to JavaScript before it gets passed to the Svelte compiler. If you are using `vitePreprocess`, make sure to specifically enable preprocessing script tags (`vitePreprocess({{ script: true }})`)",
+                        issue.feature.description()
+                    ),
+                    issue.start + offset,
+                    issue.end + offset,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn svelte_options_invalid_namespace(&self) -> Option<CompileError> {
+        let options = self.root().options.as_ref()?;
+
+        for attribute in options.attributes.iter() {
+            let Attribute::Attribute(attribute) = attribute else {
+                continue;
+            };
+            if attribute.name.as_ref() != "namespace" {
+                continue;
+            }
+
+            let valid = matches!(
+                static_attribute_text(attribute),
+                Some(
+                    "html"
+                        | "mathml"
+                        | "svg"
+                        | "http://www.w3.org/1998/Math/MathML"
+                        | "http://www.w3.org/2000/svg"
+                )
+            );
+            if !valid {
+                return Some(compile_error_custom(
+                    self.source(),
+                    "svelte_options_invalid_attribute_value",
+                    "Value must be \"html\", \"mathml\" or \"svg\", if specified",
+                    attribute.start,
+                    attribute.end,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn svelte_options_invalid_custom_element(&self) -> Option<CompileError> {
+        let options = self.root().options.as_ref()?;
+
+        for attribute in options.attributes.iter() {
+            let Attribute::Attribute(attribute) = attribute else {
+                continue;
+            };
+            if attribute.name.as_ref() != "customElement" {
+                continue;
+            }
+
+            let tag = match &attribute.value {
+                AttributeValueKind::Values(values) => {
+                    if values.len() == 1
+                        && let Some(AttributeValue::Text(text)) = values.first()
+                    {
+                        text.data.as_ref()
+                    } else {
+                        return Some(compile_error_custom(
+                            self.source(),
+                            "svelte_options_invalid_customelement",
+                            "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
+                            attribute.start,
+                            attribute.end,
+                        ));
+                    }
+                }
+                AttributeValueKind::ExpressionTag(tag) => {
+                    if expression_kind(&tag.expression) == Some("ObjectExpression") {
+                        continue;
+                    }
+                    return Some(compile_error_custom(
+                        self.source(),
+                        "svelte_options_invalid_customelement",
+                        "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
+                        attribute.start,
+                        attribute.end,
+                    ));
+                }
+                AttributeValueKind::Boolean(_) => {
+                    return Some(compile_error_custom(
+                        self.source(),
+                        "svelte_options_invalid_customelement",
+                        "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
+                        attribute.start,
+                        attribute.end,
+                    ));
+                }
+            };
+
+            if !is_valid_custom_element_tag_name(tag) {
+                return Some(compile_error_custom(
+                    self.source(),
+                    "svelte_options_invalid_tagname",
+                    "Tag name must be lowercase and hyphenated",
+                    attribute.start,
+                    attribute.end,
+                ));
+            }
+            if is_reserved_custom_element_tag_name(tag) {
+                return Some(compile_error_custom(
+                    self.source(),
+                    "svelte_options_reserved_tagname",
+                    "Tag name is reserved",
+                    attribute.start,
+                    attribute.end,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn let_directive_invalid_placement(&self) -> Option<CompileError> {
+        detect_let_directive_invalid_placement_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn style_directive_invalid_modifier(&self) -> Option<CompileError> {
+        detect_style_directive_invalid_modifier_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn svelte_fragment_invalid_placement(&self) -> Option<CompileError> {
+        detect_svelte_fragment_invalid_placement_in_fragment(self.source(), &self.root().fragment, false)
+    }
+
+    pub(super) fn svelte_head_illegal_attribute(&self) -> Option<CompileError> {
+        detect_svelte_head_illegal_attribute_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn text_content_model_errors(&self) -> Option<CompileError> {
+        detect_text_content_model_errors_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn mixed_event_handler_syntax(
+        &self,
+        runes_mode: bool,
+    ) -> Option<CompileError> {
         if !runes_mode {
             return None;
         }
-        return root
-            .errors
-            .iter()
-            .find(|error| matches!(error.kind, ParseErrorKind::BlockUnexpectedCharacter))
-            .and_then(|error| parse_error(source, error, true));
+        if !fragment_has_modern_dom_event_syntax(&self.root().fragment) {
+            return None;
+        }
+        detect_mixed_event_handler_syntax_in_fragment(self.source(), &self.root().fragment)
     }
 
-    root.errors
-        .iter()
-        .find_map(|error| parse_error(source, error, runes_mode))
+    pub(super) fn snippet_shadowing_prop(&self) -> Option<CompileError> {
+        for node in self.root().fragment.nodes.iter() {
+            let Node::Component(component) = node else {
+                continue;
+            };
+
+            let prop_names = component
+                .attributes
+                .iter()
+                .filter_map(component_prop_attribute_name)
+                .collect::<NameSet>();
+            if prop_names.is_empty() {
+                continue;
+            }
+
+            if let Some((snippet_name, start, end)) =
+                find_component_scope_snippet_with_name(&component.fragment, &prop_names)
+            {
+                return Some(compile_error_custom(
+                    self.source(),
+                    "snippet_shadowing_prop",
+                    format!("This snippet is shadowing the prop `{snippet_name}` with the same name"),
+                    start,
+                    end,
+                ));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn additional_template_structure_errors(&self) -> Option<CompileError> {
+        detect_additional_template_structure_errors_in_fragment(
+            self.source(),
+            &self.root().fragment,
+            StructureContext::default(),
+        )
+    }
+
+    pub(super) fn attribute_invalid_name(&self) -> Option<CompileError> {
+        detect_attribute_invalid_name_in_fragment(self.source(), &self.root().fragment)
+    }
+
+    pub(super) fn attribute_syntax(&self) -> Option<CompileError> {
+        detect_attribute_syntax_in_fragment(self.source(), &self.root().fragment)
+    }
 }
+
 
 fn parse_error(
     source: &str,
@@ -80,18 +603,18 @@ fn parse_error(
 ) -> Option<CompileError> {
     let kind = match error.kind {
         ParseErrorKind::BlockInvalidContinuationPlacement => {
-            CompilerDiagnosticKind::BlockInvalidContinuationPlacement
+            DiagnosticKind::BlockInvalidContinuationPlacement
         }
-        ParseErrorKind::ExpectedTokenElse => CompilerDiagnosticKind::ExpectedTokenElse,
+        ParseErrorKind::ExpectedTokenElse => DiagnosticKind::ExpectedTokenElse,
         ParseErrorKind::ExpectedTokenAwaitBranch => {
-            CompilerDiagnosticKind::ExpectedTokenAwaitBranch
+            DiagnosticKind::ExpectedTokenAwaitBranch
         }
         ParseErrorKind::ExpectedTokenCommentClose => {
-            CompilerDiagnosticKind::ExpectedTokenCommentClose
+            DiagnosticKind::ExpectedTokenCommentClose
         }
-        ParseErrorKind::ExpectedTokenStyleClose => CompilerDiagnosticKind::ExpectedTokenStyleClose,
-        ParseErrorKind::ExpectedTokenRightBrace => CompilerDiagnosticKind::ExpectedTokenRightBrace,
-        ParseErrorKind::ExpectedWhitespace => CompilerDiagnosticKind::ExpectedWhitespace,
+        ParseErrorKind::ExpectedTokenStyleClose => DiagnosticKind::ExpectedTokenStyleClose,
+        ParseErrorKind::ExpectedTokenRightBrace => DiagnosticKind::ExpectedTokenRightBrace,
+        ParseErrorKind::ExpectedWhitespace => DiagnosticKind::ExpectedWhitespace,
         ParseErrorKind::BlockUnexpectedCharacter => {
             if !runes_mode {
                 return None;
@@ -123,9 +646,9 @@ fn parse_error(
                 error.end,
             ));
         }
-        ParseErrorKind::CssExpectedIdentifier => CompilerDiagnosticKind::CssExpectedIdentifier,
-        ParseErrorKind::UnexpectedEof => CompilerDiagnosticKind::UnexpectedEof,
-        ParseErrorKind::BlockUnclosed => CompilerDiagnosticKind::BlockUnclosed,
+        ParseErrorKind::CssExpectedIdentifier => DiagnosticKind::CssExpectedIdentifier,
+        ParseErrorKind::UnexpectedEof => DiagnosticKind::UnexpectedEof,
+        ParseErrorKind::BlockUnclosed => DiagnosticKind::BlockUnclosed,
         ParseErrorKind::ElementUnclosed { ref name } => {
             return Some(compile_error_custom(
                 source,
@@ -139,7 +662,7 @@ fn parse_error(
             if is_void_element_name(name.as_ref()) {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::VoidElementInvalidContent,
+                    DiagnosticKind::VoidElementInvalidContent,
                     error.start,
                     error.end,
                 ));
@@ -176,25 +699,6 @@ fn parse_error(
     ))
 }
 
-pub(super) fn detect_tag_invalid_name(source: &str, root: &Root) -> Option<CompileError> {
-    let (start, end) = root.fragment.find_map(|entry| match entry.as_node()? {
-        Node::RegularElement(element) if !is_valid_element_name(element.name.as_ref()) => {
-            opening_tag_name_range(source, element.start)
-        }
-        Node::Component(component) if !is_valid_component_name(component.name.as_ref()) => {
-            opening_tag_name_range(source, component.start)
-        }
-        _ => None,
-    })?;
-
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::TagInvalidName,
-        start,
-        end,
-    ))
-}
-
 #[derive(Default)]
 struct SvelteMetaScanState {
     head_count: usize,
@@ -203,7 +707,7 @@ struct SvelteMetaScanState {
     body_count: usize,
 }
 
-fn name_range(name: &crate::ast::common::NameLocation) -> (usize, usize) {
+fn name_range(name: &crate::ast::common::SourceRange) -> (usize, usize) {
     (name.start.character, name.end.character)
 }
 
@@ -228,11 +732,11 @@ enum SvelteMetaKind {
 }
 
 impl SvelteMetaKind {
-    fn invalid_content(self) -> CompilerDiagnosticKind {
+    fn invalid_content(self) -> DiagnosticKind {
         match self {
-            Self::Head => CompilerDiagnosticKind::SvelteMetaInvalidContent,
-            Self::Window => CompilerDiagnosticKind::SvelteWindowInvalidContent,
-            Self::Document | Self::Body => CompilerDiagnosticKind::SvelteMetaInvalidContent,
+            Self::Head => DiagnosticKind::SvelteMetaInvalidContent,
+            Self::Window => DiagnosticKind::SvelteWindowInvalidContent,
+            Self::Document | Self::Body => DiagnosticKind::SvelteMetaInvalidContent,
         }
     }
 }
@@ -246,7 +750,7 @@ fn detect_svelte_meta_structure_errors_from_root(
     {
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::SvelteMetaInvalidContent,
+            DiagnosticKind::SvelteMetaInvalidContent,
             start,
             end,
         ));
@@ -272,7 +776,7 @@ fn scan_root_meta(
     if element_depth > 0 || block_depth > 0 {
         return Err(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::SvelteMetaInvalidPlacement,
+            DiagnosticKind::SvelteMetaInvalidPlacement,
             start,
             start,
         ));
@@ -282,7 +786,7 @@ fn scan_root_meta(
     if *count > 1 {
         return Err(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::SvelteMetaDuplicate,
+            DiagnosticKind::SvelteMetaDuplicate,
             start,
             start,
         ));
@@ -340,7 +844,7 @@ fn scan_modern_node_for_svelte_meta(
                     .unwrap_or_else(|| name_range(&element.name_loc));
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::SvelteMetaInvalidTag,
+                    DiagnosticKind::SvelteMetaInvalidTag,
                     start,
                     end,
                 ));
@@ -579,68 +1083,9 @@ fn first_non_whitespace_fragment_range(fragment: &Fragment) -> Option<(usize, us
             }
             return Some((text.start, text.end));
         }
-        return Some(crate::api::modern::modern_node_span(node));
+        return Some((node.start(), node.end()));
     }
     None
-}
-
-pub(super) fn detect_svelte_self_invalid_placement(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let (start, end) = find_invalid_svelte_self_in_fragment(&root.fragment, 0, false)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::SvelteSelfInvalidPlacement,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_each_key_without_as(source: &str, root: &Root) -> Option<CompileError> {
-    let (start, end) = find_each_key_without_as_in_fragment(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::EachKeyWithoutAs,
-        start,
-        end,
-    ))
-}
-
-pub(super) fn detect_each_context_error(source: &str, root: &Root) -> Option<CompileError> {
-    let error = root.fragment.find_map(|entry| match entry.as_node()? {
-        Node::EachBlock(block) => block.context_error.as_ref(),
-        _ => None,
-    })?;
-
-    match &error.kind {
-        ParseErrorKind::UnexpectedReservedWord { word } => Some(compile_error_custom(
-            source,
-            "unexpected_reserved_word",
-            format!("'{word}' is a reserved word in JavaScript and cannot be used here"),
-            error.start,
-            error.end,
-        )),
-        ParseErrorKind::JsParseError { message } => {
-            if reserved_word_from_message(message.as_ref()).is_some() {
-                return Some(compile_error_custom(
-                    source,
-                    "unexpected_reserved_word",
-                    message.as_ref(),
-                    error.start,
-                    error.end,
-                ));
-            }
-            Some(compile_error_custom(
-                source,
-                "js_parse_error",
-                message.as_ref(),
-                error.start,
-                error.end,
-            ))
-        }
-        _ => None,
-    }
 }
 
 fn reserved_word_from_message(message: &str) -> Option<&str> {
@@ -648,113 +1093,6 @@ fn reserved_word_from_message(message: &str) -> Option<&str> {
     let middle = "' is a reserved word in JavaScript and cannot be used here";
     let word = message.strip_prefix(prefix)?.strip_suffix(middle)?;
     (!word.is_empty()).then_some(word)
-}
-
-pub(super) fn detect_invalid_arguments_usage(source: &str, root: &Root) -> Option<CompileError> {
-    for script in [&root.module, &root.instance] {
-        let Some(script) = script.as_ref() else {
-            continue;
-        };
-        let offset = script.content_start;
-        struct ArgumentsVisitor {
-            function_depth: usize,
-            found: Option<(usize, usize)>,
-        }
-        impl<'a> Visit<'a> for ArgumentsVisitor {
-            fn visit_function_body(&mut self, body: &oxc_ast::ast::FunctionBody<'a>) {
-                self.function_depth += 1;
-                walk::walk_function_body(self, body);
-                self.function_depth -= 1;
-            }
-
-            fn visit_identifier_reference(&mut self, ident: &IdentifierReference<'a>) {
-                if self.found.is_none() && self.function_depth == 0 && ident.name == "arguments" {
-                    let span = ident.span();
-                    self.found = Some((span.start as usize, span.end as usize));
-                }
-            }
-        }
-        let mut visitor = ArgumentsVisitor {
-            function_depth: 0,
-            found: None,
-        };
-        visitor.visit_program(script.content.program());
-        if let Some((start, end)) = visitor.found {
-            return Some(compile_error_with_range(
-                source,
-                CompilerDiagnosticKind::InvalidArgumentsUsage,
-                start + offset,
-                end + offset,
-            ));
-        }
-    }
-    None
-}
-
-pub(super) fn detect_reactive_declaration_cycle_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let script = root.instance.as_ref()?;
-    let offset = script.content_start;
-    let statements = collect_reactive_statements(&script.content);
-    if statements.len() < 2 {
-        return None;
-    }
-
-    let names = statements
-        .iter()
-        .flat_map(|statement| statement.assignments.iter().cloned())
-        .fold(OrderedNames::default(), |mut names, name| {
-            names.extend([name]);
-            names
-        });
-    let (names, name_set) = names.into_parts();
-
-    let mut graph = HashMap::<Arc<str>, OrderedNames>::new();
-    for statement in &statements {
-        for assignment in &statement.assignments {
-            let edges = graph.entry(assignment.clone()).or_default();
-            for dependency in &statement.dependencies {
-                if statement.assignment_set.contains(dependency.as_ref())
-                    || !name_set.contains(dependency.as_ref())
-                {
-                    continue;
-                }
-                edges.extend([dependency.clone()]);
-            }
-        }
-    }
-
-    let graph = freeze_name_graph(graph);
-    let mut stack = Vec::<Arc<str>>::new();
-    let mut active = NameSet::default();
-    let mut visited = NameSet::default();
-    for name in &names {
-        if let Some(cycle) =
-            find_reactive_cycle(name.as_ref(), &graph, &mut visited, &mut active, &mut stack)
-        {
-            let statement = statements
-                .iter()
-                .find(|statement| statement.assignment_set.contains(cycle[0].as_ref()))?;
-            return Some(compile_error_custom(
-                source,
-                "reactive_declaration_cycle",
-                format!(
-                    "Cyclical dependency detected: {}",
-                    cycle
-                        .iter()
-                        .map(Arc::as_ref)
-                        .collect::<Vec<_>>()
-                        .join(" \u{2192} ")
-                ),
-                statement.start + offset,
-                statement.end + offset,
-            ));
-        }
-    }
-
-    None
 }
 
 struct ReactiveStatement {
@@ -767,7 +1105,7 @@ struct ReactiveStatement {
 
 type NameGraph = HashMap<Arc<str>, Box<[Arc<str>]>>;
 
-fn collect_reactive_statements(program: &ParsedJsProgram) -> Vec<ReactiveStatement> {
+fn collect_reactive_statements(program: &JsProgram) -> Vec<ReactiveStatement> {
     struct AssignmentCollector {
         names: OrderedNames,
         function_depth: usize,
@@ -1143,14 +1481,6 @@ fn find_each_key_without_as_in_fragment(fragment: &Fragment) -> Option<(usize, u
     })
 }
 
-pub(super) fn detect_missing_directive_name(source: &str, root: &Root) -> Option<CompileError> {
-    detect_missing_directive_name_in_fragment(source, &root.fragment)
-}
-
-pub(super) fn detect_directive_invalid_value(source: &str, root: &Root) -> Option<CompileError> {
-    detect_invalid_directive_value_in_fragment(source, &root.fragment)
-}
-
 fn detect_missing_directive_name_in_fragment(
     source: &str,
     fragment: &Fragment,
@@ -1223,7 +1553,7 @@ fn detect_missing_directive_name_in_attributes(
         if is_missing {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::DirectiveMissingName {
+                DiagnosticKind::DirectiveMissingName {
                     directive: Arc::from(directive),
                 },
                 start,
@@ -1289,29 +1619,6 @@ fn transition_directive_prefix(attribute: &TransitionDirective) -> &'static str 
     }
 }
 
-pub(super) fn detect_empty_attribute_shorthand(source: &str, root: &Root) -> Option<CompileError> {
-    let start = root.fragment.find_map(|entry| {
-        let el = entry.as_node()?.as_element()?;
-        el.attributes()
-            .iter()
-            .find_map(empty_attribute_shorthand_start)
-    })?;
-
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::AttributeEmptyShorthand,
-        start,
-        start,
-    ))
-}
-
-pub(super) fn detect_duplicate_attributes(source: &str, root: &Root) -> Option<CompileError> {
-    root.fragment.find_map(|entry| {
-        let element = entry.as_node()?.as_element()?;
-        duplicate_attribute_error(source, element.attributes())
-    })
-}
-
 fn empty_attribute_shorthand_start(attribute: &Attribute) -> Option<usize> {
     let Attribute::Attribute(attribute) = attribute else {
         return None;
@@ -1320,7 +1627,7 @@ fn empty_attribute_shorthand_start(attribute: &Attribute) -> Option<usize> {
         return None;
     }
 
-    let AttributeValueList::ExpressionTag(tag) = &attribute.value else {
+    let AttributeValueKind::ExpressionTag(tag) = &attribute.value else {
         return None;
     };
     if tag
@@ -1336,19 +1643,6 @@ fn empty_attribute_shorthand_start(attribute: &Attribute) -> Option<usize> {
     }
 
     Some(attribute.start)
-}
-
-pub(super) fn detect_debug_tag_invalid_arguments_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let (start, end) = find_debug_tag_invalid_argument_in_fragment(&root.fragment)?;
-    Some(compile_error_with_range(
-        source,
-        CompilerDiagnosticKind::DebugTagInvalidArguments,
-        start,
-        end,
-    ))
 }
 
 fn find_debug_tag_invalid_argument_in_fragment(fragment: &Fragment) -> Option<(usize, usize)> {
@@ -1414,70 +1708,9 @@ fn find_error_in_child_fragments_with_scope(
     }
 }
 
-pub(super) fn detect_template_directive_errors_from_root(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    let mut context = ValidationContext {
-        imports: collect_imported_bindings(root),
-        immutable: NameStack::from_items(collect_script_constant_bindings(root)),
-        snippets: NameStack::default(),
-        each: NameStack::default(),
-        runes: runes_mode,
-    };
-    detect_template_directive_errors_in_fragment(source, &root.fragment, None, &mut context)
-}
-
-pub(super) fn detect_slot_attribute_errors_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_slot_attribute_errors_in_fragment(source, &root.fragment, &mut Vec::new())
-}
-
-pub(super) fn detect_const_tag_errors_from_root(
-    source: &str,
-    root: &Root,
-    async_mode: bool,
-) -> Option<CompileError> {
-    detect_const_tag_errors_in_fragment(
-        source,
-        &root.fragment,
-        ConstOwner::Root,
-        &ConstScope::default(),
-        async_mode,
-    )
-}
-
 struct ConstCycle<'a> {
     tag: &'a ConstTag,
     names: Box<[Arc<str>]>,
-}
-
-pub(super) fn detect_bind_invalid_value_from_root(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    let mut bindable = NameStack::from_items(collect_bindable_bindings(root, runes_mode));
-    detect_bind_invalid_value_in_fragment(source, &root.fragment, &mut bindable)
-}
-
-pub(super) fn detect_bind_invalid_value_warn_mode_from_root(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    let mut bindable = NameStack::from_items(collect_bindable_bindings(root, runes_mode));
-    bindable.extend(collect_script_constant_bindings(root));
-    detect_bind_invalid_value_in_fragment(source, &root.fragment, &mut bindable)
-}
-
-pub(super) fn detect_constant_binding_from_root(source: &str, root: &Root) -> Option<CompileError> {
-    let immutable = NameStack::from_items(collect_script_constant_bindings(root));
-    let mut scope = NameStack::default();
-    detect_constant_binding_in_fragment(source, &root.fragment, &immutable, &mut scope)
 }
 
 fn compile_error_custom(
@@ -1502,72 +1735,6 @@ fn compile_error_custom(
         end: Some(Box::new(end_location)),
         filename: None,
     }
-}
-
-pub(super) fn detect_script_duplicate_from_root(source: &str, root: &Root) -> Option<CompileError> {
-    let mut saw_default = false;
-    let mut saw_module = false;
-
-    for script in scripts(root) {
-        let context = match script_kind(source, script) {
-            Ok(context) => context,
-            Err(error) => return Some(error),
-        };
-        match context {
-            ScriptContext::Default => {
-                if saw_default {
-                    return Some(compile_error_custom(
-                        source,
-                        "script_duplicate",
-                        "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
-                        script.start,
-                        script.start,
-                    ));
-                }
-                saw_default = true;
-            }
-            ScriptContext::Module => {
-                if saw_module {
-                    return Some(compile_error_custom(
-                        source,
-                        "script_duplicate",
-                        "A component can have a single top-level `<script>` element and/or a single top-level `<script module>` element",
-                        script.start,
-                        script.start,
-                    ));
-                }
-                saw_module = true;
-            }
-        }
-    }
-
-    None
-}
-
-pub(super) fn detect_typescript_invalid_features_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for script in scripts(root) {
-        if !script_has_typescript_lang(script) {
-            continue;
-        }
-        let offset = script.content_start;
-        if let Some(issue) = find_typescript_invalid_feature(&script.content) {
-            return Some(compile_error_custom(
-                source,
-                "typescript_invalid_feature",
-                format!(
-                    "TypeScript language features like {} are not natively supported, and their use is generally discouraged. Outside of `<script>` tags, these features are not supported. For use within `<script>` tags, you will need to use a preprocessor to convert it to JavaScript before it gets passed to the Svelte compiler. If you are using `vitePreprocess`, make sure to specifically enable preprocessing script tags (`vitePreprocess({{ script: true }})`)",
-                    issue.feature.description()
-                ),
-                issue.start + offset,
-                issue.end + offset,
-            ));
-        }
-    }
-
-    None
 }
 
 fn scripts(root: &Root) -> Vec<&Script> {
@@ -1658,7 +1825,7 @@ struct TsIssue {
     end: usize,
 }
 
-fn find_typescript_invalid_feature(node: &ParsedJsProgram) -> Option<TsIssue> {
+fn find_typescript_invalid_feature(node: &JsProgram) -> Option<TsIssue> {
     fn namespace_body_has_runtime(body: &oxc_ast::ast::TSModuleDeclarationBody<'_>) -> bool {
         match body {
             oxc_ast::ast::TSModuleDeclarationBody::TSModuleBlock(block) => {
@@ -1808,127 +1975,6 @@ fn find_typescript_invalid_feature(node: &ParsedJsProgram) -> Option<TsIssue> {
     visitor.found
 }
 
-pub(super) fn detect_svelte_options_invalid_namespace_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let options = root.options.as_ref()?;
-
-    for attribute in options.attributes.iter() {
-        let Attribute::Attribute(attribute) = attribute else {
-            continue;
-        };
-        if attribute.name.as_ref() != "namespace" {
-            continue;
-        }
-
-        let valid = matches!(
-            static_attribute_text(attribute),
-            Some(
-                "html"
-                    | "mathml"
-                    | "svg"
-                    | "http://www.w3.org/1998/Math/MathML"
-                    | "http://www.w3.org/2000/svg"
-            )
-        );
-        if !valid {
-            return Some(compile_error_custom(
-                source,
-                "svelte_options_invalid_attribute_value",
-                "Value must be \"html\", \"mathml\" or \"svg\", if specified",
-                attribute.start,
-                attribute.end,
-            ));
-        }
-    }
-
-    None
-}
-
-pub(super) fn detect_svelte_options_invalid_custom_element_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    let options = root.options.as_ref()?;
-
-    for attribute in options.attributes.iter() {
-        let Attribute::Attribute(attribute) = attribute else {
-            continue;
-        };
-        if attribute.name.as_ref() != "customElement" {
-            continue;
-        }
-
-        let tag = match &attribute.value {
-            AttributeValueList::Values(values) => {
-                if values.len() == 1
-                    && let Some(AttributeValue::Text(text)) = values.first()
-                {
-                    text.data.as_ref()
-                } else {
-                    return Some(compile_error_custom(
-                        source,
-                        "svelte_options_invalid_customelement",
-                        "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
-                        attribute.start,
-                        attribute.end,
-                    ));
-                }
-            }
-            AttributeValueList::ExpressionTag(tag) => {
-                if expression_kind(&tag.expression) == Some("ObjectExpression") {
-                    continue;
-                }
-                return Some(compile_error_custom(
-                    source,
-                    "svelte_options_invalid_customelement",
-                    "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
-                    attribute.start,
-                    attribute.end,
-                ));
-            }
-            AttributeValueList::Boolean(_) => {
-                return Some(compile_error_custom(
-                    source,
-                    "svelte_options_invalid_customelement",
-                    "\"customElement\" must be a string literal defining a valid custom element name or an object of the form { tag?: string; shadow?: \"open\" | \"none\" | `ShadowRootInit`; props?: { [key: string]: { attribute?: string; reflect?: boolean; type: .. } } }",
-                    attribute.start,
-                    attribute.end,
-                ));
-            }
-        };
-
-        if !is_valid_custom_element_tag_name(tag) {
-            return Some(compile_error_custom(
-                source,
-                "svelte_options_invalid_tagname",
-                "Tag name must be lowercase and hyphenated",
-                attribute.start,
-                attribute.end,
-            ));
-        }
-        if is_reserved_custom_element_tag_name(tag) {
-            return Some(compile_error_custom(
-                source,
-                "svelte_options_reserved_tagname",
-                "Tag name is reserved",
-                attribute.start,
-                attribute.end,
-            ));
-        }
-    }
-
-    None
-}
-
-pub(super) fn detect_let_directive_invalid_placement_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_let_directive_invalid_placement_in_fragment(source, &root.fragment)
-}
-
 fn detect_let_directive_invalid_placement_in_fragment(
     source: &str,
     fragment: &Fragment,
@@ -1960,13 +2006,6 @@ fn detect_let_directive_invalid_placement_in_fragment(
 
         None
     })
-}
-
-pub(super) fn detect_style_directive_invalid_modifier_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_style_directive_invalid_modifier_in_fragment(source, &root.fragment)
 }
 
 fn detect_style_directive_invalid_modifier_in_fragment(
@@ -2011,13 +2050,6 @@ fn detect_style_directive_invalid_modifier_in_attributes(
         ));
     }
     None
-}
-
-pub(super) fn detect_svelte_fragment_invalid_placement_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_svelte_fragment_invalid_placement_in_fragment(source, &root.fragment, false)
 }
 
 fn detect_svelte_fragment_invalid_placement_in_fragment(
@@ -2156,13 +2188,6 @@ fn detect_svelte_fragment_invalid_placement_in_fragment(
     None
 }
 
-pub(super) fn detect_svelte_head_illegal_attribute_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_svelte_head_illegal_attribute_in_fragment(source, &root.fragment)
-}
-
 fn detect_svelte_head_illegal_attribute_in_fragment(
     source: &str,
     fragment: &Fragment,
@@ -2196,13 +2221,6 @@ fn detect_svelte_head_illegal_attribute_in_fragment(
         }
     }
     None
-}
-
-pub(super) fn detect_text_content_model_errors_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_text_content_model_errors_in_fragment(source, &root.fragment)
 }
 
 fn detect_text_content_model_errors_in_fragment(
@@ -2275,20 +2293,6 @@ fn detect_text_content_model_errors_in_fragment(
     None
 }
 
-pub(super) fn detect_mixed_event_handler_syntax_from_root(
-    source: &str,
-    root: &Root,
-    runes_mode: bool,
-) -> Option<CompileError> {
-    if !runes_mode {
-        return None;
-    }
-    if !fragment_has_modern_dom_event_syntax(&root.fragment) {
-        return None;
-    }
-    detect_mixed_event_handler_syntax_in_fragment(source, &root.fragment)
-}
-
 fn detect_mixed_event_handler_syntax_in_fragment(
     source: &str,
     fragment: &Fragment,
@@ -2343,40 +2347,6 @@ fn fragment_has_modern_dom_event_syntax(fragment: &Fragment) -> bool {
         .is_some()
 }
 
-pub(super) fn detect_snippet_shadowing_prop_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    for node in root.fragment.nodes.iter() {
-        let Node::Component(component) = node else {
-            continue;
-        };
-
-        let prop_names = component
-            .attributes
-            .iter()
-            .filter_map(component_prop_attribute_name)
-            .collect::<NameSet>();
-        if prop_names.is_empty() {
-            continue;
-        }
-
-        if let Some((snippet_name, start, end)) =
-            find_component_scope_snippet_with_name(&component.fragment, &prop_names)
-        {
-            return Some(compile_error_custom(
-                source,
-                "snippet_shadowing_prop",
-                format!("This snippet is shadowing the prop `{snippet_name}` with the same name"),
-                start,
-                end,
-            ));
-        }
-    }
-
-    None
-}
-
 fn component_prop_attribute_name(attribute: &Attribute) -> Option<Arc<str>> {
     match attribute {
         Attribute::Attribute(attribute) => Some(attribute.name.clone()),
@@ -2399,7 +2369,7 @@ fn find_component_scope_snippet_with_name(
     fragment.search(|entry, _| match entry {
         Entry::Node(Node::Component(_)) => Search::Skip,
         Entry::Node(Node::SnippetBlock(block)) => {
-            let Some(name) = expression_identifier_name(&block.expression) else {
+            let Some(name) = block.expression.identifier_name() else {
                 return Search::Continue;
             };
             if names.contains(name.as_ref()) {
@@ -2451,17 +2421,6 @@ fn is_reserved_custom_element_tag_name(name: &str) -> bool {
             | "font-face-format"
             | "font-face-name"
             | "missing-glyph"
-    )
-}
-
-pub(super) fn detect_additional_template_structure_errors_from_root(
-    source: &str,
-    root: &Root,
-) -> Option<CompileError> {
-    detect_additional_template_structure_errors_in_fragment(
-        source,
-        &root.fragment,
-        StructureContext::default(),
     )
 }
 
@@ -2806,7 +2765,7 @@ fn detect_additional_template_structure_errors_in_element(
             .unwrap_or(element.end.saturating_sub(1));
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::VoidElementInvalidContent,
+            DiagnosticKind::VoidElementInvalidContent,
             start,
             start,
         ));
@@ -2821,7 +2780,7 @@ fn detect_additional_template_structure_errors_in_element(
             if attribute.name.is_empty()
                 && matches!(
                     &attribute.value,
-                    AttributeValueList::ExpressionTag(tag)
+                    AttributeValueKind::ExpressionTag(tag)
                         if expression_kind(&tag.expression) == Some("ThisExpression")
                 )
             {
@@ -2838,7 +2797,7 @@ fn detect_additional_template_structure_errors_in_element(
             }
 
             has_this_attribute = true;
-            if matches!(&attribute.value, AttributeValueList::Boolean(true)) {
+            if matches!(&attribute.value, AttributeValueKind::Boolean(true)) {
                 return Some(compile_error_custom(
                     source,
                     "svelte_element_missing_this",
@@ -2847,9 +2806,9 @@ fn detect_additional_template_structure_errors_in_element(
                     attribute.name_loc.end.character,
                 ));
             }
-            if let AttributeValueList::ExpressionTag(tag) = &attribute.value
+            if let AttributeValueKind::ExpressionTag(tag) = &attribute.value
                 && matches!(
-                    expression_identifier_name(&tag.expression).as_deref(),
+                    tag.expression.identifier_name().as_deref(),
                     Some(name) if name == "this"
                 )
             {
@@ -2898,7 +2857,7 @@ fn detect_additional_template_structure_errors_in_element(
                 if !element.name.starts_with("svelte:")
                     && attribute.name.len() > 2
                     && attribute.name.starts_with("on")
-                    && !matches!(&attribute.value, AttributeValueList::ExpressionTag(_)) =>
+                    && !matches!(&attribute.value, AttributeValueKind::ExpressionTag(_)) =>
             {
                 return Some(compile_error_custom(
                     source,
@@ -2971,7 +2930,7 @@ fn detect_svelte_element_this_errors(source: &str, el: &SvelteElement) -> Option
         if attribute.name.is_empty()
             && matches!(
                 &attribute.value,
-                AttributeValueList::ExpressionTag(tag)
+                AttributeValueKind::ExpressionTag(tag)
                     if expression_kind(&tag.expression) == Some("ThisExpression")
             )
         {
@@ -2986,7 +2945,7 @@ fn detect_svelte_element_this_errors(source: &str, el: &SvelteElement) -> Option
         if attribute.name.as_ref() != "this" {
             continue;
         }
-        if matches!(&attribute.value, AttributeValueList::Boolean(true)) {
+        if matches!(&attribute.value, AttributeValueKind::Boolean(true)) {
             return Some(compile_error_custom(
                 source,
                 "svelte_element_missing_this",
@@ -3000,7 +2959,7 @@ fn detect_svelte_element_this_errors(source: &str, el: &SvelteElement) -> Option
     // Check extracted expression
     if let Some(ref expression) = el.expression {
         if matches!(
-            expression_identifier_name(expression).as_deref(),
+            expression.identifier_name().as_deref(),
             Some("this")
         ) {
             return Some(compile_error_custom(
@@ -3551,12 +3510,12 @@ fn detect_template_directive_errors_in_fragment(
                             find_assignment_violation_in_template_expression(&tag.expression, context)
                         {
                             let kind = match violation.kind {
-                                AssignmentKind::Constant => CompilerDiagnosticKind::ConstantAssignment,
+                                AssignmentKind::Constant => DiagnosticKind::ConstantAssignment,
                                 AssignmentKind::SnippetParameter => {
-                                    CompilerDiagnosticKind::SnippetParameterAssignment
+                                    DiagnosticKind::SnippetParameterAssignment
                                 }
                                 AssignmentKind::EachItemInvalid => {
-                                    CompilerDiagnosticKind::EachItemInvalidAssignment
+                                    DiagnosticKind::EachItemInvalidAssignment
                                 }
                             };
                             return Some(compile_error_with_range(
@@ -3574,14 +3533,6 @@ fn detect_template_directive_errors_in_fragment(
             None
         },
     )
-}
-
-pub(super) fn detect_attribute_invalid_name(source: &str, root: &Root) -> Option<CompileError> {
-    detect_attribute_invalid_name_in_fragment(source, &root.fragment)
-}
-
-pub(super) fn detect_attribute_syntax(source: &str, root: &Root) -> Option<CompileError> {
-    detect_attribute_syntax_in_fragment(source, &root.fragment)
 }
 
 fn detect_attribute_syntax_in_fragment(source: &str, fragment: &Fragment) -> Option<CompileError> {
@@ -3650,7 +3601,7 @@ fn detect_attribute_syntax_in_attributes(
             ),
             AttrErrorKind::ExpectedValue => compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::ExpectedAttributeValue,
+                DiagnosticKind::ExpectedAttributeValue,
                 error.start,
                 error.end,
             ),
@@ -3692,7 +3643,7 @@ fn duplicate_attribute_error(source: &str, attributes: &[Attribute]) -> Option<C
             let (start, end) = attribute_span(attribute);
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::AttributeDuplicate,
+                DiagnosticKind::AttributeDuplicate,
                 start,
                 end,
             ));
@@ -3784,7 +3735,7 @@ fn detect_attribute_invalid_name_in_attributes(
         if name.is_empty() {
             // `{foo}` shorthand attributes are represented as empty-name attributes with an
             // expression payload in this AST shape; they are validated elsewhere.
-            if matches!(attribute.value, AttributeValueList::ExpressionTag(_)) {
+            if matches!(attribute.value, AttributeValueKind::ExpressionTag(_)) {
                 continue;
             }
         }
@@ -3975,12 +3926,12 @@ fn detect_element_directive_errors<E: Element>(
                     find_assignment_violation_in_template_expression(&directive.expression, context)
                 {
                     let kind = match violation.kind {
-                        AssignmentKind::Constant => CompilerDiagnosticKind::ConstantAssignment,
+                        AssignmentKind::Constant => DiagnosticKind::ConstantAssignment,
                         AssignmentKind::SnippetParameter => {
-                            CompilerDiagnosticKind::SnippetParameterAssignment
+                            DiagnosticKind::SnippetParameterAssignment
                         }
                         AssignmentKind::EachItemInvalid => {
-                            CompilerDiagnosticKind::EachItemInvalidAssignment
+                            DiagnosticKind::EachItemInvalidAssignment
                         }
                     };
                     return Some(compile_error_with_range(
@@ -4177,7 +4128,7 @@ fn detect_unquoted_attribute_sequence_from_ast(
         return None;
     }
 
-    let AttributeValueList::Values(values) = &attribute.value else {
+    let AttributeValueKind::Values(values) = &attribute.value else {
         return None;
     };
     if values.len() <= 1 {
@@ -4186,7 +4137,7 @@ fn detect_unquoted_attribute_sequence_from_ast(
 
     Some(compile_error_with_range(
         source,
-        CompilerDiagnosticKind::AttributeUnquotedSequence,
+        DiagnosticKind::AttributeUnquotedSequence,
         attribute.start,
         attribute.end,
     ))
@@ -4194,14 +4145,14 @@ fn detect_unquoted_attribute_sequence_from_ast(
 
 fn single_attribute_expression(attribute: &NamedAttribute) -> Option<&Expression> {
     match &attribute.value {
-        AttributeValueList::ExpressionTag(tag) => Some(&tag.expression),
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::ExpressionTag(tag) => Some(&tag.expression),
+        AttributeValueKind::Values(values) => {
             let [AttributeValue::ExpressionTag(tag)] = &values[..] else {
                 return None;
             };
             Some(&tag.expression)
         }
-        AttributeValueList::Boolean(_) => None,
+        AttributeValueKind::Boolean(_) => None,
     }
 }
 
@@ -4209,14 +4160,14 @@ fn style_directive_expression(
     attribute: &crate::ast::modern::StyleDirective,
 ) -> Option<&Expression> {
     match &attribute.value {
-        AttributeValueList::ExpressionTag(tag) => Some(&tag.expression),
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::ExpressionTag(tag) => Some(&tag.expression),
+        AttributeValueKind::Values(values) => {
             let [AttributeValue::ExpressionTag(tag)] = &values[..] else {
                 return None;
             };
             Some(&tag.expression)
         }
-        AttributeValueList::Boolean(_) => None,
+        AttributeValueKind::Boolean(_) => None,
     }
 }
 
@@ -4231,7 +4182,7 @@ fn detect_unparenthesized_attribute_sequence_expression(
     let (start, end) = expression_span(expression)?;
     Some(compile_error_with_range(
         source,
-        CompilerDiagnosticKind::AttributeInvalidSequenceExpression,
+        DiagnosticKind::AttributeInvalidSequenceExpression,
         start,
         end,
     ))
@@ -4344,7 +4295,7 @@ fn detect_bind_directive_error(
     {
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::EachItemInvalidAssignment,
+            DiagnosticKind::EachItemInvalidAssignment,
             directive.start,
             directive.end,
         ));
@@ -4353,7 +4304,7 @@ fn detect_bind_directive_error(
     if context.snippets.contains(base_identifier.as_ref()) {
         return Some(compile_error_with_range(
             source,
-            CompilerDiagnosticKind::SnippetParameterAssignment,
+            DiagnosticKind::SnippetParameterAssignment,
             directive.start,
             directive.end,
         ));
@@ -4484,7 +4435,7 @@ fn detect_slot_attribute_error_for_node(
             if !direct_child_of_component && !is_component_attribute {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::SlotAttributeInvalidPlacement,
+                    DiagnosticKind::SlotAttributeInvalidPlacement,
                     attribute.start,
                     attribute.end,
                 ));
@@ -4508,7 +4459,7 @@ fn detect_slot_attribute_error_for_node(
             if !frame.slots.insert(name.clone()) {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::SlotAttributeDuplicate {
+                    DiagnosticKind::SlotAttributeDuplicate {
                         slot: name,
                         component,
                     },
@@ -4522,7 +4473,7 @@ fn detect_slot_attribute_error_for_node(
             {
                 return Some(compile_error_with_range(
                     source,
-                    CompilerDiagnosticKind::SlotDefaultDuplicate,
+                    DiagnosticKind::SlotDefaultDuplicate,
                     start,
                     end,
                 ));
@@ -4534,7 +4485,7 @@ fn detect_slot_attribute_error_for_node(
         None if !is_component_attribute => {
             return Some(compile_error_with_range(
                 source,
-                CompilerDiagnosticKind::SlotAttributeInvalidPlacement,
+                DiagnosticKind::SlotAttributeInvalidPlacement,
                 attribute.start,
                 attribute.end,
             ));
@@ -4714,7 +4665,7 @@ fn detect_const_tag_errors_in_fragment(
                 if let Some((start, end)) = const_tag_invalid_expression_span(tag) {
                     return Some(compile_error_with_range(
                         source,
-                        CompilerDiagnosticKind::ConstTagInvalidExpression,
+                        DiagnosticKind::ConstTagInvalidExpression,
                         start,
                         end,
                     ));
@@ -4920,7 +4871,7 @@ fn detect_const_tag_invalid_reference(
         if !async_mode
             && matches!(owner, ConstOwner::Boundary)
             && matches!(
-                expression_identifier_name(&block.expression).as_deref(),
+                block.expression.identifier_name().as_deref(),
                 Some("failed" | "pending")
             )
         {
@@ -5171,11 +5122,11 @@ fn detect_const_tag_invalid_reference_in_attrs(
     for attr in attrs {
         let found = match attr {
             Attribute::Attribute(attr) => match &attr.value {
-                AttributeValueList::Boolean(_) => None,
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => None,
+                AttributeValueKind::ExpressionTag(tag) => {
                     find_unavailable_const_reference(&tag.expression, visible, unavailable)
                 }
-                AttributeValueList::Values(values) => values.iter().find_map(|value| match value {
+                AttributeValueKind::Values(values) => values.iter().find_map(|value| match value {
                     AttributeValue::Text(_) => None,
                     AttributeValue::ExpressionTag(tag) => {
                         find_unavailable_const_reference(&tag.expression, visible, unavailable)
@@ -5183,11 +5134,11 @@ fn detect_const_tag_invalid_reference_in_attrs(
                 }),
             },
             Attribute::StyleDirective(style) => match &style.value {
-                AttributeValueList::Boolean(_) => None,
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => None,
+                AttributeValueKind::ExpressionTag(tag) => {
                     find_unavailable_const_reference(&tag.expression, visible, unavailable)
                 }
-                AttributeValueList::Values(values) => values.iter().find_map(|value| match value {
+                AttributeValueKind::Values(values) => values.iter().find_map(|value| match value {
                     AttributeValue::Text(_) => None,
                     AttributeValue::ExpressionTag(tag) => {
                         find_unavailable_const_reference(&tag.expression, visible, unavailable)
@@ -5479,12 +5430,12 @@ fn const_owner_allows_declaration(owner: ConstOwner) -> bool {
 
 fn find_const_tag_invalid_rune_usage(
     tag: &ConstTag,
-) -> Option<(CompilerDiagnosticKind, usize, usize)> {
+) -> Option<(DiagnosticKind, usize, usize)> {
     let offset = tag.declaration.start;
     for name in ["$state", "$state.raw"] {
         if let Some((start, end)) = find_first_call_named_in_expression(&tag.declaration, name) {
             return Some((
-                CompilerDiagnosticKind::StateInvalidPlacement,
+                DiagnosticKind::StateInvalidPlacement,
                 start + offset,
                 end + offset,
             ));
@@ -5493,7 +5444,7 @@ fn find_const_tag_invalid_rune_usage(
     for name in ["$derived", "$derived.by"] {
         if let Some((start, end)) = find_first_call_named_in_expression(&tag.declaration, name) {
             return Some((
-                CompilerDiagnosticKind::StateInvalidPlacementDerived,
+                DiagnosticKind::StateInvalidPlacementDerived,
                 start + offset,
                 end + offset,
             ));
@@ -6134,7 +6085,7 @@ fn detect_bind_target_error_for_element<E: Element>(
                 ));
             };
 
-            let is_dynamic = !matches!(contenteditable.value, AttributeValueList::Boolean(true))
+            let is_dynamic = !matches!(contenteditable.value, AttributeValueKind::Boolean(true))
                 && static_attribute_text(contenteditable).is_none();
             if is_dynamic {
                 return Some(compile_error_custom(
@@ -6181,7 +6132,7 @@ fn input_type_attribute(attributes: &[Attribute]) -> Option<InputTypeAttribute<'
     })?;
 
     match &attribute.value {
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Values(values) => {
             if values.len() == 1
                 && let Some(AttributeValue::Text(text)) = values.first()
             {
@@ -6189,7 +6140,7 @@ fn input_type_attribute(attributes: &[Attribute]) -> Option<InputTypeAttribute<'
             }
             Some(InputTypeAttribute::Dynamic)
         }
-        AttributeValueList::Boolean(_) | AttributeValueList::ExpressionTag(_) => {
+        AttributeValueKind::Boolean(_) | AttributeValueKind::ExpressionTag(_) => {
             Some(InputTypeAttribute::Dynamic)
         }
     }
@@ -6202,8 +6153,8 @@ fn invalid_input_type_attribute_span(attributes: &[Attribute]) -> Option<(usize,
     })?;
 
     match &attribute.value {
-        AttributeValueList::Boolean(_) => Some((attribute.start, attribute.end)),
-        AttributeValueList::Values(_) | AttributeValueList::ExpressionTag(_) => None,
+        AttributeValueKind::Boolean(_) => Some((attribute.start, attribute.end)),
+        AttributeValueKind::Values(_) | AttributeValueKind::ExpressionTag(_) => None,
     }
 }
 
@@ -6214,14 +6165,14 @@ fn invalid_select_multiple_attribute_span(attributes: &[Attribute]) -> Option<(u
     })?;
 
     match &attribute.value {
-        AttributeValueList::Boolean(_) => None,
+        AttributeValueKind::Boolean(_) => None,
         _ => Some((attribute.start, attribute.end)),
     }
 }
 
 fn static_attribute_text(attribute: &NamedAttribute) -> Option<&str> {
     match &attribute.value {
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Values(values) => {
             if values.len() == 1
                 && let Some(AttributeValue::Text(text)) = values.first()
             {
@@ -6229,7 +6180,7 @@ fn static_attribute_text(attribute: &NamedAttribute) -> Option<&str> {
             }
             None
         }
-        AttributeValueList::Boolean(_) | AttributeValueList::ExpressionTag(_) => None,
+        AttributeValueKind::Boolean(_) | AttributeValueKind::ExpressionTag(_) => None,
     }
 }
 
@@ -6267,7 +6218,7 @@ fn collect_script_constant_bindings(root: &Root) -> Box<[Arc<str>]> {
     bindings.into_boxed_slice()
 }
 
-fn collect_script_constant_bindings_in_program(program: &ParsedJsProgram, out: &mut OrderedNames) {
+fn collect_script_constant_bindings_in_program(program: &JsProgram, out: &mut OrderedNames) {
     for statement in &program.program().body {
         match statement {
             Statement::ImportDeclaration(declaration) => {
@@ -6303,7 +6254,7 @@ fn collect_script_constant_bindings_in_program(program: &ParsedJsProgram, out: &
 }
 
 fn collect_bindable_bindings_in_program(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     runes_mode: bool,
     out: &mut NameSet,
 ) {
@@ -6346,14 +6297,14 @@ fn find_assignment_violation_in_template_expression(
             immutable.insert(name.clone());
         }
     }
-    let (start, end) =
+    let span =
         super::runes::find_constant_assignment_in_expression(expression, &immutable)?;
     let offset = expression.start;
-    let kind = assignment_kind_for_expression_span(expression, (start + offset, end + offset), context);
+    let kind = assignment_kind_for_expression_span(expression, (span.start + offset, span.end + offset), context);
     Some(AssignmentViolation {
         kind,
-        start: start + offset,
-        end: end + offset,
+        start: span.start + offset,
+        end: span.end + offset,
     })
 }
 
@@ -6419,7 +6370,7 @@ fn expression_is_identifier_or_member(expression: &OxcExpression<'_>) -> bool {
     )
 }
 
-fn collect_imported_bindings_in_program(program: &ParsedJsProgram, bindings: &mut NameSet) {
+fn collect_imported_bindings_in_program(program: &JsProgram, bindings: &mut NameSet) {
     for statement in &program.program().body {
         let Statement::ImportDeclaration(declaration) = statement else {
             continue;
@@ -6576,7 +6527,7 @@ fn import_specifier_local_name<'a>(
 
 fn oxc_callee_name(callee: &OxcExpression<'_>) -> Option<String> {
     match callee.get_inner_expression() {
-        OxcExpression::Identifier(reference) => Some(reference.name.as_str().to_owned()),
+        OxcExpression::Identifier(reference) => Some(reference.name.to_string()),
         OxcExpression::StaticMemberExpression(member) => {
             let object = member.object.get_inner_expression();
             let OxcExpression::Identifier(object) = object else {
@@ -6624,7 +6575,7 @@ fn count_animation_relevant_nodes(fragment: &Fragment) -> usize {
 #[cfg(test)]
 mod tests {
     use super::super::validate_component_template;
-    use super::detect_svelte_meta_structure_errors;
+    use super::detect_svelte_meta_structure_errors_from_root;
     use crate::api::CompileOptions;
     use crate::compiler::phases::parse::parse_component_for_compile;
 
@@ -7132,7 +7083,7 @@ mod tests {
         assert_eq!(state.window_count, 2);
         assert!(second.is_some(), "expected second-node error");
 
-        let error = detect_svelte_meta_structure_errors(source, parsed.root())
+        let error = detect_svelte_meta_structure_errors_from_root(source, parsed.root())
             .expect("expected validation error");
         assert_eq!(error.code.as_ref(), "svelte_meta_duplicate");
     }

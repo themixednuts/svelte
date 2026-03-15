@@ -101,10 +101,10 @@ impl CompileError {
 /// Diagnostic codes for Svelte-specific parse and validation errors.
 ///
 /// Each variant carries its own error message and a `miette` diagnostic code.
-/// Use [`CompilerDiagnosticKind::to_compile_error`] to convert a variant into
+/// Use [`DiagnosticKind::to_compile_error`] to convert a variant into
 /// a [`CompileError`] with source position information.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Diagnostic)]
-pub enum CompilerDiagnosticKind {
+pub enum DiagnosticKind {
     #[error("Expected attribute value")]
     #[diagnostic(code(svelte::expected_attribute_value))]
     ExpectedAttributeValue,
@@ -548,7 +548,7 @@ pub enum CompilerDiagnosticKind {
     ImportSvelteInternalForbidden,
 }
 
-impl CompilerDiagnosticKind {
+impl DiagnosticKind {
     /// Return the machine-readable diagnostic code string for this variant.
     pub fn code(&self) -> &'static str {
         match self {
@@ -688,7 +688,7 @@ impl CompilerDiagnosticKind {
 mod tests {
     use camino::Utf8Path;
 
-    use super::CompilerDiagnosticKind;
+    use super::DiagnosticKind;
     use crate::{SourceId, SourceText};
 
     #[test]
@@ -698,7 +698,7 @@ mod tests {
             "a\n😀b",
             Some(Utf8Path::new("input.svelte")),
         );
-        let error = CompilerDiagnosticKind::ExpectedWhitespace.to_compile_error_in(
+        let error = DiagnosticKind::ExpectedWhitespace.to_compile_error_in(
             source,
             "a\n😀".len(),
             "a\n😀b".len(),
