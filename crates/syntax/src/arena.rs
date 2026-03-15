@@ -35,7 +35,7 @@ use smallvec::SmallVec;
 use crate::ast::common::{ScriptContext, Span};
 use crate::ast::modern::{self, Node as ModernNode};
 use crate::error::CompileError;
-use crate::js::{ParsedJsExpression, ParsedJsProgram};
+use crate::js::{JsExpression, JsProgram};
 use crate::parse::{ParseMode, ParseOptions};
 
 /// Stable identifier for a node in the Svelte AST arena.
@@ -137,10 +137,10 @@ pub enum NodeKind {
     SvelteBoundary,
     TitleElement,
     // Script and Style
-    Script { context: ScriptContext, program: Arc<ParsedJsProgram> },
+    Script { context: ScriptContext, program: Arc<JsProgram> },
     StyleSheet,
     // JS expressions (leaf references into OXC arena)
-    Expression { handle: Option<Arc<ParsedJsExpression>> },
+    Expression { handle: Option<Arc<JsExpression>> },
     // Sub-structures
     Attribute { name: Arc<str> },
     Alternate,
@@ -412,7 +412,7 @@ impl SvelteAst {
     // ---- Type queries ----
 
     /// If this node is an Expression with an OXC handle, return a reference to the parsed expression.
-    pub fn js_expression(&self, id: NodeId) -> Option<&ParsedJsExpression> {
+    pub fn js_expression(&self, id: NodeId) -> Option<&JsExpression> {
         match &self.nodes[id.index()].kind {
             NodeKind::Expression { handle: Some(arc) } => Some(arc.as_ref()),
             _ => None,
@@ -420,7 +420,7 @@ impl SvelteAst {
     }
 
     /// If this node is a Script, return a reference to the parsed JS program.
-    pub fn js_program(&self, id: NodeId) -> Option<&ParsedJsProgram> {
+    pub fn js_program(&self, id: NodeId) -> Option<&JsProgram> {
         match &self.nodes[id.index()].kind {
             NodeKind::Script { program, .. } => Some(program.as_ref()),
             _ => None,
@@ -907,13 +907,13 @@ impl ArenaBuilder {
         }
     }
 
-    fn build_attribute_values(&mut self, parent: NodeId, value: &modern::AttributeValueList) {
+    fn build_attribute_values(&mut self, parent: NodeId, value: &modern::AttributeValueKind) {
         match value {
-            modern::AttributeValueList::Boolean(_) => {}
-            modern::AttributeValueList::ExpressionTag(tag) => {
+            modern::AttributeValueKind::Boolean(_) => {}
+            modern::AttributeValueKind::ExpressionTag(tag) => {
                 self.build_expression(parent, &tag.expression);
             }
-            modern::AttributeValueList::Values(values) => {
+            modern::AttributeValueKind::Values(values) => {
                 for val in values.iter() {
                     match val {
                         modern::AttributeValue::ExpressionTag(tag) => {

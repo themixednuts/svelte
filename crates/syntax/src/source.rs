@@ -1,6 +1,6 @@
 use camino::Utf8Path;
 
-use crate::error::SourceLocation;
+use crate::error::LineColumn;
 use crate::primitives::{SourceId, Span};
 
 /// Borrowed source text with an identifier and optional filename.
@@ -90,9 +90,9 @@ impl<'src> SourceText<'src> {
     }
 
     /// Build a full source location for a byte offset.
-    pub fn location_at_offset(self, offset: usize) -> SourceLocation {
+    pub fn location_at_offset(self, offset: usize) -> LineColumn {
         let (line, column) = self.line_column_at_offset(offset);
-        SourceLocation {
+        LineColumn {
             line,
             column,
             character: self.utf16_offset(offset),

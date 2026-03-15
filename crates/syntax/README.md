@@ -75,9 +75,9 @@ assert!(!cst.has_error());
 
 ### JavaScript handles
 
-- `ParsedJsProgram` — self-contained OXC program AST that owns its source and
+- `JsProgram` — self-contained OXC program AST that owns its source and
   allocator. Access the parsed `Program` without reparsing.
-- `ParsedJsExpression` — same pattern for a single JS/TS expression.
+- `JsExpression` — same pattern for a single JS/TS expression.
 
 ### Arena AST
 

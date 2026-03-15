@@ -8,10 +8,9 @@ use tree_sitter::Node as TsNode;
 use super::{
     AttributeKind, ElementKind, SvelteElementKind, classify_attribute_name, classify_element_name,
     elements::is_void_element_name, find_first_named_child, is_component_name,
-    parse_identifier_name, parse_modern_attributes, source_location_from_point, text_for_node,
+    parse_identifier_name, parse_modern_attributes, line_column_from_point, text_for_node,
 };
-use crate::SourceLocation;
-use crate::ast::common::NameLocation as LegacyNameLocation;
+use crate::LineColumn;
 use crate::ast::common::{AttributeValueSyntax, ParseError, ParseErrorKind, Span};
 use crate::ast::legacy::Expression as LegacyExpression;
 use crate::ast::modern::*;
@@ -1511,14 +1510,6 @@ pub(crate) fn push_modern_text_node(nodes: &mut Vec<Node>, text: Text) {
     nodes.push(Node::Text(text));
 }
 
-pub fn modern_node_start(node: &Node) -> usize {
-    node.start()
-}
-
-pub fn modern_node_end(node: &Node) -> usize {
-    node.end()
-}
-
 pub(super) fn parse_modern_script(
     source: &str,
     element: TsNode<'_>,
@@ -1552,7 +1543,7 @@ pub(super) fn parse_modern_script(
                 if name.as_ref() == "lang"
                     && matches!(
                         value,
-                        AttributeValueList::Values(values)
+                        AttributeValueKind::Values(values)
                             if matches!(
                                 values.first(),
                                 Some(AttributeValue::Text(Text { data, .. }))
@@ -1575,7 +1566,7 @@ pub(super) fn parse_modern_script(
         is_ts,
     )
     .unwrap_or_else(|| crate::parse::ParsedProgramContent {
-        parsed: Arc::new(crate::js::ParsedJsProgram::parse(
+        parsed: Arc::new(crate::js::JsProgram::parse(
             content_source,
             if is_ts {
                 oxc_span::SourceType::ts().with_module(true)
@@ -1615,7 +1606,7 @@ pub(super) fn parse_modern_options(source: &str, element: TsNode<'_>) -> Option<
         }) = attribute
         {
             if name.as_ref() == "customElement"
-                && let AttributeValueList::Values(values) = value
+                && let AttributeValueKind::Values(values) = value
                 && let Some(AttributeValue::Text(Text { data, .. })) = values.first()
             {
                 custom_element = Some(CustomElement { tag: data.clone() });
@@ -1624,12 +1615,12 @@ pub(super) fn parse_modern_options(source: &str, element: TsNode<'_>) -> Option<
             if name.as_ref() == "runes" {
                 match value_syntax {
                     AttributeValueSyntax::Boolean => runes = Some(true),
-                    _ if matches!(value, AttributeValueList::ExpressionTag(_)) => {
-                        let AttributeValueList::ExpressionTag(tag) = value else {
+                    _ if matches!(value, AttributeValueKind::ExpressionTag(_)) => {
+                        let AttributeValueKind::ExpressionTag(tag) = value else {
                             unreachable!("checked expression tag");
                         };
-                        if expression_literal_bool(&tag.expression).is_some() {
-                            runes = expression_literal_bool(&tag.expression);
+                        if tag.expression.literal_bool().is_some() {
+                            runes = tag.expression.literal_bool();
                         }
                     }
                     _ => {}
@@ -1717,19 +1708,19 @@ pub(super) fn parse_modern_style(source: &str, element: TsNode<'_>) -> Option<Cs
     })
 }
 
-fn modern_attribute_value_is_module(value: &AttributeValueList) -> bool {
+fn modern_attribute_value_is_module(value: &AttributeValueKind) -> bool {
     match value {
-        AttributeValueList::Boolean(_) => false,
-        AttributeValueList::Values(values) => values.iter().any(|value| {
+        AttributeValueKind::Boolean(_) => false,
+        AttributeValueKind::Values(values) => values.iter().any(|value| {
             matches!(
                 value,
                 AttributeValue::Text(Text { data, .. }) if data.as_ref() == "module"
             )
         }),
-        AttributeValueList::ExpressionTag(tag) => {
-            expression_identifier_name(&tag.expression)
+        AttributeValueKind::ExpressionTag(tag) => {
+            tag.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == "module")
-                || expression_literal_string(&tag.expression)
+                || tag.expression.literal_string()
                     .is_some_and(|value| value.as_ref() == "module")
         }
     }
@@ -1938,7 +1929,7 @@ fn parse_collapsed_tag_sequence_from_text(
                         index += 1;
                     }
 
-                    AttributeValueList::Values(
+                    AttributeValueKind::Values(
                         vec![AttributeValue::Text(Text {
                             start: base + value_start,
                             end: base + value_end,
@@ -1948,14 +1939,14 @@ fn parse_collapsed_tag_sequence_from_text(
                         .into_boxed_slice(),
                     )
                 } else {
-                    AttributeValueList::Boolean(true)
+                    AttributeValueKind::Boolean(true)
                 }
             } else {
-                AttributeValueList::Boolean(true)
+                AttributeValueKind::Boolean(true)
             };
             let value_syntax = match &value {
-                AttributeValueList::Boolean(_) => AttributeValueSyntax::Boolean,
-                AttributeValueList::Values(_) | AttributeValueList::ExpressionTag(_) => {
+                AttributeValueKind::Boolean(_) => AttributeValueSyntax::Boolean,
+                AttributeValueKind::Values(_) | AttributeValueKind::ExpressionTag(_) => {
                     AttributeValueSyntax::Quoted
                 }
             };
@@ -1998,10 +1989,10 @@ fn parse_collapsed_tag_sequence_from_text(
     Some((nodes, comments))
 }
 
-pub(super) fn modern_name_location(source: &str, start: usize, end: usize) -> LegacyNameLocation {
-    LegacyNameLocation {
-        start: source_location_at_offset(source, start),
-        end: source_location_at_offset(source, end),
+pub(super) fn modern_name_location(source: &str, start: usize, end: usize) -> SourceRange {
+    SourceRange {
+        start: location_at_offset(source, start),
+        end: location_at_offset(source, end),
     }
 }
 
@@ -2017,9 +2008,9 @@ pub(super) fn modern_root_comment(
         start,
         end,
         value,
-        loc: LegacyNameLocation {
-            start: source_location_at_offset(source, start),
-            end: source_location_at_offset(source, end),
+        loc: SourceRange {
+            start: location_at_offset(source, start),
+            end: location_at_offset(source, end),
         },
     }
 }
@@ -2182,7 +2173,7 @@ fn debug_tag_identifiers(arguments: &[Expression]) -> Box<[Identifier]> {
 }
 
 fn modern_identifier_from_expression(expression: Expression) -> Option<Identifier> {
-    let name = crate::parse::oxc_query::expression_identifier_name(&expression)?;
+    let name = expression.identifier_name()?;
     Some(Identifier {
         start: expression.start,
         end: expression.end,
@@ -3151,7 +3142,7 @@ pub(crate) fn parse_snippet_params(
         return Vec::new();
     };
     let raw = text_for_node(source, params_node);
-    let Some(parsed) = crate::js::ParsedJsParameters::parse(raw.as_ref()).ok().map(Arc::new) else {
+    let Some(parsed) = crate::js::JsParameters::parse(raw.as_ref()).ok().map(Arc::new) else {
         return named_children_vec(params_node)
             .into_iter()
             .filter(|node| node.kind() == "pattern")
@@ -3363,7 +3354,7 @@ pub(crate) fn parse_pattern_with_oxc(
 
     let leading_ws = text.find(trimmed).unwrap_or(0);
     let start = abs_start + leading_ws;
-    let parsed = Arc::new(crate::js::ParsedJsPattern::parse(trimmed).ok()?);
+    let parsed = Arc::new(crate::js::JsPattern::parse(trimmed).ok()?);
     let end = start + trimmed.len();
     let mut expression = Expression::from_pattern(parsed, start, end);
     expression.syntax.parens = leading_parens(trimmed, start, expression.start);
@@ -3427,7 +3418,7 @@ pub fn line_column_at_offset(source: &str, offset: usize) -> (usize, usize) {
     SourceText::new(SourceId::new(0), source, None).line_column_at_offset(offset)
 }
 
-fn source_location_at_offset(source: &str, offset: usize) -> SourceLocation {
+fn location_at_offset(source: &str, offset: usize) -> LineColumn {
     SourceText::new(SourceId::new(0), source, None).location_at_offset(offset)
 }
 
@@ -3487,7 +3478,7 @@ fn extract_this_expression(attributes: Box<[Attribute]>) -> (Option<Expression>,
         if this_expr.is_none()
             && let Attribute::Attribute(ref named) = attr
             && classify_attribute_name(named.name.as_ref()) == AttributeKind::This
-            && let AttributeValueList::ExpressionTag(ref tag) = named.value
+            && let AttributeValueKind::ExpressionTag(ref tag) = named.value
         {
             this_expr = Some(tag.expression.clone());
             continue;
@@ -3495,7 +3486,7 @@ fn extract_this_expression(attributes: Box<[Attribute]>) -> (Option<Expression>,
         if this_expr.is_none()
             && let Attribute::Attribute(ref named) = attr
             && classify_attribute_name(named.name.as_ref()) == AttributeKind::This
-            && let AttributeValueList::Values(ref values) = named.value
+            && let AttributeValueKind::Values(ref values) = named.value
             && values.len() == 1
             && let AttributeValue::Text(text) = &values[0]
         {
@@ -3514,7 +3505,7 @@ fn extract_this_expression(attributes: Box<[Attribute]>) -> (Option<Expression>,
 
 fn modern_string_literal_expression(value: Arc<str>, start: usize, end: usize) -> Expression {
     let raw = format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
-    match crate::js::ParsedJsExpression::parse(raw, oxc_span::SourceType::ts().with_module(true)) {
+    match crate::js::JsExpression::parse(raw, oxc_span::SourceType::ts().with_module(true)) {
         Ok(parsed) => Expression::from_expression(Arc::new(parsed), start, end),
         Err(_) => Expression::empty(start, end),
     }
@@ -3675,18 +3666,18 @@ fn parse_modern_regular_element(
         .unwrap_or_else(|| Arc::from(""));
 
     let name_loc = if let Some(tag_name) = tag_name {
-        LegacyNameLocation {
-            start: source_location_from_point(
+        SourceRange {
+            start: line_column_from_point(
                 source,
                 tag_name.start_position(),
                 tag_name.start_byte(),
             ),
-            end: source_location_from_point(source, tag_name.end_position(), tag_name.end_byte()),
+            end: line_column_from_point(source, tag_name.end_position(), tag_name.end_byte()),
         }
     } else {
-        LegacyNameLocation {
-            start: source_location_from_point(source, node.start_position(), node.start_byte()),
-            end: source_location_from_point(source, node.start_position(), node.start_byte()),
+        SourceRange {
+            start: line_column_from_point(source, node.start_position(), node.start_byte()),
+            end: line_column_from_point(source, node.start_position(), node.start_byte()),
         }
     };
 
@@ -4224,7 +4215,7 @@ fn loose_tag_name_and_loc(
     source: &str,
     container: TsNode<'_>,
     name_node: Option<TsNode<'_>>,
-) -> (Arc<str>, LegacyNameLocation) {
+) -> (Arc<str>, SourceRange) {
     let name_start = name_node.map(|node| node.start_byte()).unwrap_or_else(|| {
         container
             .start_byte()
@@ -4236,28 +4227,28 @@ fn loose_tag_name_and_loc(
     if let Some((name, name_end)) = loose_tag_name_range(source, name_start, fallback_end) {
         return (
             name,
-            LegacyNameLocation {
-                start: source_location_from_point(
+            SourceRange {
+                start: line_column_from_point(
                     source,
                     name_node
                         .map(|node| node.start_position())
                         .unwrap_or_else(|| container.start_position()),
                     name_start,
                 ),
-                end: source_location_at_offset(source, name_end),
+                end: location_at_offset(source, name_end),
             },
         );
     }
 
     (
         Arc::from(""),
-        LegacyNameLocation {
-            start: source_location_from_point(
+        SourceRange {
+            start: line_column_from_point(
                 source,
                 container.start_position(),
                 container.start_byte(),
             ),
-            end: source_location_from_point(
+            end: line_column_from_point(
                 source,
                 container.start_position(),
                 container.start_byte(),
@@ -4533,22 +4524,6 @@ pub fn attach_trailing_comments_to_expression(
 ) {
 }
 
-pub fn modern_node_span(node: &Node) -> (usize, usize) {
-    (node.start(), node.end())
-}
-
-pub fn expression_identifier_name(expression: &Expression) -> Option<Arc<str>> {
-    crate::parse::oxc_query::expression_identifier_name(expression)
-}
-
-pub fn expression_literal_string(expression: &Expression) -> Option<Arc<str>> {
-    crate::parse::oxc_query::expression_literal_string(expression)
-}
-
-pub fn expression_literal_bool(expression: &Expression) -> Option<bool> {
-    crate::parse::oxc_query::expression_literal_bool(expression)
-}
-
 fn offset_to_line_column(
     text: &str,
     offset: usize,
@@ -4579,7 +4554,7 @@ pub fn legacy_expression_from_modern_expression(
     super::legacy::legacy_expression_from_modern(expression, include_character)
 }
 
-pub fn named_children_vec(node: TsNode<'_>) -> Vec<TsNode<'_>> {
+pub(crate) fn named_children_vec(node: TsNode<'_>) -> Vec<TsNode<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
 }

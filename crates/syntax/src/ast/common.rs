@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::SourceLocation;
+use crate::LineColumn;
 
+/// Serde discriminant for `"type": "Script"` in the JSON AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScriptType {
     Script,
@@ -17,9 +18,9 @@ pub enum ScriptContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NameLocation {
-    pub start: SourceLocation,
-    pub end: SourceLocation,
+pub struct SourceRange {
+    pub start: LineColumn,
+    pub end: LineColumn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -116,6 +117,7 @@ pub enum RootCommentType {
     Block,
 }
 
+/// Serde discriminant for `"type": "Fragment"` in the JSON AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FragmentType {
     Fragment,

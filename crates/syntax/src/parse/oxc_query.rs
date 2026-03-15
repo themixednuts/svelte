@@ -5,24 +5,6 @@ use oxc_span::GetSpan;
 
 use crate::ast::modern::{Expression, JsNodeHandle};
 
-pub(crate) fn expression_identifier_name(expression: &Expression) -> Option<Arc<str>> {
-    expression.identifier_name()
-}
-
-pub(crate) fn expression_literal_string(expression: &Expression) -> Option<Arc<str>> {
-    match expression.oxc_expression()? {
-        OxcExpression::StringLiteral(value) => Some(Arc::from(value.value.as_str())),
-        _ => None,
-    }
-}
-
-pub(crate) fn expression_literal_bool(expression: &Expression) -> Option<bool> {
-    match expression.oxc_expression()? {
-        OxcExpression::BooleanLiteral(value) => Some(value.value),
-        _ => None,
-    }
-}
-
 pub(crate) fn split_debug_tag_arguments(expression: Expression) -> Box<[Expression]> {
     if let Some(OxcExpression::SequenceExpression(sequence)) = expression.oxc_expression() {
         let root = match &expression.node {

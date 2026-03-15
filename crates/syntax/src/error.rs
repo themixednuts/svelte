@@ -20,7 +20,7 @@ pub struct SourcePosition {
 
 /// A line/column location in source text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceLocation {
+pub struct LineColumn {
     /// One-based line number.
     pub line: usize,
     /// Zero-based UTF-16 column.
@@ -43,9 +43,9 @@ pub struct CompileError {
     /// Character range where the error occurred.
     pub position: Option<Box<SourcePosition>>,
     /// Line/column location of the start of the error.
-    pub start: Option<Box<SourceLocation>>,
+    pub start: Option<Box<LineColumn>>,
     /// Line/column location of the end of the error.
-    pub end: Option<Box<SourceLocation>>,
+    pub end: Option<Box<LineColumn>>,
     /// File path, if known.
     pub filename: Option<Arc<Utf8PathBuf>>,
 }

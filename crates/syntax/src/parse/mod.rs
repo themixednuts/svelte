@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use crate::ast::{CssAst, modern::CssNode};
 use crate::error::CompileError;
-use crate::js::ParsedJsProgram;
+use crate::js::JsProgram;
 pub use component::modern::{
-    expression_literal_bool, expression_literal_string, find_matching_brace_close,
-    legacy_expression_from_modern_expression, line_column_at_offset, named_children_vec,
+    find_matching_brace_close, legacy_expression_from_modern_expression, line_column_at_offset,
     parse_modern_expression_from_text, parse_modern_expression_tag,
 };
 pub use component::{
@@ -20,14 +19,11 @@ pub use component::{
     is_void_element_name,
 };
 pub use component::{ParseMode, ParseOptions, parse, parse_modern_root, parse_modern_root_incremental};
-pub use component::{
-    expression_identifier_name, modern_node_end, modern_node_span, modern_node_start,
-};
 pub(crate) use scan::find_valid_legacy_closing_tag_start;
 pub use scan::parse_svelte_ignores;
 
 pub(crate) struct ParsedProgramContent {
-    pub parsed: Arc<ParsedJsProgram>,
+    pub parsed: Arc<JsProgram>,
 }
 
 pub fn parse_css(source: &str) -> Result<CssAst, CompileError> {

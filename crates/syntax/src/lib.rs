@@ -89,21 +89,19 @@ pub use cst::{CstEdit, CstParser, Document, Language, parse_svelte, parse_svelte
 
 // --- Errors ---
 
-pub use error::{CompileError, CompilerDiagnosticKind, SourceLocation, SourcePosition};
+pub use error::{CompileError, CompilerDiagnosticKind, LineColumn, SourcePosition};
 
 // --- JavaScript handles ---
 
-pub use js::{ParsedJsExpression, ParsedJsProgram};
+pub use js::{JsExpression, JsProgram};
 
 // --- AST parsing and element/attribute classification ---
 
 pub use parse::{
     AttributeKind, ElementKind, ParseMode, ParseOptions, SvelteElementKind,
-    classify_attribute_name, classify_element_name, expression_identifier_name,
-    expression_literal_bool, expression_literal_string, find_matching_brace_close,
-    is_component_name, is_custom_element_name, is_valid_component_name, is_valid_element_name,
-    is_void_element_name, line_column_at_offset, modern_node_end, modern_node_span,
-    modern_node_start, named_children_vec, parse, parse_css, parse_modern_css_nodes,
+    classify_attribute_name, classify_element_name, find_matching_brace_close, is_component_name,
+    is_custom_element_name, is_valid_component_name, is_valid_element_name, is_void_element_name,
+    line_column_at_offset, parse, parse_css, parse_modern_css_nodes,
     parse_modern_expression_from_text, parse_modern_expression_tag, parse_modern_root,
     parse_modern_root_incremental, parse_svelte_ignores,
 };

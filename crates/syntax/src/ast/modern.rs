@@ -12,15 +12,16 @@ use serde::{Deserialize, Serialize, ser::SerializeMap};
 use crate::ast::common::Span;
 pub use crate::ast::common::{
     AttrError, AttrErrorKind, AttributeValueSyntax, DirectiveValueSyntax,
-    FragmentType, LiteralValue, Loc, NameLocation, ParseError, Position, RootCommentType,
+    FragmentType, LiteralValue, Loc, SourceRange, ParseError, Position, RootCommentType,
     ScriptContext, ScriptType, SnippetHeaderError, SnippetHeaderErrorKind,
 };
-use crate::js::{ParsedJsExpression, ParsedJsParameters, ParsedJsPattern, ParsedJsProgram};
+use crate::js::{JsExpression, JsParameters, JsPattern, JsProgram};
 
-fn empty_parsed_js_program() -> Arc<ParsedJsProgram> {
-    Arc::new(ParsedJsProgram::parse("", oxc_span::SourceType::mjs()))
+fn empty_parsed_js_program() -> Arc<JsProgram> {
+    Arc::new(JsProgram::parse("", oxc_span::SourceType::mjs()))
 }
 
+/// Serde discriminant for `"type": "Root"` in the JSON AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootType {
     Root,
@@ -257,12 +258,12 @@ pub struct Script {
         skip_deserializing,
         default = "empty_parsed_js_program"
     )]
-    pub content: Arc<ParsedJsProgram>,
+    pub content: Arc<JsProgram>,
     pub attributes: Box<[Attribute]>,
 }
 
 impl Script {
-    pub fn parsed_program(&self) -> &ParsedJsProgram {
+    pub fn parsed_program(&self) -> &JsProgram {
         &self.content
     }
 
@@ -362,6 +363,7 @@ pub struct ExpressionTag {
     pub expression: Expression,
 }
 
+/// Serde discriminant for `"type": "ExpressionTag"` in the JSON AST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExpressionTagType {
     ExpressionTag,
@@ -379,7 +381,7 @@ pub struct RegularElement {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     #[serde(skip_serializing, default)]
     pub self_closing: bool,
     #[serde(skip_serializing, default)]
@@ -393,7 +395,7 @@ pub struct Component {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -403,7 +405,7 @@ pub struct SlotElement {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -413,7 +415,7 @@ pub struct SvelteHead {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -423,7 +425,7 @@ pub struct SvelteBody {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -433,7 +435,7 @@ pub struct SvelteWindow {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -443,7 +445,7 @@ pub struct SvelteDocument {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -453,7 +455,7 @@ pub struct SvelteComponent {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -465,7 +467,7 @@ pub struct SvelteElement {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -477,7 +479,7 @@ pub struct SvelteSelf {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -487,7 +489,7 @@ pub struct SvelteFragment {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -497,7 +499,7 @@ pub struct SvelteBoundary {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -507,7 +509,7 @@ pub struct TitleElement {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub attributes: Box<[Attribute]>,
     pub fragment: Fragment,
 }
@@ -540,8 +542,8 @@ pub struct NamedAttribute {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
-    pub value: AttributeValueList,
+    pub name_loc: SourceRange,
+    pub value: AttributeValueKind,
     #[serde(skip_serializing, default)]
     pub value_syntax: AttributeValueSyntax,
     #[serde(skip_serializing, default)]
@@ -550,7 +552,7 @@ pub struct NamedAttribute {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum AttributeValueList {
+pub enum AttributeValueKind {
     Boolean(bool),
     Values(Box<[AttributeValue]>),
     ExpressionTag(ExpressionTag),
@@ -568,7 +570,7 @@ pub struct DirectiveAttribute {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub expression: Expression,
     pub modifiers: Box<[Arc<str>]>,
     #[serde(skip_serializing, default)]
@@ -582,9 +584,9 @@ pub struct StyleDirective {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub modifiers: Box<[Arc<str>]>,
-    pub value: AttributeValueList,
+    pub value: AttributeValueKind,
     #[serde(skip_serializing, default)]
     pub value_syntax: AttributeValueSyntax,
 }
@@ -594,7 +596,7 @@ pub struct TransitionDirective {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub expression: Expression,
     pub modifiers: Box<[Arc<str>]>,
     pub intro: bool,
@@ -637,19 +639,19 @@ pub struct ExpressionSyntax {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsNodeHandle {
-    Expression(Arc<ParsedJsExpression>),
+    Expression(Arc<JsExpression>),
     SequenceItem {
-        root: Arc<ParsedJsExpression>,
+        root: Arc<JsExpression>,
         index: usize,
     },
-    Pattern(Arc<ParsedJsPattern>),
+    Pattern(Arc<JsPattern>),
     ParameterItem {
-        parameters: Arc<ParsedJsParameters>,
+        parameters: Arc<JsParameters>,
         index: usize,
     },
-    RestParameter(Arc<ParsedJsParameters>),
+    RestParameter(Arc<JsParameters>),
     StatementInProgram {
-        program: Arc<ParsedJsProgram>,
+        program: Arc<JsProgram>,
         index: usize,
     },
 }
@@ -679,7 +681,7 @@ impl Expression {
         self.node.is_none() && self.start == self.end
     }
 
-    pub fn from_expression(parsed: Arc<ParsedJsExpression>, start: usize, end: usize) -> Self {
+    pub fn from_expression(parsed: Arc<JsExpression>, start: usize, end: usize) -> Self {
         Self {
             start,
             end,
@@ -689,7 +691,7 @@ impl Expression {
     }
 
     pub fn from_sequence_item(
-        root: Arc<ParsedJsExpression>,
+        root: Arc<JsExpression>,
         index: usize,
         start: usize,
         end: usize,
@@ -702,7 +704,7 @@ impl Expression {
         }
     }
 
-    pub fn from_pattern(parsed: Arc<ParsedJsPattern>, start: usize, end: usize) -> Self {
+    pub fn from_pattern(parsed: Arc<JsPattern>, start: usize, end: usize) -> Self {
         Self {
             start,
             end,
@@ -712,7 +714,7 @@ impl Expression {
     }
 
     pub fn from_parameter_item(
-        parameters: Arc<ParsedJsParameters>,
+        parameters: Arc<JsParameters>,
         index: usize,
         start: usize,
         end: usize,
@@ -725,7 +727,7 @@ impl Expression {
         }
     }
 
-    pub fn from_rest_parameter(parameters: Arc<ParsedJsParameters>, start: usize, end: usize) -> Self {
+    pub fn from_rest_parameter(parameters: Arc<JsParameters>, start: usize, end: usize) -> Self {
         Self {
             start,
             end,
@@ -735,7 +737,7 @@ impl Expression {
     }
 
     pub fn from_statement(
-        program: Arc<ParsedJsProgram>,
+        program: Arc<JsProgram>,
         index: usize,
         start: usize,
         end: usize,
@@ -776,7 +778,7 @@ impl Expression {
         parens
     }
 
-    pub fn parsed(&self) -> Option<&ParsedJsExpression> {
+    pub fn parsed(&self) -> Option<&JsExpression> {
         match &self.node {
             Some(JsNodeHandle::Expression(parsed)) => Some(parsed),
             Some(JsNodeHandle::SequenceItem { root, .. }) => Some(root),
@@ -902,6 +904,20 @@ impl Expression {
             BindingPattern::BindingIdentifier(identifier) => {
                 Some(Arc::from(identifier.name.as_str()))
             }
+            _ => None,
+        }
+    }
+
+    pub fn literal_string(&self) -> Option<Arc<str>> {
+        match self.oxc_expression()? {
+            OxcExpression::StringLiteral(value) => Some(Arc::from(value.value.as_str())),
+            _ => None,
+        }
+    }
+
+    pub fn literal_bool(&self) -> Option<bool> {
+        match self.oxc_expression()? {
+            OxcExpression::BooleanLiteral(value) => Some(value.value),
             _ => None,
         }
     }
@@ -1394,7 +1410,7 @@ pub trait HasFragment {
 
 pub trait Element: Span + HasFragment {
     fn name(&self) -> &str;
-    fn name_loc(&self) -> &NameLocation;
+    fn name_loc(&self) -> &SourceRange;
     fn attributes(&self) -> &[Attribute];
     fn expression(&self) -> Option<&Expression> {
         None
@@ -1413,7 +1429,7 @@ macro_rules! impl_element {
 
             impl Element for $ty {
                 fn name(&self) -> &str { &self.name }
-                fn name_loc(&self) -> &NameLocation { &self.name_loc }
+                fn name_loc(&self) -> &SourceRange { &self.name_loc }
                 fn attributes(&self) -> &[Attribute] { &self.attributes }
             }
         )*
@@ -1437,7 +1453,7 @@ impl Element for RegularElement {
     fn name(&self) -> &str {
         &self.name
     }
-    fn name_loc(&self) -> &NameLocation {
+    fn name_loc(&self) -> &SourceRange {
         &self.name_loc
     }
     fn attributes(&self) -> &[Attribute] {
@@ -1464,7 +1480,7 @@ impl Element for SvelteComponent {
     fn name(&self) -> &str {
         &self.name
     }
-    fn name_loc(&self) -> &NameLocation {
+    fn name_loc(&self) -> &SourceRange {
         &self.name_loc
     }
     fn attributes(&self) -> &[Attribute] {
@@ -1485,7 +1501,7 @@ impl Element for SvelteElement {
     fn name(&self) -> &str {
         &self.name
     }
-    fn name_loc(&self) -> &NameLocation {
+    fn name_loc(&self) -> &SourceRange {
         &self.name_loc
     }
     fn attributes(&self) -> &[Attribute] {
@@ -1617,7 +1633,7 @@ pub struct RootComment {
     pub start: usize,
     pub end: usize,
     pub value: Arc<str>,
-    pub loc: NameLocation,
+    pub loc: SourceRange,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1804,7 +1820,7 @@ mod tests {
 
     #[test]
     fn expression_serializes_oxc_identifier_with_offset() {
-        let parsed = crate::js::ParsedJsExpression::parse(
+        let parsed = crate::js::JsExpression::parse(
             "foo",
             oxc_span::SourceType::mjs(),
         )

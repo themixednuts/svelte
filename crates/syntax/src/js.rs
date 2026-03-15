@@ -52,13 +52,13 @@ self_cell! {
 /// This owns the source text and arena allocator required by the parsed OXC
 /// AST so downstream tools can inspect the AST without reparsing or converting
 /// through ESTree JSON.
-pub struct ParsedJsProgram {
+pub struct JsProgram {
     cell: ParsedProgramCell,
 }
 
-impl std::fmt::Debug for ParsedJsProgram {
+impl std::fmt::Debug for JsProgram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParsedJsProgram")
+        f.debug_struct("JsProgram")
             .field("source", &self.source())
             .field("source_type", &self.source_type())
             .field("panicked", &self.panicked())
@@ -67,15 +67,15 @@ impl std::fmt::Debug for ParsedJsProgram {
     }
 }
 
-impl PartialEq for ParsedJsProgram {
+impl PartialEq for JsProgram {
     fn eq(&self, other: &Self) -> bool {
         self.source() == other.source() && self.source_type() == other.source_type()
     }
 }
 
-impl Eq for ParsedJsProgram {}
+impl Eq for JsProgram {}
 
-impl ParsedJsProgram {
+impl JsProgram {
     /// Parse JavaScript or TypeScript source into a program AST.
     #[must_use]
     pub fn parse(source: impl Into<Box<str>>, source_type: SourceType) -> Self {
@@ -151,28 +151,28 @@ impl ParsedJsProgram {
 /// This owns the source text and arena allocator required by the parsed OXC
 /// AST so downstream tools can inspect a template/script expression without
 /// reparsing.
-pub struct ParsedJsExpression {
+pub struct JsExpression {
     cell: ParsedExpressionCell,
 }
 
-impl std::fmt::Debug for ParsedJsExpression {
+impl std::fmt::Debug for JsExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParsedJsExpression")
+        f.debug_struct("JsExpression")
             .field("source", &self.source())
             .field("source_type", &self.source_type())
             .finish()
     }
 }
 
-impl PartialEq for ParsedJsExpression {
+impl PartialEq for JsExpression {
     fn eq(&self, other: &Self) -> bool {
         self.source() == other.source() && self.source_type() == other.source_type()
     }
 }
 
-impl Eq for ParsedJsExpression {}
+impl Eq for JsExpression {}
 
-impl ParsedJsExpression {
+impl JsExpression {
     /// Parse a single JavaScript or TypeScript expression.
     pub fn parse(
         source: impl Into<Box<str>>,
@@ -216,14 +216,14 @@ impl ParsedJsExpression {
 /// Svelte stores certain binding and parameter positions in the same logical
 /// expression slot as ordinary expressions. This handle keeps those nodes in
 /// OXC form without routing through ESTree compatibility trees.
-pub struct ParsedJsPattern {
+pub struct JsPattern {
     source: Box<str>,
-    wrapper: Arc<ParsedJsExpression>,
+    wrapper: Arc<JsExpression>,
 }
 
-impl std::fmt::Debug for ParsedJsPattern {
+impl std::fmt::Debug for JsPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParsedJsPattern")
+        f.debug_struct("JsPattern")
             .field("source", &self.source())
             .finish()
     }
@@ -233,14 +233,14 @@ impl std::fmt::Debug for ParsedJsPattern {
 ///
 /// This preserves richer parameter information like rest/default/type metadata
 /// while still exposing each parameter binding pattern without reparsing.
-pub struct ParsedJsParameters {
+pub struct JsParameters {
     source: Box<str>,
-    wrapper: Arc<ParsedJsExpression>,
+    wrapper: Arc<JsExpression>,
 }
 
-impl std::fmt::Debug for ParsedJsParameters {
+impl std::fmt::Debug for JsParameters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParsedJsParameters")
+        f.debug_struct("JsParameters")
             .field("source", &self.source())
             .field("parameter_count", &self.parameters().items.len())
             .field("has_rest", &self.parameters().rest.is_some())
@@ -248,19 +248,19 @@ impl std::fmt::Debug for ParsedJsParameters {
     }
 }
 
-impl PartialEq for ParsedJsParameters {
+impl PartialEq for JsParameters {
     fn eq(&self, other: &Self) -> bool {
         self.source() == other.source()
     }
 }
 
-impl Eq for ParsedJsParameters {}
+impl Eq for JsParameters {}
 
-impl ParsedJsParameters {
+impl JsParameters {
     pub fn parse(source: impl Into<Box<str>>) -> Result<Self, Box<[OxcDiagnostic]>> {
         let source = source.into();
         let wrapper_source = format!("({})=>{{}}", source);
-        let wrapper = Arc::new(ParsedJsExpression::parse(
+        let wrapper = Arc::new(JsExpression::parse(
             wrapper_source,
             SourceType::ts().with_module(true),
         )?);
@@ -293,7 +293,7 @@ impl ParsedJsParameters {
         self.parameters().rest.as_deref()
     }
 
-    fn parameters_from_wrapper(wrapper: &ParsedJsExpression) -> Option<&FormalParameters<'_>> {
+    fn parameters_from_wrapper(wrapper: &JsExpression) -> Option<&FormalParameters<'_>> {
         match wrapper.expression() {
             Expression::ArrowFunctionExpression(function) => Some(&function.params),
             _ => None,
@@ -301,19 +301,19 @@ impl ParsedJsParameters {
     }
 }
 
-impl PartialEq for ParsedJsPattern {
+impl PartialEq for JsPattern {
     fn eq(&self, other: &Self) -> bool {
         self.source() == other.source()
     }
 }
 
-impl Eq for ParsedJsPattern {}
+impl Eq for JsPattern {}
 
-impl ParsedJsPattern {
+impl JsPattern {
     pub fn parse(source: impl Into<Box<str>>) -> Result<Self, Box<[OxcDiagnostic]>> {
         let source = source.into();
         let wrapper_source = format!("({})=>{{}}", source);
-        let wrapper = Arc::new(ParsedJsExpression::parse(
+        let wrapper = Arc::new(JsExpression::parse(
             wrapper_source,
             SourceType::ts().with_module(true),
         )?);
@@ -338,7 +338,7 @@ impl ParsedJsPattern {
         Self::pattern_from_wrapper(&self.wrapper).expect("validated parsed pattern")
     }
 
-    fn pattern_from_wrapper(wrapper: &ParsedJsExpression) -> Option<&BindingPattern<'_>> {
+    fn pattern_from_wrapper(wrapper: &JsExpression) -> Option<&BindingPattern<'_>> {
         match wrapper.expression() {
             Expression::ArrowFunctionExpression(function) => function
                 .params
@@ -350,7 +350,7 @@ impl ParsedJsPattern {
     }
 }
 
-impl ParsedJsProgram {
+impl JsProgram {
     #[must_use]
     pub fn statement(&self, index: usize) -> Option<&Statement<'_>> {
         self.program().body.get(index)
@@ -382,11 +382,11 @@ mod tests {
     use oxc_ast::ast::{BindingPattern, Expression, Statement};
     use oxc_span::SourceType;
 
-    use super::{ParsedJsExpression, ParsedJsPattern, ParsedJsProgram};
+    use super::{JsExpression, JsPattern, JsProgram};
 
     #[test]
     fn parsed_js_program_exposes_reusable_oxc_program() {
-        let parsed = ParsedJsProgram::parse("export const answer = 42;", SourceType::mjs());
+        let parsed = JsProgram::parse("export const answer = 42;", SourceType::mjs());
 
         assert_eq!(parsed.source(), "export const answer = 42;");
         assert!(parsed.errors().is_empty());
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn parsed_js_expression_exposes_reusable_oxc_expression() {
-        let parsed = ParsedJsExpression::parse("count + 1", SourceType::ts().with_module(true))
+        let parsed = JsExpression::parse("count + 1", SourceType::ts().with_module(true))
             .expect("expression should parse");
 
         assert_eq!(parsed.source(), "count + 1");
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn parsed_js_expression_returns_oxc_errors_on_invalid_input() {
-        let errors = ParsedJsExpression::parse("foo(", SourceType::ts().with_module(true))
+        let errors = JsExpression::parse("foo(", SourceType::ts().with_module(true))
             .err()
             .expect("expression should fail");
 
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn parsed_js_pattern_exposes_reusable_oxc_pattern() {
         let parsed =
-            ParsedJsPattern::parse("{ count, items: [item] }").expect("pattern should parse");
+            JsPattern::parse("{ count, items: [item] }").expect("pattern should parse");
 
         assert!(matches!(parsed.pattern(), BindingPattern::ObjectPattern(_)));
     }

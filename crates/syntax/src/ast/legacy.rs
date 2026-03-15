@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::common::Span;
 pub use crate::ast::common::{
-    FragmentType, LiteralValue, Loc as ExpressionLoc, NameLocation,
+    FragmentType, LiteralValue, Loc as ExpressionLoc, SourceRange,
     Position as ExpressionPoint, RootCommentType, ScriptContext, ScriptType, SnippetHeaderError,
     SnippetHeaderErrorKind,
 };
 use crate::ast::modern;
-use crate::js::ParsedJsProgram;
+use crate::js::JsProgram;
 use crate::parse::legacy_expression_from_modern_expression;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,15 +23,15 @@ pub struct Script {
         skip_deserializing,
         default = "empty_parsed_js_program"
     )]
-    pub content: Arc<ParsedJsProgram>,
+    pub content: Arc<JsProgram>,
     #[serde(skip_serializing, default)]
     pub content_start: usize,
     #[serde(skip_serializing, default)]
     pub content_end: usize,
 }
 
-fn empty_parsed_js_program() -> Arc<ParsedJsProgram> {
-    Arc::new(ParsedJsProgram::parse("", oxc_span::SourceType::mjs()))
+fn empty_parsed_js_program() -> Arc<JsProgram> {
+    Arc::new(JsProgram::parse("", oxc_span::SourceType::mjs()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,8 +109,8 @@ pub struct NamedAttribute {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
-    pub value: AttributeValueList,
+    pub name_loc: SourceRange,
+    pub value: AttributeValueKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,9 +125,9 @@ pub struct StyleDirective {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub modifiers: Box<[Arc<str>]>,
-    pub value: AttributeValueList,
+    pub value: AttributeValueKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +135,7 @@ pub struct DirectiveAttribute {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub expression: Option<Expression>,
     pub modifiers: Box<[Arc<str>]>,
 }
@@ -145,7 +145,7 @@ pub struct TransitionDirective {
     pub start: usize,
     pub end: usize,
     pub name: Arc<str>,
-    pub name_loc: NameLocation,
+    pub name_loc: SourceRange,
     pub expression: Option<Expression>,
     pub modifiers: Box<[Arc<str>]>,
     pub intro: bool,
@@ -162,7 +162,7 @@ pub enum AttributeValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum AttributeValueList {
+pub enum AttributeValueKind {
     Boolean(bool),
     Values(Box<[AttributeValue]>),
 }
@@ -502,11 +502,11 @@ impl From<modern::TransitionDirective> for TransitionDirective {
     }
 }
 
-impl From<modern::AttributeValueList> for AttributeValueList {
-    fn from(value: modern::AttributeValueList) -> Self {
+impl From<modern::AttributeValueKind> for AttributeValueKind {
+    fn from(value: modern::AttributeValueKind) -> Self {
         match value {
-            modern::AttributeValueList::Boolean(flag) => Self::Boolean(flag),
-            modern::AttributeValueList::Values(values) => Self::Values(
+            modern::AttributeValueKind::Boolean(flag) => Self::Boolean(flag),
+            modern::AttributeValueKind::Values(values) => Self::Values(
                 values
                     .into_vec()
                     .into_iter()
@@ -514,7 +514,7 @@ impl From<modern::AttributeValueList> for AttributeValueList {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             ),
-            modern::AttributeValueList::ExpressionTag(tag) => Self::Values(
+            modern::AttributeValueKind::ExpressionTag(tag) => Self::Values(
                 vec![AttributeValue::MustacheTag(MustacheTag {
                     start: tag.start,
                     end: tag.end,

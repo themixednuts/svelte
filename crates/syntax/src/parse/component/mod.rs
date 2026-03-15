@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tree_sitter::{Node, Point};
 
 use crate::ast::Document;
-use crate::{CompileError, SourceId, SourceLocation, SourceText};
+use crate::{CompileError, SourceId, LineColumn, SourceText};
 
 mod elements;
 mod legacy;
@@ -22,13 +22,10 @@ pub use elements::{
 pub(crate) use legacy::parse_root as parse_legacy_root_from_cst;
 pub(crate) use legacy::{
     find_first_named_child, parse_identifier_name, parse_modern_attributes,
-    source_location_from_point, text_for_node,
+    line_column_from_point, text_for_node,
 };
 pub(crate) use modern::parse_root as parse_root_from_cst;
 pub(crate) use modern::parse_root_incremental as parse_root_incremental_from_cst;
-pub use modern::{
-    expression_identifier_name, modern_node_end, modern_node_span, modern_node_start,
-};
 pub(crate) use modern::{
     attach_leading_comments_to_expression, attach_trailing_comments_to_expression,
     find_matching_brace_close, line_column_at_offset, modern_empty_identifier_expression,

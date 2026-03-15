@@ -5,7 +5,7 @@ use oxc_parser::Parser as OxcParser;
 use oxc_span::SourceType as OxcSourceType;
 
 use crate::ast::modern::Expression;
-use crate::js::{ParsedJsExpression, ParsedJsProgram};
+use crate::js::{JsExpression, JsProgram};
 use crate::parse::ParsedProgramContent;
 
 pub(crate) struct OxcProgramOffsets {
@@ -42,13 +42,13 @@ impl<'src> SvelteOxcParser<'src> {
         } else {
             OxcSourceType::mjs()
         };
-        let parsed = Arc::new(ParsedJsProgram::parse(self.source, source_type));
+        let parsed = Arc::new(JsProgram::parse(self.source, source_type));
         Some(ParsedProgramContent { parsed })
     }
 
     pub(crate) fn parse_expression_for_template(&self) -> Option<Expression> {
         let source_type = OxcSourceType::ts().with_module(true);
-        let parsed = Arc::new(ParsedJsExpression::parse(self.source, source_type).ok()?);
+        let parsed = Arc::new(JsExpression::parse(self.source, source_type).ok()?);
         Some(Expression::from_expression(
             parsed,
             self.offsets.global_start,
