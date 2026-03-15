@@ -243,8 +243,8 @@ fn structured_error_reason(
     code: &str,
     message: &str,
     filename: Option<&str>,
-    start: Option<&svelte_compiler::SourceLocation>,
-    end: Option<&svelte_compiler::SourceLocation>,
+    start: Option<&svelte_compiler::LineColumn>,
+    end: Option<&svelte_compiler::LineColumn>,
     position: Option<&svelte_compiler::SourcePosition>,
 ) -> String {
     let payload = serde_json::json!({

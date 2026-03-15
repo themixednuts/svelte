@@ -3,9 +3,7 @@ use oxc_ast::ast::{Expression, Statement};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 use svelte_syntax::ast::modern::{Attribute, Node, Search};
-use svelte_syntax::{
-    SourceId, SourceText, expression_identifier_name, parse_modern_root, parse_svelte,
-};
+use svelte_syntax::{SourceId, SourceText, parse_modern_root, parse_svelte};
 
 pub fn has_children(content: &str, is_svelte_5_plus: bool) -> bool {
     let Ok(root) = parse_modern_root(content) else {
@@ -44,20 +42,20 @@ fn has_children_attribute(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| match attribute {
         Attribute::Attribute(attribute) if attribute.name.as_ref() == "children" => {
             match &attribute.value {
-                svelte_syntax::ast::modern::AttributeValueList::ExpressionTag(expression) => {
-                    expression_identifier_name(&expression.expression).as_deref()
+                svelte_syntax::ast::modern::AttributeValueKind::ExpressionTag(expression) => {
+                    expression.expression.identifier_name().as_deref()
                         == Some("children")
                 }
-                svelte_syntax::ast::modern::AttributeValueList::Values(values) => {
+                svelte_syntax::ast::modern::AttributeValueKind::Values(values) => {
                     values.iter().any(|value| match value {
                         svelte_syntax::ast::modern::AttributeValue::ExpressionTag(expression) => {
-                            expression_identifier_name(&expression.expression).as_deref()
+                            expression.expression.identifier_name().as_deref()
                                 == Some("children")
                         }
                         _ => false,
                     })
                 }
-                svelte_syntax::ast::modern::AttributeValueList::Boolean(_) => false,
+                svelte_syntax::ast::modern::AttributeValueKind::Boolean(_) => false,
             }
         }
         _ => false,
