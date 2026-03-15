@@ -1033,10 +1033,10 @@ impl Expression {
                 self.start as i64 - parsed.expression().span().start as i64
             }
             Some(JsNodeHandle::SequenceItem { root, index }) => {
-                if let OxcExpression::SequenceExpression(seq) = root.expression() {
-                    if let Some(expr) = seq.expressions.get(*index) {
-                        return self.start as i64 - expr.span().start as i64;
-                    }
+                if let OxcExpression::SequenceExpression(seq) = root.expression()
+                    && let Some(expr) = seq.expressions.get(*index)
+                {
+                    return self.start as i64 - expr.span().start as i64;
                 }
                 0
             }

@@ -54,18 +54,16 @@ fn try_reuse_node(
     let new_text = new_source.get(new_start..new_end)?;
     // Scan forward (skip at most a few old nodes that were removed or shifted).
     let scan_limit = (*cursor + 4).min(old_nodes.len());
-    for i in *cursor..scan_limit {
-        let old = &old_nodes[i];
+    for (i, old) in old_nodes.iter().enumerate().take(scan_limit).skip(*cursor) {
         let old_start = old.start();
         let old_end = old.end();
         let old_len = old_end - old_start;
-        if old_len == new_len {
-            if let Some(old_text) = old_source.get(old_start..old_end) {
-                if old_text == new_text {
-                    *cursor = i + 1;
-                    return Some(old.clone());
-                }
-            }
+        if old_len == new_len
+            && let Some(old_text) = old_source.get(old_start..old_end)
+            && old_text == new_text
+        {
+            *cursor = i + 1;
+            return Some(old.clone());
         }
     }
     None
@@ -136,8 +134,7 @@ fn find_old_node_by_kind<'a>(
     _kind: &str,
 ) -> Option<&'a Node> {
     let scan_limit = (*cursor + 4).min(old_nodes.len());
-    for i in *cursor..scan_limit {
-        let old = &old_nodes[i];
+    for (i, old) in old_nodes.iter().enumerate().take(scan_limit).skip(*cursor) {
         let old_len = old.end() - old.start();
         if old_len == new_len {
             *cursor = i + 1;
@@ -250,65 +247,65 @@ fn parse_root_inner(
 
         // Incremental reuse: if this child is outside all changed ranges,
         // try to clone the corresponding old AST node instead of parsing.
-        if let Some(ref hint) = hint {
-            if !any_range_overlaps(hint.changed_ranges, child_start, child_end) {
-                // Scripts: reuse by matching context on old root.
-                if child.kind() == "element" {
-                    if let Some(name) = modern_element_name(source, child) {
-                        match classify_element_name(name.as_ref()) {
-                            ElementKind::Script => {
-                                if let Some(old_root) = hint.old_root {
-                                    if let Some(old_script) = try_reuse_script(source, child, old_root) {
-                                        js.push(old_script.clone());
-                                        match old_script.context {
-                                            ScriptContext::Module => {
-                                                if module.is_none() {
-                                                    module = Some(old_script);
-                                                }
-                                            }
-                                            ScriptContext::Default => {
-                                                if instance.is_none() {
-                                                    instance = Some(old_script);
-                                                }
-                                            }
-                                        }
-                                        pending_script_comment = None;
-                                        previous_child_end = Some(child_end);
-                                        continue;
+        if let Some(ref hint) = hint
+            && !any_range_overlaps(hint.changed_ranges, child_start, child_end)
+        {
+            // Scripts: reuse by matching context on old root.
+            if child.kind() == "element"
+                && let Some(name) = modern_element_name(source, child)
+            {
+                match classify_element_name(name.as_ref()) {
+                    ElementKind::Script => {
+                        if let Some(old_root) = hint.old_root
+                            && let Some(old_script) = try_reuse_script(source, child, old_root)
+                        {
+                            js.push(old_script.clone());
+                            match old_script.context {
+                                ScriptContext::Module => {
+                                    if module.is_none() {
+                                        module = Some(old_script);
+                                    }
+                                }
+                                ScriptContext::Default => {
+                                    if instance.is_none() {
+                                        instance = Some(old_script);
                                     }
                                 }
                             }
-                            ElementKind::Style => {
-                                if let Some(old_root) = hint.old_root {
-                                    if let Some(old_style) = try_reuse_style(old_root) {
-                                        if css.is_none() {
-                                            css = Some(old_style.clone());
-                                        }
-                                        styles.push(old_style);
-                                        pending_script_comment = None;
-                                        previous_child_end = Some(child_end);
-                                        continue;
-                                    }
-                                }
-                            }
-                            _ => {}
+                            pending_script_comment = None;
+                            previous_child_end = Some(child_end);
+                            continue;
                         }
                     }
+                    ElementKind::Style => {
+                        if let Some(old_root) = hint.old_root
+                            && let Some(old_style) = try_reuse_style(old_root)
+                        {
+                            if css.is_none() {
+                                css = Some(old_style.clone());
+                            }
+                            styles.push(old_style);
+                            pending_script_comment = None;
+                            previous_child_end = Some(child_end);
+                            continue;
+                        }
+                    }
+                    _ => {}
                 }
+            }
 
-                // Fragment nodes: try ordered reuse by byte length.
-                if let Some(reused) = try_reuse_node(
-                    hint.old_source,
-                    source,
-                    hint.old_nodes,
-                    &mut old_node_cursor,
-                    child_start,
-                    child_end,
-                ) {
-                    fragment_nodes.push(reused);
-                    previous_child_end = Some(child_end);
-                    continue;
-                }
+            // Fragment nodes: try ordered reuse by byte length.
+            if let Some(reused) = try_reuse_node(
+                hint.old_source,
+                source,
+                hint.old_nodes,
+                &mut old_node_cursor,
+                child_start,
+                child_end,
+            ) {
+                fragment_nodes.push(reused);
+                previous_child_end = Some(child_end);
+                continue;
             }
         }
 
@@ -3735,20 +3732,19 @@ fn parse_modern_regular_element(
         let child_end = child.end_byte();
 
         // Incremental reuse for element children.
-        if let Some(ref hint) = hint {
-            if !any_range_overlaps(hint.changed_ranges, child_start, child_end) {
-                if let Some(reused) = try_reuse_node(
-                    hint.old_source,
-                    source,
-                    hint.old_nodes,
-                    &mut old_node_cursor,
-                    child_start,
-                    child_end,
-                ) {
-                    fragment_nodes.push(reused);
-                    continue;
-                }
-            }
+        if let Some(hint) = &hint
+            && !any_range_overlaps(hint.changed_ranges, child_start, child_end)
+            && let Some(reused) = try_reuse_node(
+                hint.old_source,
+                source,
+                hint.old_nodes,
+                &mut old_node_cursor,
+                child_start,
+                child_end,
+            )
+        {
+            fragment_nodes.push(reused);
+            continue;
         }
 
         match child.kind() {

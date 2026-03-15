@@ -743,10 +743,8 @@ impl ArenaBuilder {
                 if let Some(err) = &block.error {
                     self.build_expression(id, err);
                 }
-                for fragment in [&block.pending, &block.then, &block.catch] {
-                    if let Some(f) = fragment {
-                        self.build_fragment(id, f);
-                    }
+                for f in [&block.pending, &block.then, &block.catch].into_iter().flatten() {
+                    self.build_fragment(id, f);
                 }
             }
             ModernNode::KeyBlock(block) => {

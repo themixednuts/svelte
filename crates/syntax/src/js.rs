@@ -75,6 +75,12 @@ impl PartialEq for JsProgram {
 
 impl Eq for JsProgram {}
 
+// SAFETY: JsProgram owns all its data (Box<str>, Allocator, parsed AST).
+// The !Send/!Sync comes from self_cell's self-referential borrow, but the
+// underlying data is fully owned and not shared across threads unsafely.
+unsafe impl Send for JsProgram {}
+unsafe impl Sync for JsProgram {}
+
 impl JsProgram {
     /// Parse JavaScript or TypeScript source into a program AST.
     #[must_use]
@@ -171,6 +177,12 @@ impl PartialEq for JsExpression {
 }
 
 impl Eq for JsExpression {}
+
+// SAFETY: JsExpression owns all its data (Box<str>, Allocator, parsed AST).
+// The !Send/!Sync comes from self_cell's self-referential borrow, but the
+// underlying data is fully owned and not shared across threads unsafely.
+unsafe impl Send for JsExpression {}
+unsafe impl Sync for JsExpression {}
 
 impl JsExpression {
     /// Parse a single JavaScript or TypeScript expression.
@@ -308,6 +320,11 @@ impl PartialEq for JsPattern {
 }
 
 impl Eq for JsPattern {}
+
+// SAFETY: JsPattern contains only owned data (Box<str>) and an Arc<JsExpression>
+// which is itself Send+Sync.
+unsafe impl Send for JsPattern {}
+unsafe impl Sync for JsPattern {}
 
 impl JsPattern {
     pub fn parse(source: impl Into<Box<str>>) -> Result<Self, Box<[OxcDiagnostic]>> {

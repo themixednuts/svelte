@@ -4792,14 +4792,10 @@ fn collect_legacy_document_comments(
 
 fn collect_comments_from_script_content_range(
     _source: &str,
-    script: &legacy::Script,
+    _script: &legacy::Script,
     _comments: &mut Vec<legacy::ProgramComment>,
     _seen: &mut HashSet<(usize, usize, u8)>,
 ) {
-    if script.content_start >= script.content_end {
-        return;
-    }
-
     // TODO: re-implement comment extraction without EstreeNode
 }
 
@@ -4964,22 +4960,22 @@ fn collect_comments_from_legacy_attribute(
 }
 
 fn collect_comments_from_legacy_expression(
-    source: &str,
+    _source: &str,
     expression: &legacy::Expression,
-    comments: &mut Vec<legacy::ProgramComment>,
-    seen: &mut HashSet<(usize, usize, u8)>,
+    _comments: &mut Vec<legacy::ProgramComment>,
+    _seen: &mut HashSet<(usize, usize, u8)>,
 ) {
     match expression {
         legacy::Expression::Identifier(_) | legacy::Expression::Literal(_) => {}
         legacy::Expression::CallExpression(call) => {
-            collect_comments_from_legacy_expression(source, &call.callee, comments, seen);
+            collect_comments_from_legacy_expression(_source, &call.callee, _comments, _seen);
             for argument in call.arguments.iter() {
-                collect_comments_from_legacy_expression(source, argument, comments, seen);
+                collect_comments_from_legacy_expression(_source, argument, _comments, _seen);
             }
         }
         legacy::Expression::BinaryExpression(binary) => {
-            collect_comments_from_legacy_expression(source, &binary.left, comments, seen);
-            collect_comments_from_legacy_expression(source, &binary.right, comments, seen);
+            collect_comments_from_legacy_expression(_source, &binary.left, _comments, _seen);
+            collect_comments_from_legacy_expression(_source, &binary.right, _comments, _seen);
         }
         legacy::Expression::Other(_) => {}
     }
