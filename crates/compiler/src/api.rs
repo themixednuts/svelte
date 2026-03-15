@@ -7,13 +7,12 @@ use std::sync::Arc;
 use crate::ast::common::Span;
 use crate::ast::{CssAst, Document};
 use crate::error::SourcePosition;
-use crate::{CompileError, SourceLocation};
+use crate::{CompileError, LineColumn};
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use lightningcss::stylesheet::ParserOptions as LightningParserOptions;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub(crate) mod modern;
 mod runes_mode;
 pub(crate) mod scan;
 pub(crate) mod validation;
@@ -550,8 +549,8 @@ pub struct Warning {
     pub code: Arc<str>,
     pub message: Arc<str>,
     pub filename: Option<Utf8PathBuf>,
-    pub start: Option<SourceLocation>,
-    pub end: Option<SourceLocation>,
+    pub start: Option<LineColumn>,
+    pub end: Option<LineColumn>,
     pub frame: Option<Arc<str>>,
     pub position: Option<[usize; 2]>,
 }

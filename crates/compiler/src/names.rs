@@ -74,10 +74,6 @@ impl OrderedNames {
         &self.names
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.names.is_empty()
-    }
-
     pub(crate) fn retain<F>(&mut self, mut keep: F)
     where
         F: FnMut(&Name) -> bool,

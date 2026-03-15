@@ -1,7 +1,6 @@
-use crate::api::modern::expression_identifier_name;
 use crate::api::{ElementKind, SvelteElementKind, classify_element_name, is_void_element_name};
 use crate::ast::modern::{
-    Attribute, AttributeValue, AttributeValueList, Comment, Css, CssBlock, CssBlockChild,
+    Attribute, AttributeValue, AttributeValueKind, Comment, Css, CssBlock, CssBlockChild,
     CssCombinator, CssComplexSelector, CssNode, CssPseudoClassSelector, CssRelativeSelector,
     CssRule, CssSelectorList, CssSimpleSelector, EachBlock, Expression, ExpressionTag, Fragment,
     IfBlock, Node, Options, Script,
@@ -9,7 +8,7 @@ use crate::ast::modern::{
 use crate::ast::{Document, Root};
 use crate::js::{codegen_options, render};
 use oxc_codegen::Codegen;
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 const LINE_BREAK_THRESHOLD: usize = 50;
 
@@ -149,7 +148,7 @@ fn render_script(
 
 fn render_program_body(
     _source: &str,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     depth: usize,
     _options: &crate::api::PrintOptions,
 ) -> String {
@@ -157,7 +156,7 @@ fn render_program_body(
 }
 
 fn render_program_body_with_codegen(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     depth: usize,
 ) -> String {
     if program.program().body.is_empty() {
@@ -812,7 +811,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                     raw_name.contains(':') && raw_name != attribute.name.as_ref();
                 let has_empty_value = matches!(
                     &attribute.value,
-                    AttributeValueList::Values(values) if values.is_empty()
+                    AttributeValueKind::Values(values) if values.is_empty()
                 );
                 if attribute.name.is_empty() || has_lost_directive || has_empty_value {
                     return raw.to_string();
@@ -821,13 +820,13 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
 
             let mut out = attribute.name.to_string();
             match &attribute.value {
-                AttributeValueList::Boolean(true) => {}
-                AttributeValueList::Boolean(false) => out.push_str("={false}"),
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(true) => {}
+                AttributeValueKind::Boolean(false) => out.push_str("={false}"),
+                AttributeValueKind::ExpressionTag(tag) => {
                     out.push('=');
                     out.push_str(&render_expression_tag(tag));
                 }
-                AttributeValueList::Values(parts) => {
+                AttributeValueKind::Values(parts) => {
                     out.push('=');
                     let quote =
                         parts.len() > 1 || matches!(parts.first(), Some(AttributeValue::Text(_)));
@@ -850,7 +849,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -866,7 +865,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -882,7 +881,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -898,7 +897,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -915,13 +914,13 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push_str(modifier.as_ref());
             }
             match &directive.value {
-                AttributeValueList::Boolean(true) => {}
-                AttributeValueList::Boolean(false) => out.push_str("={false}"),
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(true) => {}
+                AttributeValueKind::Boolean(false) => out.push_str("={false}"),
+                AttributeValueKind::ExpressionTag(tag) => {
                     out.push('=');
                     out.push_str(&render_expression_tag(tag));
                 }
-                AttributeValueList::Values(parts) => {
+                AttributeValueKind::Values(parts) => {
                     out.push('=');
                     let quote =
                         parts.len() > 1 || matches!(parts.first(), Some(AttributeValue::Text(_)));
@@ -951,7 +950,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -967,7 +966,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -983,7 +982,7 @@ fn render_attribute(source: &str, attribute: &Attribute) -> String {
                 out.push('|');
                 out.push_str(modifier.as_ref());
             }
-            let shorthand = expression_identifier_name(&directive.expression)
+            let shorthand = directive.expression.identifier_name()
                 .is_some_and(|name| name.as_ref() == directive.name.as_ref());
             if !shorthand && !directive.expression.is_empty() {
                 out.push('=');
@@ -1169,31 +1168,6 @@ fn is_identifier(text: &str) -> bool {
     chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
-fn has_blank_line(text: &str) -> bool {
-    let mut saw_newline = false;
-    let mut only_whitespace_since_newline = true;
-
-    for ch in text.chars() {
-        match ch {
-            '\n' => {
-                if saw_newline && only_whitespace_since_newline {
-                    return true;
-                }
-                saw_newline = true;
-                only_whitespace_since_newline = true;
-            }
-            '\r' => {}
-            _ if ch.is_whitespace() => {}
-            _ => {
-                saw_newline = false;
-                only_whitespace_since_newline = false;
-            }
-        }
-    }
-
-    false
-}
-
 fn strip_prefix_whitespace(text: &str, max: usize) -> &str {
     for (count, (idx, ch)) in text.char_indices().enumerate() {
         if count >= max || !ch.is_whitespace() {
@@ -1290,20 +1264,4 @@ fn rendered_comment(text: String) -> Rendered {
     let mut value = rendered(text);
     value.is_comment = true;
     value
-}
-
-#[cfg(test)]
-mod tests {
-    use super::has_blank_line;
-
-    #[test]
-    fn single_crlf_gap_is_not_a_blank_line() {
-        assert!(!has_blank_line("\r\n    "));
-    }
-
-    #[test]
-    fn double_line_break_counts_as_blank_line() {
-        assert!(has_blank_line("\r\n\r\n    "));
-        assert!(has_blank_line("\n  \n"));
-    }
 }

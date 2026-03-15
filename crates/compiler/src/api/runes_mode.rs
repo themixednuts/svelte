@@ -64,7 +64,7 @@ fn script_has_rune_calls(script: &Script, has_ambiguous_state_call: bool) -> boo
 
 fn callee_rune_name(callee: &OxcExpression<'_>) -> Option<String> {
     match callee.get_inner_expression() {
-        OxcExpression::Identifier(reference) => Some(reference.name.as_str().to_owned()),
+        OxcExpression::Identifier(reference) => Some(reference.name.to_string()),
         OxcExpression::StaticMemberExpression(member) => {
             let object = member.object.get_inner_expression();
             let OxcExpression::Identifier(object) = object else {
