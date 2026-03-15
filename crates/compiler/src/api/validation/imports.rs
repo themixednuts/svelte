@@ -1,7 +1,6 @@
 use super::*;
 use crate::ast::modern::{Fragment, Node};
 use crate::source::{NamedSpan, SourceSpan};
-use crate::{SourceId, SourceText};
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, Declaration, ExportDefaultDeclarationKind,
     Expression as OxcExpression, ImportDeclarationSpecifier, ModuleExportName, Statement,
@@ -70,7 +69,7 @@ impl ComponentValidator<'_> {
 
         let offset = instance.content_start;
         let span = find_duplicate_module_import_declaration(instance.content.as_ref(), &imported)?;
-        Some(compile_error_custom_imports(
+        Some(compile_error_custom(
             self.source,
             "declaration_duplicate_module_import",
             "Cannot declare a variable with the same name as an import inside `<script module>`",
@@ -262,7 +261,7 @@ fn collect_rune_decls_from_variable_declaration(
     statement_span: Option<Span>,
     out: &mut Vec<RuneDecl>,
 ) {
-    let Some(statement_span) = statement_span.or_else(|| Some(declaration.span)) else {
+    let Some(statement_span) = statement_span.or(Some(declaration.span)) else {
         return;
     };
     let span = SourceSpan::from_oxc(statement_span);
@@ -609,29 +608,7 @@ fn find_duplicate_import_binding_span(
     }
 }
 
-fn compile_error_custom_imports(
-    source: &str,
-    code: &'static str,
-    message: impl Into<Arc<str>>,
-    start: usize,
-    end: usize,
-) -> CompileError {
-    let source_text = SourceText::new(SourceId::new(0), source, None);
-    let start_location = source_text.location_at_offset(start);
-    let end_location = source_text.location_at_offset(end);
-
-    CompileError {
-        code: Arc::from(code),
-        message: message.into(),
-        position: Some(Box::new(SourcePosition {
-            start: start_location.character,
-            end: end_location.character,
-        })),
-        start: Some(Box::new(start_location)),
-        end: Some(Box::new(end_location)),
-        filename: None,
-    }
-}
+// compile_error_custom is provided by super::compile_error_custom (validation.rs)
 
 fn import_specifier_local_name<'a>(
     specifier: &'a ImportDeclarationSpecifier<'a>,

@@ -4,7 +4,6 @@ use crate::ast::modern::{
     CssRelativeSelector, CssRule, CssSelectorList, CssSimpleSelector,
 };
 use crate::source::SourceSpan;
-use crate::{SourceId, SourceText};
 
 impl ComponentValidator<'_> {
     pub(super) fn css_compiler_errors(&self) -> Option<CompileError> {
@@ -341,7 +340,7 @@ fn detect_css_selector_errors_in_block(
                 if declaration.value.trim().is_empty()
                     && !is_empty_custom_property_declaration(declaration)
                 {
-                    return Some(compile_error_custom_css(
+                    return Some(compile_error_custom(
                         source,
                         "css_empty_declaration",
                         "Declaration cannot be empty",
@@ -753,29 +752,7 @@ fn css_simple_selector_span(selector: &CssSimpleSelector) -> SourceSpan {
     }
 }
 
-fn compile_error_custom_css(
-    source: &str,
-    code: &'static str,
-    message: impl Into<Arc<str>>,
-    start: usize,
-    end: usize,
-) -> CompileError {
-    let source_text = SourceText::new(SourceId::new(0), source, None);
-    let start_location = source_text.location_at_offset(start);
-    let end_location = source_text.location_at_offset(end);
-
-    CompileError {
-        code: Arc::from(code),
-        message: message.into(),
-        position: Some(Box::new(SourcePosition {
-            start: start_location.character,
-            end: end_location.character,
-        })),
-        start: Some(Box::new(start_location)),
-        end: Some(Box::new(end_location)),
-        filename: None,
-    }
-}
+// compile_error_custom is provided by super::compile_error_custom (validation.rs)
 
 #[cfg(test)]
 mod tests {

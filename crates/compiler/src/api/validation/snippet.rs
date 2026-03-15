@@ -162,7 +162,7 @@ fn first_exported_name(program: &JsProgram) -> Option<NamedSpan> {
         if declaration.source.is_some() {
             continue;
         }
-        for specifier in &declaration.specifiers {
+        if let Some(specifier) = declaration.specifiers.first() {
             let name = Arc::from(specifier.local.name().as_str());
             let span = SourceSpan::from_oxc(specifier.span());
             return Some(NamedSpan::new(name, span));

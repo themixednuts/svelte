@@ -11,7 +11,6 @@ use crate::ast::modern::{
     IfBlock, NamedAttribute, Node, RegularElement, Script, ScriptContext, Search, SnippetBlock,
     SvelteElement, TransitionDirective,
 };
-use crate::{SourceId, SourceText};
 use oxc_ast::ast::{
     ClassElement, Declaration, Expression as OxcExpression, FormalParameter,
     IdentifierReference, ImportDeclarationSpecifier, MethodDefinitionKind, Statement,
@@ -1713,29 +1712,7 @@ struct ConstCycle<'a> {
     names: Box<[Arc<str>]>,
 }
 
-fn compile_error_custom(
-    source: &str,
-    code: &'static str,
-    message: impl Into<Arc<str>>,
-    start: usize,
-    end: usize,
-) -> CompileError {
-    let source_text = SourceText::new(SourceId::new(0), source, None);
-    let start_location = source_text.location_at_offset(start);
-    let end_location = source_text.location_at_offset(end);
-
-    CompileError {
-        code: Arc::from(code),
-        message: message.into(),
-        position: Some(Box::new(SourcePosition {
-            start: start_location.character,
-            end: end_location.character,
-        })),
-        start: Some(Box::new(start_location)),
-        end: Some(Box::new(end_location)),
-        filename: None,
-    }
-}
+// compile_error_custom is provided by super::compile_error_custom (validation.rs)
 
 fn scripts(root: &Root) -> Vec<&Script> {
     if !root.scripts.is_empty() {
@@ -2396,11 +2373,6 @@ fn attribute_span(attribute: &Attribute) -> (usize, usize) {
         Attribute::TransitionDirective(attribute) => (attribute.start, attribute.end),
         Attribute::AttachTag(attribute) => (attribute.start, attribute.end),
     }
-}
-
-#[allow(dead_code)]
-fn node_span(node: &Node) -> (usize, usize) {
-    (node.start(), node.end())
 }
 
 fn is_valid_custom_element_tag_name(name: &str) -> bool {
@@ -4532,7 +4504,7 @@ fn default_slot_conflict(fragment: &Fragment) -> Option<(usize, usize)> {
             continue;
         }
 
-        return Some(node_span(node));
+        return Some((node.start(), node.end()));
     }
 
     None
@@ -6546,7 +6518,7 @@ fn span_range(span: OxcSpan) -> (usize, usize) {
 fn let_directive_binding_names(directive: &DirectiveAttribute) -> Box<[Arc<str>]> {
     if let Some(name) = directive.expression.identifier_name() {
         if !name.is_empty() {
-            return Box::new([Arc::from(name)]);
+            return Box::new([name]);
         }
         return Box::new([directive.name.clone()]);
     }

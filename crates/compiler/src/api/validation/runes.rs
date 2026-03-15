@@ -5,7 +5,6 @@ use crate::ast::modern::{
 };
 use crate::names::NameStack;
 use crate::source::{NamedSpan, SourceSpan};
-use crate::{SourceId, SourceText};
 use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, BlockStatement, CallExpression, CatchClause, ChainElement,
     ClassElement, Declaration, Expression as OxcExpression, ImportDeclarationSpecifier,
@@ -203,7 +202,7 @@ impl ComponentValidator<'_> {
             let Some(named) = find_rune_invalid_spread(&script.content) else {
                 continue;
             };
-            return Some(compile_error_custom_runes(
+            return Some(compile_error_custom(
                 self.source,
                 "rune_invalid_spread",
                 format!("`{}` cannot be called with a spread argument", named.name),
@@ -451,31 +450,31 @@ impl ComponentValidator<'_> {
                             block
                                 .key
                                 .as_ref()
-                                .and_then(|key| find_with_offset(key))
+                                .and_then(&find_with_offset)
                         })
                         .or_else(|| {
                             block
                                 .context
                                 .as_ref()
-                                .and_then(|context| find_with_offset(context))
+                                .and_then(&find_with_offset)
                         }),
                     Node::AwaitBlock(block) => find_with_offset(&block.expression)
                         .or_else(|| {
                             block
                                 .value
                                 .as_ref()
-                                .and_then(|value| find_with_offset(value))
+                                .and_then(&find_with_offset)
                         })
                         .or_else(|| {
                             block
                                 .error
                                 .as_ref()
-                                .and_then(|error| find_with_offset(error))
+                                .and_then(&find_with_offset)
                         }),
                     Node::SnippetBlock(block) => block
                         .parameters
                         .iter()
-                        .find_map(|parameter| find_with_offset(parameter)),
+                        .find_map(&find_with_offset),
                     Node::KeyBlock(block) => find_with_offset(&block.expression),
                     _ => None,
                 };
@@ -1417,10 +1416,10 @@ fn collect_all_expression_statement_call_spans(
             &mut self,
             it: &oxc_ast::ast::ExpressionStatement<'a>,
         ) {
-            if let OxcExpression::CallExpression(call) = it.expression.get_inner_expression() {
-                if oxc_callee_name(&call.callee).as_deref() == Some(self.call_name) {
-                    self.spans.insert(span_range(call.span));
-                }
+            if let OxcExpression::CallExpression(call) = it.expression.get_inner_expression()
+                && oxc_callee_name(&call.callee).as_deref() == Some(self.call_name)
+            {
+                self.spans.insert(span_range(call.span));
             }
             walk::walk_expression_statement(self, it);
         }
@@ -1458,26 +1457,26 @@ fn collect_allowed_initializer_call_spans(
 
         fn visit_method_definition(&mut self, it: &oxc_ast::ast::MethodDefinition<'a>) {
             // For constructors, only allow `this.x = $state()` as DIRECT body statements
-            if it.kind == oxc_ast::ast::MethodDefinitionKind::Constructor {
-                if let Some(body) = it.value.body.as_ref() {
-                    for statement in &body.statements {
-                        if let Statement::ExpressionStatement(stmt) = statement
-                            && let OxcExpression::AssignmentExpression(assign) =
-                                &stmt.expression
-                            && matches!(
-                                assign.left,
-                                oxc_ast::ast::AssignmentTarget::StaticMemberExpression(_)
-                                    | oxc_ast::ast::AssignmentTarget::PrivateFieldExpression(_)
-                                    | oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(_)
-                            )
-                            && let Some(member) = assign.left.as_member_expression()
-                            && matches!(member.object(), OxcExpression::ThisExpression(_))
-                            && let OxcExpression::CallExpression(call) =
-                                assign.right.get_inner_expression()
-                            && oxc_callee_name(&call.callee).as_deref() == Some(self.call_name)
-                        {
-                            self.spans.insert(span_range(call.span));
-                        }
+            if it.kind == oxc_ast::ast::MethodDefinitionKind::Constructor
+                && let Some(body) = it.value.body.as_ref()
+            {
+                for statement in &body.statements {
+                    if let Statement::ExpressionStatement(stmt) = statement
+                        && let OxcExpression::AssignmentExpression(assign) =
+                            &stmt.expression
+                        && matches!(
+                            assign.left,
+                            oxc_ast::ast::AssignmentTarget::StaticMemberExpression(_)
+                                | oxc_ast::ast::AssignmentTarget::PrivateFieldExpression(_)
+                                | oxc_ast::ast::AssignmentTarget::ComputedMemberExpression(_)
+                        )
+                        && let Some(member) = assign.left.as_member_expression()
+                        && matches!(member.object(), OxcExpression::ThisExpression(_))
+                        && let OxcExpression::CallExpression(call) =
+                            assign.right.get_inner_expression()
+                        && oxc_callee_name(&call.callee).as_deref() == Some(self.call_name)
+                    {
+                        self.spans.insert(span_range(call.span));
                     }
                 }
             }
@@ -1985,11 +1984,11 @@ fn find_constant_assignment_in_program(program: &JsProgram) -> Option<SourceSpan
         fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
             // Only track declarations in nested scopes (inside functions/arrows).
             // Top-level const bindings are already in `immutables`.
-            if self.locals.len() > 1 {
-                if let Some(scope) = self.locals.last_mut() {
-                    for declarator in &declaration.declarations {
-                        extend_name_set_with_oxc_pattern_bindings(scope, &declarator.id);
-                    }
+            if self.locals.len() > 1
+                && let Some(scope) = self.locals.last_mut()
+            {
+                for declarator in &declaration.declarations {
+                    extend_name_set_with_oxc_pattern_bindings(scope, &declarator.id);
                 }
             }
             walk::walk_variable_declaration(self, declaration);
@@ -2034,10 +2033,10 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FieldOrigin {
         /// Field declaration with no initializer (e.g., `count;`)
-        PlainField,
+        Plain,
         /// Field declaration with a non-rune initializer (e.g., `count = -1;`)
-        InitializedField,
-        StateField,
+        Initialized,
+        State,
     }
 
     #[derive(Clone, Copy)]
@@ -2169,26 +2168,25 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                     // Computed member with non-literal key:
                     // this[variable] = $state(...) is invalid placement.
                     // this[0] or this["name"] are OK (statically resolvable).
-                    if is_state_creation_expression(&assignment.right) {
-                        if let AssignmentTarget::ComputedMemberExpression(member) =
+                    if is_state_creation_expression(&assignment.right)
+                        && let AssignmentTarget::ComputedMemberExpression(member) =
                             &assignment.left
+                    {
+                        let is_literal_key = matches!(
+                            member.expression.get_inner_expression(),
+                            OxcExpression::NumericLiteral(_)
+                                | OxcExpression::StringLiteral(_)
+                        );
+                        if !is_literal_key
+                            && matches!(
+                                member.object.get_inner_expression(),
+                                OxcExpression::ThisExpression(_)
+                            )
                         {
-                            let is_literal_key = matches!(
-                                member.expression.get_inner_expression(),
-                                OxcExpression::NumericLiteral(_)
-                                    | OxcExpression::StringLiteral(_)
-                            );
-                            if !is_literal_key
-                                && matches!(
-                                    member.object.get_inner_expression(),
-                                    OxcExpression::ThisExpression(_)
-                                )
-                            {
-                                return Some(ClassStateFieldError {
-                                    kind: DiagnosticKind::StateInvalidPlacement,
-                                    span: span_range(assignment.right.span()),
-                                });
-                            }
+                            return Some(ClassStateFieldError {
+                                kind: DiagnosticKind::StateInvalidPlacement,
+                                span: span_range(assignment.right.span()),
+                            });
                         }
                     }
                     return None;
@@ -2197,7 +2195,7 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                 if is_state_creation_expression(&assignment.right) {
                     if let Some(existing) = info.fields.get(name.as_ref()) {
                         match existing.origin {
-                            FieldOrigin::PlainField => {
+                            FieldOrigin::Plain => {
                                 // A plain field (no initializer) followed by a constructor
                                 // assignment with $state/$derived is the "first assignment
                                 // to a class field" pattern — this is allowed.
@@ -2206,13 +2204,13 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                                     name,
                                     RecordedField {
                                         _span: assignment.span,
-                                        origin: FieldOrigin::StateField,
+                                        origin: FieldOrigin::State,
                                     },
                                 );
                                 return None;
                             }
-                            FieldOrigin::InitializedField | FieldOrigin::StateField => {
-                                let kind = if existing.origin == FieldOrigin::StateField {
+                            FieldOrigin::Initialized | FieldOrigin::State => {
+                                let kind = if existing.origin == FieldOrigin::State {
                                     DiagnosticKind::StateFieldDuplicate { name }
                                 } else {
                                     DiagnosticKind::DuplicateClassField { name }
@@ -2236,7 +2234,7 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                         name,
                         RecordedField {
                             _span: assignment.span,
-                            origin: FieldOrigin::StateField,
+                            origin: FieldOrigin::State,
                         },
                     );
                     return None;
@@ -2273,10 +2271,10 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                     }
                     let origin = match &property.value {
                         Some(value) if is_state_creation_expression(value) => {
-                            FieldOrigin::StateField
+                            FieldOrigin::State
                         }
-                        Some(_) => FieldOrigin::InitializedField,
-                        None => FieldOrigin::PlainField,
+                        Some(_) => FieldOrigin::Initialized,
+                        None => FieldOrigin::Plain,
                     };
                     info.fields.insert(
                         key,
@@ -2300,7 +2298,7 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
                             Arc::<str>::from(name),
                             RecordedField {
                                 _span: property.span,
-                                origin: FieldOrigin::PlainField,
+                                origin: FieldOrigin::Plain,
                             },
                         );
                     }
@@ -2309,12 +2307,8 @@ fn find_class_state_field_error_oxc(program: &JsProgram) -> Option<ClassStateFie
             }
         }
 
-        let Some(constructor) = constructor else {
-            return None;
-        };
-        let Some(body) = constructor.value.body.as_ref() else {
-            return None;
-        };
+        let constructor = constructor?;
+        let body = constructor.value.body.as_ref()?;
 
         for stmt in &body.statements {
             if let Some(error) = record_constructor_statement(stmt, &mut info) {
@@ -2480,29 +2474,7 @@ impl AliasStack {
     }
 }
 
-fn compile_error_custom_runes(
-    source: &str,
-    code: &'static str,
-    message: impl Into<Arc<str>>,
-    start: usize,
-    end: usize,
-) -> CompileError {
-    let source_text = SourceText::new(SourceId::new(0), source, None);
-    let start_location = source_text.location_at_offset(start);
-    let end_location = source_text.location_at_offset(end);
-
-    CompileError {
-        code: Arc::from(code),
-        message: message.into(),
-        position: Some(Box::new(SourcePosition {
-            start: start_location.character,
-            end: end_location.character,
-        })),
-        start: Some(Box::new(start_location)),
-        end: Some(Box::new(end_location)),
-        filename: None,
-    }
-}
+// compile_error_custom is provided by super::compile_error_custom (validation.rs)
 
 fn find_store_invalid_subscription(program: &JsProgram) -> Option<SourceSpan> {
     struct Visitor {
@@ -2832,16 +2804,16 @@ fn find_invalid_global_reference_in_fragment_with_declared(
         let node = entry.as_node()?;
         match node {
             Node::ExpressionTag(tag) => {
-                find_invalid_global_reference_in_expression(&tag.expression, &declared, runes_mode)
+                find_invalid_global_reference_in_expression(&tag.expression, declared, runes_mode)
             }
             Node::RenderTag(tag) => {
-                find_invalid_global_reference_in_expression(&tag.expression, &declared, runes_mode)
+                find_invalid_global_reference_in_expression(&tag.expression, declared, runes_mode)
             }
             Node::HtmlTag(tag) => {
-                find_invalid_global_reference_in_expression(&tag.expression, &declared, runes_mode)
+                find_invalid_global_reference_in_expression(&tag.expression, declared, runes_mode)
             }
             Node::ConstTag(tag) => {
-                find_invalid_global_reference_in_expression(&tag.declaration, &declared, runes_mode)
+                find_invalid_global_reference_in_expression(&tag.declaration, declared, runes_mode)
             }
             _ => None,
         }
@@ -3360,10 +3332,10 @@ fn collect_dollar_label_store_subscriptions(
     program: &oxc_ast::ast::Program<'_>,
 ) {
     for stmt in &program.body {
-        if let Statement::LabeledStatement(labeled) = stmt {
-            if labeled.label.name.as_str() == "$" {
-                collect_dollar_refs_from_statement(names, &labeled.body);
-            }
+        if let Statement::LabeledStatement(labeled) = stmt
+            && labeled.label.name.as_str() == "$"
+        {
+            collect_dollar_refs_from_statement(names, &labeled.body);
         }
     }
 }

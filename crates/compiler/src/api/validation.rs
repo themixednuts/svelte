@@ -92,6 +92,34 @@ pub(super) fn compile_error_with_range(
     kind.to_compile_error_in(SourceText::new(SourceId::new(0), source, None), start, end)
 }
 
+/// Build a [`CompileError`] with a custom code and message (not from [`DiagnosticKind`]).
+///
+/// Shared across all validation sub-modules — replaces the four identical
+/// `compile_error_custom_{template,runes,css,imports}` helpers.
+pub(super) fn compile_error_custom(
+    source: &str,
+    code: &'static str,
+    message: impl Into<Arc<str>>,
+    start: usize,
+    end: usize,
+) -> CompileError {
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let start_location = source_text.location_at_offset(start);
+    let end_location = source_text.location_at_offset(end);
+
+    CompileError {
+        code: Arc::from(code),
+        message: message.into(),
+        position: Some(Box::new(SourcePosition {
+            start: start_location.character,
+            end: end_location.character,
+        })),
+        start: Some(Box::new(start_location)),
+        end: Some(Box::new(end_location)),
+        filename: None,
+    }
+}
+
 fn is_error_mode_warn(options: &CompileOptions) -> bool {
     matches!(options.error_mode, crate::api::ErrorMode::Warn)
 }
