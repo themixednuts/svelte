@@ -1,7 +1,7 @@
 use crate::ast::modern::Root;
 
 /// Script/style ranges are CST-derived; no source-string scanning fallback.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ScriptStyleRegions {
     pub non_module_script_content_ranges: Vec<(usize, usize)>,
     /// (block_start, block_end, content_start, content_end)

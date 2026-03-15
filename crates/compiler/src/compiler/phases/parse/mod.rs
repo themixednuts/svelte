@@ -1,12 +1,13 @@
 mod oxc;
 mod regions;
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use camino::Utf8Path;
 use oxc_ast::ast::Statement;
 use oxc_ast_visit::{Visit, walk};
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 use crate::api::ParseOptions;
 use crate::ast::modern::Root;
@@ -29,7 +30,7 @@ impl ParsedComponent {
         &self.root
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn into_parts(self) -> (Arc<str>, Root) {
         (self.source, self.root)
     }
@@ -39,7 +40,7 @@ impl ParsedComponent {
 pub(crate) struct ParsedModuleProgram<'src> {
     source: SourceText<'src>,
     language: ModuleProgramLanguage,
-    program: Arc<ParsedJsProgram>,
+    program: Rc<JsProgram>,
 }
 
 impl<'src> ParsedModuleProgram<'src> {
@@ -51,7 +52,7 @@ impl<'src> ParsedModuleProgram<'src> {
         self.language
     }
 
-    pub(crate) fn program(&self) -> &ParsedJsProgram {
+    pub(crate) fn program(&self) -> &JsProgram {
         &self.program
     }
 }
@@ -152,7 +153,7 @@ fn syntax_parse_options(options: ParseOptions) -> svelte_syntax::ParseOptions {
 fn parse_program_for_compile_with_language(
     source: &str,
     is_ts: bool,
-) -> Option<Arc<ParsedJsProgram>> {
+) -> Option<Rc<JsProgram>> {
     oxc::SvelteOxcParser::new(source)
         .with_typescript(is_ts)
         .parse_program_for_compile()
@@ -160,7 +161,7 @@ fn parse_program_for_compile_with_language(
 
 fn detect_module_program(
     source: SourceText<'_>,
-) -> Option<(ModuleProgramLanguage, Arc<ParsedJsProgram>)> {
+) -> Option<(ModuleProgramLanguage, Rc<JsProgram>)> {
     if module_filename_is_typescript(source.filename) {
         let program = parse_program_for_compile_with_language(source.text, true)?;
         return Some((ModuleProgramLanguage::TypeScript, program));
@@ -210,7 +211,7 @@ impl ModuleProgramLanguage {
     }
 }
 
-fn program_contains_typescript_syntax(program: &ParsedJsProgram) -> bool {
+fn program_contains_typescript_syntax(program: &JsProgram) -> bool {
     struct TypescriptSyntaxVisitor {
         found: bool,
     }
@@ -279,7 +280,7 @@ mod tests {
 
     use crate::ast::common::{AttributeValueSyntax, ParseErrorKind};
     use crate::ast::modern::{
-        Attribute, AttributeValue, AttributeValueList, DirectiveValueSyntax, Node, Root,
+        Attribute, AttributeValue, AttributeValueKind, DirectiveValueSyntax, Node, Root,
     };
 
     #[test]
@@ -417,7 +418,7 @@ mod tests {
         let Attribute::Attribute(attribute) = attribute else {
             panic!("expected named attribute");
         };
-        let AttributeValueList::ExpressionTag(tag) = &attribute.value else {
+        let AttributeValueKind::ExpressionTag(tag) = &attribute.value else {
             panic!("expected single expression tag");
         };
 
@@ -453,7 +454,7 @@ mod tests {
         };
 
         assert_eq!(attribute.value_syntax, AttributeValueSyntax::Unquoted);
-        let AttributeValueList::Values(values) = &attribute.value else {
+        let AttributeValueKind::Values(values) = &attribute.value else {
             panic!("expected split value parts");
         };
         assert_eq!(values.len(), 2);
@@ -470,7 +471,7 @@ mod tests {
         };
 
         assert_eq!(attribute.value_syntax, AttributeValueSyntax::Unquoted);
-        let AttributeValueList::Values(values) = &attribute.value else {
+        let AttributeValueKind::Values(values) = &attribute.value else {
             panic!("expected split value parts");
         };
         assert_eq!(values.len(), 2);
@@ -487,7 +488,7 @@ mod tests {
         };
 
         assert_eq!(attribute.value_syntax, AttributeValueSyntax::Unquoted);
-        let AttributeValueList::Values(values) = &attribute.value else {
+        let AttributeValueKind::Values(values) = &attribute.value else {
             panic!("expected split value parts");
         };
         assert_eq!(values.len(), 2);

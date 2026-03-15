@@ -327,7 +327,6 @@ pub(crate) fn compose_sourcemaps(outer: &SourceMap, inner: &SourceMap) -> Source
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn merge_sourcemaps(base: &SourceMap, overlay: &SourceMap) -> SourceMap {
     let base_decoded = decode_mappings(base.mappings.as_ref());
     let overlay_decoded = decode_mappings(overlay.mappings.as_ref());

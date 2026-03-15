@@ -9,7 +9,7 @@ use oxc_ast::match_expression;
 use rustc_hash::FxHashSet;
 
 use crate::ast::modern::{
-    Attribute, AttributeValue, AttributeValueList, Expression, Fragment, Node, Root,
+    Attribute, AttributeValue, AttributeValueKind, Expression, Fragment, Node, Root,
 };
 
 type CssName = Arc<str>;
@@ -136,7 +136,7 @@ pub(crate) enum CssAttributeMatchKind {
     Dash,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum EachBoundaryKind {
     First,
     Last,
@@ -144,7 +144,7 @@ pub(crate) enum EachBoundaryKind {
     After,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct BoundaryCandidates<'a> {
     pub(crate) tags: &'a CssNameSet,
     pub(crate) classes: &'a CssNameSet,
@@ -396,13 +396,13 @@ fn cartesian_join_variants(left: &[String], right: &[String]) -> Option<Vec<Stri
     Some(combined)
 }
 
-fn static_attribute_text_from_value(value: &AttributeValueList) -> Option<String> {
+fn static_attribute_text_from_value(value: &AttributeValueKind) -> Option<String> {
     match value {
-        AttributeValueList::Boolean(_) => None,
-        AttributeValueList::ExpressionTag(tag) => {
+        AttributeValueKind::Boolean(_) => None,
+        AttributeValueKind::ExpressionTag(tag) => {
             static_attribute_text_from_expression(&tag.expression)
         }
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Values(values) => {
             let mut out = String::new();
             for value in values.iter() {
                 match value {
@@ -821,11 +821,11 @@ fn collect_class_expr_from_attrs(attributes: &[Attribute]) -> bool {
     false
 }
 
-fn analyze_class_attribute_value(value: &AttributeValueList) -> ClassValueAnalysis {
+fn analyze_class_attribute_value(value: &AttributeValueKind) -> ClassValueAnalysis {
     match value {
-        AttributeValueList::Boolean(_) => ClassValueAnalysis::default(),
-        AttributeValueList::ExpressionTag(tag) => analyze_class_expression(&tag.expression),
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Boolean(_) => ClassValueAnalysis::default(),
+        AttributeValueKind::ExpressionTag(tag) => analyze_class_expression(&tag.expression),
+        AttributeValueKind::Values(values) => {
             if let Some(variants) = class_string_variants_from_parts(values) {
                 return ClassValueAnalysis {
                     tokens: class_tokens_from_variants(&variants),
@@ -1189,10 +1189,10 @@ fn process_element(
                     attrs.insert(Arc::clone(&key), value);
                 }
                 if static_value.is_none()
-                    && (matches!(named.value, AttributeValueList::ExpressionTag(_))
+                    && (matches!(named.value, AttributeValueKind::ExpressionTag(_))
                         || matches!(
                             &named.value,
-                            AttributeValueList::Values(values)
+                            AttributeValueKind::Values(values)
                                 if values.iter().any(|value| matches!(value, AttributeValue::ExpressionTag(_)))
                         ))
                 {
@@ -1260,27 +1260,6 @@ fn regular_element_is_optional(_element: &crate::ast::modern::RegularElement) ->
     false
 }
 
-#[allow(dead_code)]
-fn svelte_element_has_dynamic_this(attributes: &[Attribute]) -> bool {
-    for attribute in attributes.iter() {
-        if let Attribute::Attribute(named) = attribute {
-            if named.name.as_ref() != "this" {
-                continue;
-            }
-            if matches!(named.value, AttributeValueList::ExpressionTag(_)) {
-                return true;
-            }
-            if let AttributeValueList::Values(values) = &named.value
-                && values
-                    .iter()
-                    .any(|value| matches!(value, AttributeValue::ExpressionTag(_)))
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 #[derive(Default, Clone)]
 struct BoundaryTokenSet {

@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::rc::Rc;
 
 use oxc_ast::ast::Statement;
 use oxc_span::SourceType as OxcSourceType;
 
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
+#[derive(Debug)]
 pub(crate) struct SvelteOxcParser<'src> {
     source: &'src str,
     is_ts: bool,
@@ -18,20 +19,19 @@ impl<'src> SvelteOxcParser<'src> {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn with_typescript(mut self, is_ts: bool) -> Self {
         self.is_ts = is_ts;
         self
     }
 
-    pub(crate) fn parse_program_for_compile(&self) -> Option<Arc<ParsedJsProgram>> {
+    pub(crate) fn parse_program_for_compile(&self) -> Option<Rc<JsProgram>> {
         let source_type = source_type(self.is_ts);
-        let parsed = Arc::new(ParsedJsProgram::parse(self.source, source_type));
+        let parsed = Rc::new(JsProgram::parse(self.source, source_type));
         parsed.errors().is_empty().then_some(parsed)
     }
 
     pub(crate) fn parse_import_ranges_for_compile(&self) -> Option<Vec<(usize, usize)>> {
-        let parsed = ParsedJsProgram::parse(self.source, source_type(self.is_ts));
+        let parsed = JsProgram::parse(self.source, source_type(self.is_ts));
         if !parsed.errors().is_empty() {
             return None;
         }
@@ -62,7 +62,7 @@ fn source_type(is_ts: bool) -> OxcSourceType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn program_body_len(program: &ParsedJsProgram) -> usize {
+    fn program_body_len(program: &JsProgram) -> usize {
         program.program().body.len()
     }
 
