@@ -3,7 +3,7 @@ use crate::api::validation::{
 };
 use crate::api::{CompileOptions, Warning};
 use crate::ast::modern::{
-    Alternate, Attribute, AttributeValue, AttributeValueList, DirectiveAttribute, EachBlock,
+    Alternate, Attribute, AttributeValue, AttributeValueKind, DirectiveAttribute, EachBlock,
     Expression, Fragment, Node, RegularElement, Root, SnippetBlock,
 };
 use crate::names::{Name, NameSet, OrderedNames};
@@ -27,7 +27,7 @@ use oxc_span::GetSpan;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 const A11Y_INVISIBLE_ELEMENTS: &[&str] = &["meta", "html", "script", "style"];
 const A11Y_PRESENTATION_ROLES: &[&str] = &["presentation", "none"];
@@ -208,10 +208,8 @@ fn collect_binding_names_from_oxc_expression(
             }
         }
         OxcExpression::AssignmentExpression(assign) => {
-            if let Some(id) = assign.left.as_simple_assignment_target() {
-                if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = id {
-                    names.insert(Arc::from(id.name.as_str()));
-                }
+            if let Some(oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id)) = assign.left.as_simple_assignment_target() {
+                names.insert(Arc::from(id.name.as_str()));
             }
         }
         _ => {}
@@ -1020,14 +1018,14 @@ fn root_namespace_context(root: &Root) -> (bool, bool) {
                 return None;
             }
             match &attribute.value {
-                AttributeValueList::Values(values) => values.iter().find_map(|value| match value {
+                AttributeValueKind::Values(values) => values.iter().find_map(|value| match value {
                     AttributeValue::Text(text) => Some(text.data.as_ref().to_ascii_lowercase()),
                     _ => None,
                 }),
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     expression_string_value(&tag.expression).map(|value| value.to_ascii_lowercase())
                 }
-                AttributeValueList::Boolean(_) => None,
+                AttributeValueKind::Boolean(_) => None,
             }
         })
     });
@@ -2968,7 +2966,7 @@ fn emit_script_estree_warnings(
 /// Returns a map from `attached_to` (the OXC byte offset of the statement the
 /// comment is attached to) → boxed slice of ignored warning codes.
 fn collect_script_svelte_ignores(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     runes_mode: bool,
 ) -> FxHashMap<u32, Box<[Arc<str>]>> {
     let mut out = FxHashMap::<u32, Box<[Arc<str>]>>::default();
@@ -2997,7 +2995,7 @@ fn collect_script_svelte_ignores(
 fn emit_program_estree_warnings(
     source: &str,
     options: &CompileOptions,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     script_context: ScriptWalkContext,
     runes_mode: bool,
     base_offset: usize,
@@ -3257,7 +3255,7 @@ fn emit_reactive_module_script_dependency_warnings(
     }
 }
 
-fn collect_declared_names_in_program(program: &ParsedJsProgram) -> NameSet {
+fn collect_declared_names_in_program(program: &JsProgram) -> NameSet {
     let mut names = FxHashSet::<Arc<str>>::default();
     for statement in &program.program().body {
         match statement {
@@ -3303,7 +3301,7 @@ fn collect_declared_names_in_program(program: &ParsedJsProgram) -> NameSet {
     names
 }
 
-fn collect_reassigned_identifier_names(program: &ParsedJsProgram) -> NameSet {
+fn collect_reassigned_identifier_names(program: &JsProgram) -> NameSet {
     let mut names = FxHashSet::<Arc<str>>::default();
     struct ReassignedNamesVisitor<'a> {
         names: &'a mut NameSet,
@@ -3593,11 +3591,8 @@ fn call_expression_callee_name(call: &oxc_ast::ast::CallExpression<'_>) -> Optio
 }
 
 fn argument_is_proxyable(arg: &oxc_ast::ast::Argument<'_>) -> bool {
-    match arg {
-        oxc_ast::ast::Argument::ObjectExpression(_)
-        | oxc_ast::ast::Argument::ArrayExpression(_) => true,
-        _ => false,
-    }
+    matches!(arg, oxc_ast::ast::Argument::ObjectExpression(_)
+        | oxc_ast::ast::Argument::ArrayExpression(_))
 }
 
 fn collect_template_reassigned_names(fragment: &Fragment, out: &mut NameSet) {
@@ -3671,11 +3666,11 @@ fn collect_template_reassigned_from_attributes(attributes: &[Attribute], out: &m
     for attribute in attributes {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_template_reassigned_from_expression(&tag.expression, out);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_template_reassigned_from_expression(&tag.expression, out);
@@ -3705,11 +3700,11 @@ fn collect_template_reassigned_from_attributes(attributes: &[Attribute], out: &m
                 collect_template_reassigned_from_expression(&tag.expression, out);
             }
             Attribute::StyleDirective(style) => match &style.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_template_reassigned_from_expression(&tag.expression, out);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_template_reassigned_from_expression(&tag.expression, out);
@@ -3997,7 +3992,7 @@ fn emit_export_let_unused_warnings(
 }
 
 fn collect_instance_mutable_exports(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     _runes_mode: bool,
 ) -> Vec<ExportedMutableBinding> {
     let mutable_bindings = collect_program_mutable_bindings(program);
@@ -4009,21 +4004,20 @@ fn collect_instance_mutable_exports(
         };
 
         if let Some(Declaration::VariableDeclaration(declaration)) = statement.declaration.as_ref()
+            && declaration.kind != VariableDeclarationKind::Const
         {
-            if declaration.kind != VariableDeclarationKind::Const {
-                let mut bindings = Vec::<PatternBinding>::new();
-                for declarator in &declaration.declarations {
-                    collect_pattern_bindings_from_oxc(&declarator.id, &mut bindings);
-                }
-                let stmt_start = statement.span().start as usize;
-                out.extend(bindings.into_iter().map(|binding| ExportedMutableBinding {
-                    name: binding.name,
-                    start: binding.start,
-                    end: binding.end,
-                    statement_start: stmt_start,
-                    ignore_codes: Box::default(),
-                }));
+            let mut bindings = Vec::<PatternBinding>::new();
+            for declarator in &declaration.declarations {
+                collect_pattern_bindings_from_oxc(&declarator.id, &mut bindings);
             }
+            let stmt_start = statement.span().start as usize;
+            out.extend(bindings.into_iter().map(|binding| ExportedMutableBinding {
+                name: binding.name,
+                start: binding.start,
+                end: binding.end,
+                statement_start: stmt_start,
+                ignore_codes: Box::default(),
+            }));
         }
 
         if statement.source.is_some() {
@@ -4053,7 +4047,7 @@ fn collect_instance_mutable_exports(
 }
 
 fn collect_program_mutable_bindings(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
 ) -> FxHashMap<Arc<str>, (usize, usize)> {
     let mut out = FxHashMap::<Arc<str>, (usize, usize)>::default();
 
@@ -4094,7 +4088,7 @@ fn collect_program_mutable_bindings(
 }
 
 fn collect_script_export_uses(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     export_names: &NameSet,
     out: &mut NameSet,
 ) {
@@ -4246,11 +4240,11 @@ fn collect_export_uses_from_attributes(
     for attribute in attributes {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_export_uses_from_expression(
@@ -4288,17 +4282,17 @@ fn collect_export_uses_from_attributes(
                 collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
             }
             Attribute::StyleDirective(style) => match &style.value {
-                AttributeValueList::Boolean(_) => {
+                AttributeValueKind::Boolean(_) => {
                     if let Some(mapped) = mapped_export_name(style.name.as_ref(), export_names)
                         && !scope.contains(mapped.as_ref())
                     {
                         out.insert(mapped);
                     }
                 }
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_export_uses_from_expression(&tag.expression, export_names, scope, out);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_export_uses_from_expression(
@@ -4635,8 +4629,8 @@ fn collect_non_reactive_from_attributes(
     for attribute in attributes {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_non_reactive_from_expression(
                         &tag.expression,
                         false,
@@ -4645,7 +4639,7 @@ fn collect_non_reactive_from_attributes(
                         out,
                     );
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_non_reactive_from_expression(
@@ -4700,8 +4694,8 @@ fn collect_non_reactive_from_attributes(
                 );
             }
             Attribute::StyleDirective(style) => match &style.value {
-                AttributeValueList::Boolean(_) => {}
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::Boolean(_) => {}
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_non_reactive_from_expression(
                         &tag.expression,
                         false,
@@ -4710,7 +4704,7 @@ fn collect_non_reactive_from_attributes(
                         out,
                     );
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_non_reactive_from_expression(
@@ -4795,7 +4789,7 @@ fn collect_non_reactive_from_expression(
     }
 }
 
-fn collect_default_svelte_imports(program: &ParsedJsProgram) -> NameSet {
+fn collect_default_svelte_imports(program: &JsProgram) -> NameSet {
     let mut imported = FxHashSet::<Arc<str>>::default();
     for statement in &program.program().body {
         let Statement::ImportDeclaration(statement) = statement else {
@@ -4822,7 +4816,7 @@ fn collect_default_svelte_imports(program: &ParsedJsProgram) -> NameSet {
 fn emit_custom_element_props_identifier_warnings(
     source: &str,
     options: &CompileOptions,
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     base_offset: usize,
     warnings: &mut Vec<Warning>,
 ) {
@@ -4918,7 +4912,7 @@ fn custom_element_has_props_option(root: &Root) -> bool {
             {
                 return false;
             }
-            let AttributeValueList::ExpressionTag(tag) = &attribute.value else {
+            let AttributeValueKind::ExpressionTag(tag) = &attribute.value else {
                 return false;
             };
             let Some(expression) = tag.expression.oxc_expression() else {
@@ -5116,7 +5110,7 @@ fn base_identifier_name_from_oxc_expression(expression: &OxcExpression<'_>) -> O
 fn expression_string_value(expression: &Expression) -> Option<String> {
     let expression = expression.oxc_expression()?;
     match expression {
-        OxcExpression::StringLiteral(literal) => Some(literal.value.as_str().to_owned()),
+        OxcExpression::StringLiteral(literal) => Some(literal.value.to_string()),
         _ => None,
     }
 }
@@ -5198,7 +5192,7 @@ fn attribute_global_event_reference_name(
         return None;
     }
 
-    let AttributeValueList::ExpressionTag(tag) = &attribute.value else {
+    let AttributeValueKind::ExpressionTag(tag) = &attribute.value else {
         return None;
     };
     let identifier_name = tag.expression.identifier_name()?.to_string();
@@ -5775,18 +5769,18 @@ fn named_attribute_from_element_full_name<'a>(
 
 fn attribute_has_value(attribute: &crate::ast::modern::NamedAttribute) -> bool {
     match &attribute.value {
-        AttributeValueList::Boolean(value) => *value,
-        AttributeValueList::Values(values) => values.iter().any(|value| match value {
+        AttributeValueKind::Boolean(value) => *value,
+        AttributeValueKind::Values(values) => values.iter().any(|value| match value {
             AttributeValue::Text(text) => text.data.chars().any(|ch| !ch.is_whitespace()),
             AttributeValue::ExpressionTag(_) => true,
         }),
-        AttributeValueList::ExpressionTag(_) => true,
+        AttributeValueKind::ExpressionTag(_) => true,
     }
 }
 
 fn attribute_text_value(attribute: &crate::ast::modern::NamedAttribute) -> Option<String> {
     match &attribute.value {
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Values(values) => {
             let mut out = String::new();
             for value in values.iter() {
                 match value {
@@ -5804,8 +5798,8 @@ fn attribute_static_value(
     attribute: &crate::ast::modern::NamedAttribute,
 ) -> Option<StaticAttributeValue> {
     match &attribute.value {
-        AttributeValueList::Boolean(value) if *value => Some(StaticAttributeValue::BooleanTrue),
-        AttributeValueList::Values(values) => {
+        AttributeValueKind::Boolean(value) if *value => Some(StaticAttributeValue::BooleanTrue),
+        AttributeValueKind::Values(values) => {
             let mut out = String::new();
             for value in values.iter() {
                 match value {

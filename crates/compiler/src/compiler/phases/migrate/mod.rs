@@ -9,15 +9,14 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::{GetSpan, Span as OxcSpan};
-use svelte_syntax::ParsedJsProgram;
+use svelte_syntax::JsProgram;
 
 use crate::CompileError;
-use crate::api::modern::expression_literal_string;
 use crate::api::scan::migrate_svelte_ignore;
 use crate::api::{MigrateOptions, MigrateResult, ParseMode, ParseOptions, is_void_element_name};
 use crate::ast::common::Span;
 use crate::ast::modern::{
-    Alternate, Attribute, AttributeValue, AttributeValueList, AwaitBlock, Comment, Fragment,
+    Alternate, Attribute, AttributeValue, AttributeValueKind, AwaitBlock, Comment, Fragment,
     IfBlock, KeyBlock, Node, RegularElement, Root as ModernRoot, Script, SvelteElement,
 };
 use crate::ast::{Document, Root};
@@ -296,13 +295,9 @@ fn migrate_impossible_slot_name_change(document: &Document, source: &str) -> Opt
     )))
 }
 
-fn span_range(span: OxcSpan) -> (usize, usize) {
-    (span.start as usize, span.end as usize)
-}
-
 fn callee_name(callee: &OxcExpression<'_>) -> Option<String> {
     match callee.get_inner_expression() {
-        OxcExpression::Identifier(reference) => Some(reference.name.as_str().to_owned()),
+        OxcExpression::Identifier(reference) => Some(reference.name.to_string()),
         OxcExpression::StaticMemberExpression(member) => {
             let OxcExpression::Identifier(object) = member.object.get_inner_expression() else {
                 return None;
@@ -399,7 +394,7 @@ fn export_let_declaration<'a>(statement: &'a Statement<'a>) -> Option<&'a Variab
     (declaration.kind.as_str() == "let").then_some(declaration)
 }
 
-fn program_has_call(program: &ParsedJsProgram, expected_callee_name: &str) -> bool {
+fn program_has_call(program: &JsProgram, expected_callee_name: &str) -> bool {
     struct CallVisitor<'a> {
         callee_name: &'a str,
         found: bool,
@@ -425,7 +420,7 @@ fn program_has_call(program: &ParsedJsProgram, expected_callee_name: &str) -> bo
     visitor.found
 }
 
-fn program_has_export_let(program: &ParsedJsProgram) -> bool {
+fn program_has_export_let(program: &JsProgram) -> bool {
     program
         .program()
         .body
@@ -433,7 +428,7 @@ fn program_has_export_let(program: &ParsedJsProgram) -> bool {
         .any(|statement| export_let_declaration(statement).is_some())
 }
 
-fn program_has_non_identifier_export_let(program: &ParsedJsProgram) -> bool {
+fn program_has_non_identifier_export_let(program: &JsProgram) -> bool {
     program.program().body.iter().any(|statement| {
         let Some(declaration) = export_let_declaration(statement) else {
             return false;
@@ -446,7 +441,7 @@ fn program_has_non_identifier_export_let(program: &ParsedJsProgram) -> bool {
 }
 
 fn collect_simple_export_props(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     bind_targets: &HashSet<String>,
     source: &str,
     source_offset: usize,
@@ -666,11 +661,6 @@ fn raw_trailing_comment_range(source: &str, statement_end: usize) -> Option<(usi
     None
 }
 
-fn expression_source_from_span(source: &str, span: OxcSpan) -> Option<String> {
-    let (start, end) = span_range(span);
-    source.get(start..end).map(ToString::to_string)
-}
-
 fn expression_source(source: &str, expression: &crate::ast::modern::Expression) -> Option<String> {
     // Prefer the modern AST's absolute positions, which are correct for template expressions.
     // The OXC span is relative to the parsed snippet, not the full .svelte source.
@@ -747,7 +737,7 @@ fn prop_bind_targets(root: &ModernRoot) -> HashSet<String> {
     names
 }
 
-fn script_updated_names(program: &ParsedJsProgram) -> HashSet<String> {
+fn script_updated_names(program: &JsProgram) -> HashSet<String> {
     struct UpdatedNamesVisitor<'a> {
         names: &'a mut HashSet<String>,
     }
@@ -1059,7 +1049,7 @@ fn script_slot_reference_name(expression: &OxcExpression<'_>) -> Option<String> 
 }
 
 fn collect_script_slot_bindings(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     source: &str,
     source_offset: usize,
 ) -> Vec<ScriptSlotBinding> {
@@ -1360,7 +1350,7 @@ fn render_accessor_exports(props: &[SimpleExportProp], indent: &str) -> String {
 }
 
 fn props_type_declaration(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     source: &str,
     source_offset: usize,
 ) -> Option<PropsTypeDeclaration> {
@@ -3901,10 +3891,10 @@ fn collect_slot_reference_attribute_edits(
     for attribute in attributes {
         match attribute {
             Attribute::Attribute(attribute) => match &attribute.value {
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_slot_reference_expression_edit(&tag.expression, use_rest_props, edits);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_slot_reference_expression_edit(
@@ -3915,7 +3905,7 @@ fn collect_slot_reference_attribute_edits(
                         }
                     }
                 }
-                AttributeValueList::Boolean(_) => {}
+                AttributeValueKind::Boolean(_) => {}
             },
             Attribute::BindDirective(directive)
             | Attribute::OnDirective(directive)
@@ -3930,10 +3920,10 @@ fn collect_slot_reference_attribute_edits(
                 );
             }
             Attribute::StyleDirective(directive) => match &directive.value {
-                AttributeValueList::ExpressionTag(tag) => {
+                AttributeValueKind::ExpressionTag(tag) => {
                     collect_slot_reference_expression_edit(&tag.expression, use_rest_props, edits);
                 }
-                AttributeValueList::Values(values) => {
+                AttributeValueKind::Values(values) => {
                     for value in values.iter() {
                         if let AttributeValue::ExpressionTag(tag) = value {
                             collect_slot_reference_expression_edit(
@@ -3944,7 +3934,7 @@ fn collect_slot_reference_attribute_edits(
                         }
                     }
                 }
-                AttributeValueList::Boolean(_) => {}
+                AttributeValueKind::Boolean(_) => {}
             },
             Attribute::TransitionDirective(directive) => {
                 collect_slot_reference_expression_edit(
@@ -5830,8 +5820,8 @@ fn event_attribute_expression(attribute: &Attribute) -> Option<&crate::ast::mode
         Attribute::OnDirective(directive) => Some(&directive.expression),
         Attribute::Attribute(attribute) if attribute.name.starts_with("on") => {
             match &attribute.value {
-                AttributeValueList::ExpressionTag(tag) => Some(&tag.expression),
-                AttributeValueList::Values(values) if values.len() == 1 => match &values[0] {
+                AttributeValueKind::ExpressionTag(tag) => Some(&tag.expression),
+                AttributeValueKind::Values(values) if values.len() == 1 => match &values[0] {
                     AttributeValue::ExpressionTag(tag) => Some(&tag.expression),
                     _ => None,
                 },
@@ -5882,7 +5872,7 @@ struct TopLevelLetBinding {
 }
 
 fn top_level_let_statement_for_name(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     name: &str,
     source: &str,
     source_offset: usize,
@@ -6098,11 +6088,10 @@ fn extract_block_comment_lines(source: &str, start: usize, end: usize) -> Vec<St
     let mut comments = Vec::new();
     for line in region.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("//") {
+        if let Some(after_slashes) = trimmed.strip_prefix("//") {
             // Preserve the text after `//` exactly as-is, but add one leading space
             // to represent the removed block indentation
-            let after_slashes = &trimmed[2..];
-            comments.push(format!("// {}", after_slashes));
+            comments.push(format!("// {after_slashes}"));
         }
     }
     comments
@@ -6241,7 +6230,7 @@ fn normalize_svelte_ignore_comments(source: &str) -> String {
 }
 
 fn top_level_reactive_assignment_counts(
-    program: &ParsedJsProgram,
+    program: &JsProgram,
     source: &str,
     source_offset: usize,
 ) -> HashMap<String, usize> {
@@ -6261,7 +6250,7 @@ fn top_level_reactive_assignment_counts(
     counts
 }
 
-fn non_reactive_script_updated_names(program: &ParsedJsProgram) -> HashSet<String> {
+fn non_reactive_script_updated_names(program: &JsProgram) -> HashSet<String> {
     struct UpdatedNamesVisitor<'a> {
         names: &'a mut HashSet<String>,
     }
@@ -6397,7 +6386,7 @@ fn unwrap_oxc_parenthesized_expression<'a>(
     node
 }
 
-fn top_level_declaration_starts(program: &ParsedJsProgram, source_offset: usize) -> HashMap<String, usize> {
+fn top_level_declaration_starts(program: &JsProgram, source_offset: usize) -> HashMap<String, usize> {
     let mut starts = HashMap::new();
     for statement in &program.program().body {
         let (start, _) = span_range_with_offset(source_offset, statement.span());
@@ -6564,7 +6553,7 @@ fn slot_element_name(slot: &crate::ast::modern::SlotElement) -> Option<&str> {
 }
 
 fn static_text_attribute_value(attribute: &crate::ast::modern::NamedAttribute) -> Option<&str> {
-    let AttributeValueList::Values(values) = &attribute.value else {
+    let AttributeValueKind::Values(values) = &attribute.value else {
         return None;
     };
     if values.len() != 1 {
@@ -6784,7 +6773,7 @@ fn migration_task_result(source: &str, message: &str) -> Arc<str> {
     ))
 }
 
-fn export_let_names(program: &ParsedJsProgram) -> HashSet<String> {
+fn export_let_names(program: &JsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for statement in &program.program().body {
         let Some(declaration) = export_let_declaration(statement) else {
@@ -6801,7 +6790,7 @@ fn export_let_names(program: &ParsedJsProgram) -> HashSet<String> {
 }
 
 fn top_level_let_statements<'a>(
-    program: &'a ParsedJsProgram,
+    program: &'a JsProgram,
     source: &'a str,
     source_offset: usize,
 ) -> Vec<TopLevelLetStatement<'a>> {
@@ -6831,7 +6820,7 @@ fn top_level_let_statements<'a>(
 }
 
 fn top_level_reactive_assignments<'a>(
-    program: &'a ParsedJsProgram,
+    program: &'a JsProgram,
     source: &'a str,
     source_offset: usize,
 ) -> Vec<TopLevelReactiveAssignment<'a>> {
@@ -7534,7 +7523,7 @@ fn expression_end(expression: &crate::ast::modern::Expression) -> Option<usize> 
 
 fn migrate_svelte_element_static_this(source: &str, element: &SvelteElement) -> Option<Edit> {
     let expression = element.expression.as_ref()?;
-    expression_literal_string(expression)?;
+    expression.literal_string()?;
 
     let start = expression.start;
     let end = expression.end;
@@ -7661,11 +7650,11 @@ fn migrate_svelte_self_without_filename(source: &str, start: usize) -> Option<Ed
 
 fn named_attribute_string_value(attribute: &crate::ast::modern::NamedAttribute) -> Option<&str> {
     match &attribute.value {
-        AttributeValueList::Values(values) => match values.as_ref() {
+        AttributeValueKind::Values(values) => match values.as_ref() {
             [AttributeValue::Text(text)] => Some(text.data.as_ref()),
             _ => None,
         },
-        AttributeValueList::ExpressionTag(_) | AttributeValueList::Boolean(_) => None,
+        AttributeValueKind::ExpressionTag(_) | AttributeValueKind::Boolean(_) => None,
     }
 }
 
@@ -7740,13 +7729,13 @@ fn slot_render_argument_source(source: &str, attributes: &[Attribute]) -> Option
         }
 
         let value = match &attribute.value {
-            AttributeValueList::Boolean(true) => attribute.name.to_string(),
-            AttributeValueList::Boolean(false) => return None,
-            AttributeValueList::ExpressionTag(tag) => source
+            AttributeValueKind::Boolean(true) => attribute.name.to_string(),
+            AttributeValueKind::Boolean(false) => return None,
+            AttributeValueKind::ExpressionTag(tag) => source
                 .get(expression_start(&tag.expression)?..expression_end(&tag.expression)?)?
                 .trim()
                 .to_string(),
-            AttributeValueList::Values(values) => match values.as_ref() {
+            AttributeValueKind::Values(values) => match values.as_ref() {
                 [AttributeValue::Text(text)] => format!("{:?}", text.data),
                 [AttributeValue::ExpressionTag(tag)] => source
                     .get(expression_start(&tag.expression)?..expression_end(&tag.expression)?)?
@@ -8013,7 +8002,7 @@ fn unique_generated_name(base: &str, used_names: &mut HashSet<String>) -> String
     }
 }
 
-fn declared_names_in_program(program: &ParsedJsProgram) -> HashSet<String> {
+fn declared_names_in_program(program: &JsProgram) -> HashSet<String> {
     let mut names = HashSet::new();
     for statement in &program.program().body {
         collect_declared_names_from_node(statement, &mut names);
