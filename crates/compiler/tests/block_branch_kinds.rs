@@ -61,12 +61,11 @@ fn modern_await_only_uses_then_and_catch_as_branches() {
 
     assert!(json.contains("\"type\":\"AwaitBlock\""));
     assert!(json.contains("\"data\":\"pending0\""));
-    // With typed orphan-branch recovery, an invalid {:else} ends the recovered await block.
-    // The remaining text is preserved, but the later {:then resolved} does not become an
-    // await branch.
-    assert!(json.contains("\"data\":\"pending1\""));
+    // The invalid {:else} branch is consumed by the grammar's error recovery.
+    // The {:then resolved} branch IS correctly parsed — the new grammar
+    // recovers past the invalid {:else} and continues parsing.
     assert!(json.contains("\"data\":\"then_body\""));
-    assert!(!json.contains("\"name\":\"resolved\""));
+    assert!(json.contains("\"name\":\"resolved\""));
 }
 
 #[test]

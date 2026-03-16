@@ -2278,11 +2278,10 @@ fn parse_modern_each_block(source: &str, block: TsNode<'_>) -> Option<EachBlock>
         if branch.kind() != "else_clause" {
             return None;
         }
-        // In the new grammar, else_clause body nodes are children of the clause itself
-        let clause_children = named_children_vec(branch);
+        let body_nodes = else_clause_body_nodes(branch);
         Some(Fragment {
             r#type: FragmentType::Fragment,
-            nodes: parse_modern_nodes_slice(source, &clause_children, false).into_boxed_slice(),
+            nodes: parse_modern_nodes_slice(source, &body_nodes, false).into_boxed_slice(),
         })
     });
 
@@ -3873,11 +3872,10 @@ fn parse_modern_alternate(
             }))
         }
         "else_clause" => {
-            // In the new grammar, body nodes are children of else_clause itself
-            let clause_children = named_children_vec(branch);
+            let body_nodes = else_clause_body_nodes(branch);
             Some(Alternate::Fragment(Fragment {
                 r#type: FragmentType::Fragment,
-                nodes: parse_modern_nodes_slice(source, &clause_children, false).into_boxed_slice(),
+                nodes: parse_modern_nodes_slice(source, &body_nodes, false).into_boxed_slice(),
             }))
         }
         _ => {
@@ -4553,4 +4551,15 @@ pub fn legacy_expression_from_modern_expression(
 pub(crate) fn named_children_vec(node: TsNode<'_>) -> Vec<TsNode<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
+}
+
+/// Returns the body nodes of an `else_clause`, filtering out grammar delimiter
+/// nodes (`block_open` / `block_close`) that are not content. Without this
+/// filter, `parse_modern_nodes_slice` would emit the gap text between the
+/// delimiters (the literal "else" keyword) as a spurious `Text` node.
+fn else_clause_body_nodes(clause: TsNode<'_>) -> Vec<TsNode<'_>> {
+    named_children_vec(clause)
+        .into_iter()
+        .filter(|n| !matches!(n.kind(), "block_open" | "block_close"))
+        .collect()
 }
