@@ -1,15 +1,17 @@
 use super::modern::{
-    modern_element_name, parse_modern_expression_tag_loose, parse_modern_script,
-    parse_modern_style, recover_modern_error_nodes,
+    else_clause_body_nodes, modern_element_name, parse_modern_expression_tag_loose,
+    parse_modern_script, parse_modern_style, recover_modern_error_nodes,
 };
 use super::*;
 use crate::ast::common::Span;
 use crate::ast::legacy;
 use crate::ast::modern;
+use crate::js::unwrap_parenthesized_expression;
 use crate::{SourceId, SourceText};
 use oxc_ast::ast::{Argument as OxcArgument, BindingPattern, Expression as OxcExpression};
+use oxc_span::GetSpan;
 
-pub(crate) fn parse_root(source: &str, root: Node<'_>, _loose: bool) -> legacy::Root {
+pub fn parse_root(source: &str, root: Node<'_>, _loose: bool) -> legacy::Root {
     let mut html_cst_children = Vec::new();
     let mut module = None;
     let mut instance = None;
@@ -25,8 +27,8 @@ pub(crate) fn parse_root(source: &str, root: Node<'_>, _loose: bool) -> legacy::
                 ElementKind::Script => {
                     if let Some(script) = parse_modern_script(source, child, None) {
                         match script.context {
-                            modern::ScriptContext::Module => module = Some(script.into()),
-                            modern::ScriptContext::Default => instance = Some(script.into()),
+                            modern::ScriptContext::Module => module = Some(legacy::script_from_modern(source, script)),
+                            modern::ScriptContext::Default => instance = Some(legacy::script_from_modern(source, script)),
                         }
                         if child.start_byte() <= leading_consumed_until {
                             leading_consumed_until = leading_consumed_until.max(child.end_byte());
@@ -104,6 +106,70 @@ pub(crate) fn parse_root(source: &str, root: Node<'_>, _loose: bool) -> legacy::
         instance.as_ref(),
         module.as_ref(),
     );
+
+    let mut document = legacy::Root {
+        html: legacy::Fragment {
+            r#type: legacy::FragmentType::Fragment,
+            start: fragment_start,
+            end: fragment_end,
+            children: html_children.into_boxed_slice(),
+        },
+        css,
+        instance,
+        module,
+        comments,
+    };
+
+    if !source.is_ascii() {
+        remap_legacy_document_offsets_utf16(source, &mut document);
+    }
+
+    document
+}
+
+/// Convert a modern AST root to a legacy AST root without re-parsing the CST.
+///
+/// This is the AST-to-AST equivalent of [`parse_root`], which walks a CST.
+/// All data needed for the legacy representation already exists in the modern root;
+/// this function simply restructures it.
+pub fn legacy_root_from_modern(source: &str, root: modern::Root) -> legacy::Root {
+    let instance = root.instance.map(|s| legacy::script_from_modern(source, s));
+    let module = root.module.map(|s| legacy::script_from_modern(source, s));
+    let css = root.css.map(legacy_style_from_modern_css);
+
+    let html_children: Vec<legacy::Node> = root
+        .fragment
+        .nodes
+        .into_vec()
+        .into_iter()
+        .filter_map(|n| legacy_node_from_modern_loose(source, n))
+        .collect();
+
+    let comments = collect_legacy_document_comments(
+        source,
+        &html_children,
+        instance.as_ref(),
+        module.as_ref(),
+    );
+
+    let first_meaningful = html_children
+        .iter()
+        .find(|node| !is_legacy_whitespace_text(node));
+    let last_meaningful = html_children
+        .iter()
+        .rfind(|node| !is_legacy_whitespace_text(node));
+    let (fragment_start, fragment_end) = if first_meaningful.is_none() && !html_children.is_empty()
+    {
+        (
+            html_children.first().map(legacy_node_end),
+            html_children.last().map(legacy_node_start),
+        )
+    } else {
+        (
+            first_meaningful.map(legacy_node_start),
+            last_meaningful.map(legacy_node_end),
+        )
+    };
 
     let mut document = legacy::Root {
         html: legacy::Fragment {
@@ -462,7 +528,7 @@ fn legacy_style_selector_list_from_modern(
     }
 }
 
-fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
+fn legacy_node_from_modern_loose(source: &str, node: modern::Node) -> Option<legacy::Node> {
     match node {
         modern::Node::Text(text) => Some(legacy::Node::Text(legacy::Text {
             start: text.start,
@@ -473,7 +539,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
         modern::Node::ExpressionTag(tag) => Some(legacy::Node::MustacheTag(legacy::MustacheTag {
             start: tag.start,
             end: tag.end,
-            expression: legacy_expression_from_modern_or_empty(tag.expression),
+            expression: legacy_expression_from_modern_or_empty(source, tag.expression),
         })),
         modern::Node::DebugTag(tag) => Some(legacy::Node::DebugTag(legacy::DebugTag {
             start: tag.start,
@@ -482,7 +548,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .arguments
                 .into_vec()
                 .into_iter()
-                .map(legacy_expression_from_modern_or_empty)
+                .map(|e| legacy_expression_from_modern_or_empty(source, e))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             identifiers: tag
@@ -490,6 +556,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .into_vec()
                 .into_iter()
                 .map(|identifier| legacy::IdentifierExpression {
+                    r#type: legacy::IdentifierType::Identifier,
                     name: identifier.name,
                     start: identifier.start,
                     end: identifier.end,
@@ -506,6 +573,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             data: comment.data,
         })),
         modern::Node::RegularElement(element) => legacy_element_from_parts(
+            source,
             element.start,
             element.end,
             element.name,
@@ -513,7 +581,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             element.fragment,
         ),
         modern::Node::TitleElement(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteHead(head) => {
             let children = head
@@ -521,10 +589,10 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .nodes
                 .into_vec()
                 .into_iter()
-                .filter_map(legacy_node_from_modern_loose)
+                .filter_map(|n| legacy_node_from_modern_loose(source, n))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            let attributes = legacy_attributes_from_modern(head.attributes.into_vec());
+            let attributes = legacy_attributes_from_modern(source, head.attributes.into_vec());
             Some(legacy::Node::Head(legacy::Head {
                 start: head.start,
                 end: head.end,
@@ -534,24 +602,25 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             }))
         }
         modern::Node::SvelteBody(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteWindow(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteDocument(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteSelf(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteFragment(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SvelteBoundary(el) => {
-            legacy_element_from_parts(el.start, el.end, el.name, el.attributes, el.fragment)
+            legacy_element_from_parts(source, el.start, el.end, el.name, el.attributes, el.fragment)
         }
         modern::Node::SlotElement(element) => legacy_element_from_parts(
+            source,
             element.start,
             element.end,
             element.name,
@@ -559,6 +628,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             element.fragment,
         ),
         modern::Node::SvelteComponent(component) => legacy_inline_component_from_parts(
+            source,
             component.start,
             component.end,
             component.name,
@@ -566,6 +636,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             component.fragment,
         ),
         modern::Node::SvelteElement(el) => legacy_inline_component_from_parts(
+            source,
             el.start,
             el.end,
             el.name,
@@ -573,6 +644,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             el.fragment,
         ),
         modern::Node::Component(component) => legacy_inline_component_from_parts(
+            source,
             component.start,
             component.end,
             component.name,
@@ -586,7 +658,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                     .nodes
                     .into_vec()
                     .into_iter()
-                    .filter_map(legacy_node_from_modern_loose)
+                    .filter_map(|n| legacy_node_from_modern_loose(source, n))
                     .collect::<Vec<_>>(),
             )
             .into_boxed_slice();
@@ -598,7 +670,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                             .nodes
                             .into_vec()
                             .into_iter()
-                            .filter_map(legacy_node_from_modern_loose)
+                            .filter_map(|n| legacy_node_from_modern_loose(source, n))
                             .collect::<Vec<_>>(),
                     )
                     .into_boxed_slice();
@@ -615,7 +687,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                     })
                 }
                 Some(modern::Alternate::IfBlock(nested)) => {
-                    let nested = legacy_node_from_modern_loose(modern::Node::IfBlock(nested))?;
+                    let nested = legacy_node_from_modern_loose(source, modern::Node::IfBlock(nested))?;
                     let legacy::Node::IfBlock(nested_if) = nested else {
                         return None;
                     };
@@ -632,7 +704,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             Some(legacy::Node::IfBlock(legacy::IfBlock {
                 start: block.start,
                 end: block.end,
-                expression: legacy_expression_from_modern_or_empty(block.test),
+                expression: legacy_expression_from_modern_or_empty(source, block.test),
                 children,
                 else_block,
                 elseif: block.elseif.then_some(true),
@@ -645,7 +717,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                     .nodes
                     .into_vec()
                     .into_iter()
-                    .filter_map(legacy_node_from_modern_loose)
+                    .filter_map(|n| legacy_node_from_modern_loose(source, n))
                     .collect::<Vec<_>>(),
             )
             .into_boxed_slice();
@@ -655,7 +727,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                         .nodes
                         .into_vec()
                         .into_iter()
-                        .filter_map(legacy_node_from_modern_loose)
+                        .filter_map(|n| legacy_node_from_modern_loose(source, n))
                         .collect::<Vec<_>>(),
                 )
                 .into_boxed_slice();
@@ -680,10 +752,10 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 start: block.start,
                 end: block.end,
                 children,
-                context: block.context.map(legacy_expression_from_modern_or_empty),
-                expression: legacy_expression_from_modern_or_empty(block.expression),
+                context: block.context.map(|e| legacy_expression_from_modern_context(source, e)),
+                expression: legacy_expression_from_modern_or_empty(source, block.expression),
                 index: block.index,
-                key: block.key.map(legacy_expression_from_modern_or_empty),
+                key: block.key.map(|e| legacy_expression_from_modern_or_empty(source, e)),
                 else_block,
             }))
         }
@@ -694,14 +766,14 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                     .nodes
                     .into_vec()
                     .into_iter()
-                    .filter_map(legacy_node_from_modern_loose)
+                    .filter_map(|n| legacy_node_from_modern_loose(source, n))
                     .collect::<Vec<_>>(),
             )
             .into_boxed_slice();
             Some(legacy::Node::KeyBlock(legacy::KeyBlock {
                 start: block.start,
                 end: block.end,
-                expression: legacy_expression_from_modern_or_empty(block.expression),
+                expression: legacy_expression_from_modern_or_empty(source, block.expression),
                 children,
             }))
         }
@@ -715,7 +787,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .nodes
                 .into_vec()
                 .into_iter()
-                .filter_map(legacy_node_from_modern_loose)
+                .filter_map(|n| legacy_node_from_modern_loose(source, n))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             let then_children = block
@@ -727,7 +799,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .nodes
                 .into_vec()
                 .into_iter()
-                .filter_map(legacy_node_from_modern_loose)
+                .filter_map(|n| legacy_node_from_modern_loose(source, n))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             let catch_children = block
@@ -739,7 +811,7 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .nodes
                 .into_vec()
                 .into_iter()
-                .filter_map(legacy_node_from_modern_loose)
+                .filter_map(|n| legacy_node_from_modern_loose(source, n))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
 
@@ -750,9 +822,9 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
             Some(legacy::Node::AwaitBlock(legacy::AwaitBlock {
                 start: block.start,
                 end: block.end,
-                expression: legacy_expression_from_modern_or_empty(block.expression),
-                value: block.value.map(legacy_expression_from_modern_or_empty),
-                error: block.error.map(legacy_expression_from_modern_or_empty),
+                expression: legacy_expression_from_modern_or_empty(source, block.expression),
+                value: block.value.map(|e| legacy_expression_from_modern_or_empty(source, e)),
+                error: block.error.map(|e| legacy_expression_from_modern_or_empty(source, e)),
                 pending: legacy::PendingBlock {
                     r#type: legacy::PendingBlockType::PendingBlock,
                     start: None,
@@ -782,19 +854,21 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
                 .nodes
                 .into_vec()
                 .into_iter()
-                .filter_map(legacy_node_from_modern_loose)
+                .filter_map(|n| legacy_node_from_modern_loose(source, n))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
+            // Snippet expressions need include_character=true for loc with character field
+            let expression = legacy_expression_from_modern_with_character(source, block.expression);
             Some(legacy::Node::SnippetBlock(legacy::SnippetBlock {
                 start: block.start,
                 end: block.end,
-                expression: legacy_expression_from_modern_or_empty(block.expression),
+                expression,
                 type_params: block.type_params,
                 parameters: block
                     .parameters
                     .into_vec()
                     .into_iter()
-                    .map(legacy_expression_from_modern_or_empty)
+                    .map(|e| legacy_expression_from_modern_or_empty(source, e))
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 children,
@@ -804,20 +878,20 @@ fn legacy_node_from_modern_loose(node: modern::Node) -> Option<legacy::Node> {
         modern::Node::RenderTag(tag) => Some(legacy::Node::MustacheTag(legacy::MustacheTag {
             start: tag.start,
             end: tag.end,
-            expression: legacy_expression_from_modern_or_empty(tag.expression),
+            expression: legacy_expression_from_modern_or_empty(source, tag.expression),
         })),
     }
 }
 
-pub(super) fn legacy_nodes_from_modern_loose(nodes: Vec<modern::Node>) -> Vec<legacy::Node> {
+pub(super) fn legacy_nodes_from_modern_loose(source: &str, nodes: Vec<modern::Node>) -> Vec<legacy::Node> {
     nodes
         .into_iter()
-        .filter_map(legacy_node_from_modern_loose)
+        .filter_map(|n| legacy_node_from_modern_loose(source, n))
         .collect()
 }
 
-fn legacy_nodes_from_modern_error_recovery(nodes: Vec<modern::Node>) -> Vec<legacy::Node> {
-    legacy_nodes_from_modern_loose(nodes)
+fn legacy_nodes_from_modern_error_recovery(source: &str, nodes: Vec<modern::Node>) -> Vec<legacy::Node> {
+    legacy_nodes_from_modern_loose(source, nodes)
         .into_iter()
         .map(|node| match node {
             legacy::Node::SnippetBlock(mut block) => {
@@ -830,6 +904,7 @@ fn legacy_nodes_from_modern_error_recovery(nodes: Vec<modern::Node>) -> Vec<lega
 }
 
 fn legacy_element_from_parts(
+    source: &str,
     start: usize,
     end: usize,
     name: Arc<str>,
@@ -840,10 +915,10 @@ fn legacy_element_from_parts(
         .nodes
         .into_vec()
         .into_iter()
-        .filter_map(legacy_node_from_modern_loose)
+        .filter_map(|n| legacy_node_from_modern_loose(source, n))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let attributes = legacy_attributes_from_modern(attributes.into_vec());
+    let attributes = legacy_attributes_from_modern(source, attributes.into_vec());
     Some(legacy::Node::Element(legacy::Element {
         start,
         end,
@@ -855,6 +930,7 @@ fn legacy_element_from_parts(
 }
 
 fn legacy_inline_component_from_parts(
+    source: &str,
     start: usize,
     end: usize,
     name: Arc<str>,
@@ -865,10 +941,10 @@ fn legacy_inline_component_from_parts(
         .nodes
         .into_vec()
         .into_iter()
-        .filter_map(legacy_node_from_modern_loose)
+        .filter_map(|n| legacy_node_from_modern_loose(source, n))
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let attributes = legacy_attributes_from_modern(attributes.into_vec());
+    let attributes = legacy_attributes_from_modern(source, attributes.into_vec());
     Some(legacy::Node::InlineComponent(legacy::InlineComponent {
         start,
         end,
@@ -879,7 +955,7 @@ fn legacy_inline_component_from_parts(
     }))
 }
 
-fn legacy_attributes_from_modern(attributes: Vec<modern::Attribute>) -> Vec<legacy::Attribute> {
+fn legacy_attributes_from_modern(source: &str, attributes: Vec<modern::Attribute>) -> Vec<legacy::Attribute> {
     let mut out = Vec::new();
     for attribute in attributes {
         match attribute {
@@ -889,38 +965,38 @@ fn legacy_attributes_from_modern(attributes: Vec<modern::Attribute>) -> Vec<lega
                     end: named.end,
                     name: named.name,
                     name_loc: named.name_loc,
-                    value: named.value.into(),
+                    value: legacy::attribute_value_kind_from_modern(source, named.value),
                 }));
             }
             modern::Attribute::BindDirective(directive) => {
-                out.push(legacy::Attribute::Binding(directive.into()));
+                out.push(legacy::Attribute::Binding(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::OnDirective(directive) => {
-                out.push(legacy::Attribute::EventHandler(directive.into()));
+                out.push(legacy::Attribute::EventHandler(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::ClassDirective(directive) => {
-                out.push(legacy::Attribute::Class(directive.into()));
+                out.push(legacy::Attribute::Class(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::LetDirective(directive) => {
-                out.push(legacy::Attribute::Let(directive.into()));
+                out.push(legacy::Attribute::Let(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::UseDirective(directive) => {
-                out.push(legacy::Attribute::Action(directive.into()));
+                out.push(legacy::Attribute::Action(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::AnimateDirective(directive) => {
-                out.push(legacy::Attribute::Animation(directive.into()));
+                out.push(legacy::Attribute::Animation(legacy::directive_attribute_from_modern(source, directive)));
             }
             modern::Attribute::StyleDirective(directive) => {
-                out.push(legacy::Attribute::StyleDirective(directive.into()));
+                out.push(legacy::Attribute::StyleDirective(legacy::style_directive_from_modern(source, directive)));
             }
             modern::Attribute::TransitionDirective(directive) => {
-                out.push(legacy::Attribute::Transition(directive.into()));
+                out.push(legacy::Attribute::Transition(legacy::transition_directive_from_modern(source, directive)));
             }
             modern::Attribute::SpreadAttribute(spread) => {
                 out.push(legacy::Attribute::Spread(legacy::SpreadAttribute {
                     start: spread.start,
                     end: spread.end,
-                    expression: legacy_expression_from_modern_or_empty(spread.expression),
+                    expression: legacy_expression_from_modern_or_empty(source, spread.expression),
                 }));
             }
             modern::Attribute::AttachTag(_) => {}
@@ -929,19 +1005,45 @@ fn legacy_attributes_from_modern(attributes: Vec<modern::Attribute>) -> Vec<lega
     out
 }
 
-fn legacy_expression_from_modern_or_empty(expression: modern::Expression) -> legacy::Expression {
-    if let Some(converted) = legacy_expression_from_modern(expression.clone(), false) {
+fn legacy_expression_from_modern_with_character(source: &str, expression: modern::Expression) -> legacy::Expression {
+    if let Some(converted) = legacy_expression_from_modern(source, expression.clone(), true) {
+        return converted;
+    }
+    let (start, end) = modern_expression_bounds(&expression).unwrap_or((0, 0));
+    let loc = legacy_expression_loc(source, start, end, true);
+    legacy_empty_identifier_expression(start, end, loc)
+}
+
+fn legacy_expression_from_modern_or_empty(source: &str, expression: modern::Expression) -> legacy::Expression {
+    if let Some(converted) = legacy_expression_from_modern(source, expression.clone(), false) {
         return converted;
     }
     let (start, end) = modern_expression_bounds(&expression).unwrap_or((0, 0));
     legacy_empty_identifier_expression(start, end, None)
 }
 
+/// Convert a modern expression for an each-block destructured context.
+/// Applies a +1 column offset to match upstream Svelte's `read_pattern` which
+/// wraps `(pattern = 1)` and removes one space from the prefix, shifting
+/// newline positions by -1 and inflating columns by +1 for multi-line sources.
+fn legacy_expression_from_modern_context(source: &str, expression: modern::Expression) -> legacy::Expression {
+    if let Some(pattern) = expression.oxc_pattern() {
+        if let Some(converted) = legacy_expression_from_binding_pattern_inner(
+            source, pattern, &expression, false, 1,
+        ) {
+            return converted;
+        }
+    }
+    // Fall back to the normal path for simple identifiers / non-pattern contexts
+    legacy_expression_from_modern_or_empty(source, expression)
+}
+
 pub(crate) fn legacy_expression_from_modern(
+    source: &str,
     expression: modern::Expression,
     include_character: bool,
 ) -> Option<legacy::Expression> {
-    legacy_expression_from_modern_with_source("", expression, include_character)
+    legacy_expression_from_modern_with_source(source, expression, include_character)
 }
 
 fn legacy_expression_from_modern_with_source(
@@ -949,6 +1051,12 @@ fn legacy_expression_from_modern_with_source(
     expression: modern::Expression,
     include_character: bool,
 ) -> Option<legacy::Expression> {
+    // If expression has leading/trailing comments, use the JSON serialization path
+    // so comments can be injected into the output.
+    if !expression.leading_comments.is_empty() || !expression.trailing_comments.is_empty() {
+        return Some(other_expression_with_loc(&source, &expression));
+    }
+
     if let Some(pattern) = expression.oxc_pattern() {
         return legacy_expression_from_binding_pattern(
             source,
@@ -968,9 +1076,25 @@ fn legacy_expression_from_binding_pattern(
     expression: &modern::Expression,
     include_character: bool,
 ) -> Option<legacy::Expression> {
+    legacy_expression_from_binding_pattern_inner(source, pattern, expression, include_character, 0)
+}
+
+fn legacy_expression_from_binding_pattern_inner(
+    source: &str,
+    pattern: &BindingPattern<'_>,
+    expression: &modern::Expression,
+    include_character: bool,
+    column_offset: usize,
+) -> Option<legacy::Expression> {
+    // If the parameter has a type annotation, use full ESTree serialization
+    // so that `typeAnnotation` is included in the output.
+    if expression.oxc_parameter().is_some_and(|p| p.type_annotation.is_some()) {
+        return Some(other_expression_with_loc_offset(source, expression, column_offset));
+    }
     Some(match pattern {
         BindingPattern::BindingIdentifier(identifier) => {
             legacy::Expression::Identifier(legacy::IdentifierExpression {
+                r#type: legacy::IdentifierType::Identifier,
                 name: Arc::from(identifier.name.as_str()),
                 start: expression.start,
                 end: expression.end,
@@ -985,7 +1109,7 @@ fn legacy_expression_from_binding_pattern(
         BindingPattern::ArrayPattern(_)
         | BindingPattern::ObjectPattern(_)
         | BindingPattern::AssignmentPattern(_) => {
-            legacy::Expression::Other(expression.clone())
+            other_expression_with_loc_offset(source, expression, column_offset)
         }
     })
 }
@@ -996,13 +1120,21 @@ fn legacy_expression_from_oxc_expression(
     modern_expression: &modern::Expression,
     include_character: bool,
 ) -> Option<legacy::Expression> {
-    let start = modern_expression.start;
-    let end = modern_expression.end;
+    // OXC spans are 0-based relative to the expression text.
+    // Add the modern expression's absolute start offset to get source positions.
+    let base = modern_expression.start;
+    let span = expression.span();
+    let start = base + span.start as usize;
+    let end = base + span.end as usize;
     let loc = legacy_expression_loc(source, start, end, include_character);
+    let raw_text = || -> Arc<str> {
+        Arc::from(source.get(start..end).unwrap_or_default())
+    };
 
     Some(match expression {
         OxcExpression::Identifier(identifier) => {
             legacy::Expression::Identifier(legacy::IdentifierExpression {
+                r#type: legacy::IdentifierType::Identifier,
                 name: Arc::from(identifier.name.as_str()),
                 start,
                 end,
@@ -1011,23 +1143,26 @@ fn legacy_expression_from_oxc_expression(
         }
         OxcExpression::StringLiteral(literal) => {
             legacy::Expression::Literal(legacy::LiteralExpression {
+                r#type: legacy::LiteralType::Literal,
                 start,
                 end,
                 loc,
                 value: legacy::LiteralValue::String(Arc::from(literal.value.as_str())),
-                raw: Arc::from(modern_expression_text(source, modern_expression)),
+                raw: raw_text(),
             })
         }
         OxcExpression::BooleanLiteral(literal) => {
             legacy::Expression::Literal(legacy::LiteralExpression {
+                r#type: legacy::LiteralType::Literal,
                 start,
                 end,
                 loc,
                 value: legacy::LiteralValue::Bool(literal.value),
-                raw: Arc::from(modern_expression_text(source, modern_expression)),
+                raw: raw_text(),
             })
         }
         OxcExpression::NullLiteral(_) => legacy::Expression::Literal(legacy::LiteralExpression {
+            r#type: legacy::LiteralType::Literal,
             start,
             end,
             loc,
@@ -1036,11 +1171,12 @@ fn legacy_expression_from_oxc_expression(
         }),
         OxcExpression::NumericLiteral(literal) => {
             legacy::Expression::Literal(legacy::LiteralExpression {
+                r#type: legacy::LiteralType::Literal,
                 start,
                 end,
                 loc,
                 value: legacy::LiteralValue::Number(literal.value as i64),
-                raw: Arc::from(modern_expression_text(source, modern_expression)),
+                raw: raw_text(),
             })
         }
         OxcExpression::CallExpression(call) => {
@@ -1065,6 +1201,7 @@ fn legacy_expression_from_oxc_expression(
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             legacy::Expression::CallExpression(legacy::CallExpressionNode {
+                r#type: legacy::CallExpressionType::CallExpression,
                 start,
                 end,
                 loc,
@@ -1087,6 +1224,7 @@ fn legacy_expression_from_oxc_expression(
                 include_character,
             )?;
             legacy::Expression::BinaryExpression(legacy::BinaryExpressionNode {
+                r#type: legacy::BinaryExpressionType::BinaryExpression,
                 start,
                 end,
                 loc,
@@ -1095,8 +1233,220 @@ fn legacy_expression_from_oxc_expression(
                 right: Box::new(right),
             })
         }
-        _ => legacy::Expression::Other(modern_expression.clone()),
+        _ => other_expression_with_loc(source, modern_expression),
     })
+}
+
+/// Produce a legacy `OtherJson` expression from a modern expression, enriching
+/// the serialized ESTree JSON with `loc` fields computed from source positions.
+fn other_expression_with_loc(source: &str, modern_expression: &modern::Expression) -> legacy::Expression {
+    other_expression_with_loc_offset(source, modern_expression, 0)
+}
+
+/// Like `other_expression_with_loc` but adds `column_offset` to all column
+/// values on lines after line 1. This replicates the upstream Svelte parser's
+/// behaviour when parsing destructured patterns: it wraps `(pattern = 1)` and
+/// prepends a space-padded prefix with one space removed, shifting newline
+/// positions by -1 and thus inflating columns by +1 for multi-line sources.
+fn other_expression_with_loc_offset(
+    source: &str,
+    modern_expression: &modern::Expression,
+    column_offset: usize,
+) -> legacy::Expression {
+    if let Some(json) = modern_expression.to_estree_json() {
+        if !source.is_empty() {
+            let mut enriched = inject_loc_into_json(source, &json, column_offset);
+            // Inject leading comments from the modern expression
+            if !modern_expression.leading_comments.is_empty() {
+                enriched = inject_comments_into_expression_json(
+                    &enriched,
+                    "leadingComments",
+                    &modern_expression.leading_comments,
+                );
+            }
+            // Inject trailing comments from the modern expression
+            if !modern_expression.trailing_comments.is_empty() {
+                enriched = inject_comments_into_expression_json(
+                    &enriched,
+                    "trailingComments",
+                    &modern_expression.trailing_comments,
+                );
+            }
+            // Attach internal comments (inside function bodies, etc.)
+            let internal_comments = modern_expression.extract_internal_comments();
+            if !internal_comments.is_empty() {
+                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&enriched) {
+                    crate::js::attach_comments_to_json_tree(
+                        &mut value,
+                        &internal_comments,
+                        source,
+                    );
+                    if let Ok(s) = serde_json::to_string(&value) {
+                        enriched = s;
+                    }
+                }
+            }
+            return legacy::Expression::OtherJson(legacy::OtherExpressionJson {
+                json: Arc::from(enriched),
+            });
+        }
+        // No source available — emit JSON as-is
+        return legacy::Expression::OtherJson(legacy::OtherExpressionJson {
+            json: Arc::from(json),
+        });
+    }
+    legacy::Expression::Other(modern_expression.clone())
+}
+
+/// Inject comments (leading or trailing) from extracted JS comments into expression JSON.
+fn inject_comments_into_expression_json(
+    json: &str,
+    field_name: &str,
+    comments: &[modern::JsComment],
+) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return json.to_string();
+    };
+    if let serde_json::Value::Object(ref mut map) = value {
+        let entries: Vec<serde_json::Value> = comments
+            .iter()
+            .map(|c| {
+                let kind_str = match c.kind {
+                    modern::JsCommentKind::Line => "Line",
+                    modern::JsCommentKind::Block => "Block",
+                };
+                let mut obj = serde_json::json!({
+                    "type": kind_str,
+                    "value": c.value.as_ref(),
+                });
+                if let (Some(s), Some(e)) = (c.start, c.end) {
+                    obj["start"] = serde_json::json!(s);
+                    obj["end"] = serde_json::json!(e);
+                }
+                obj
+            })
+            .collect();
+        map.insert(
+            field_name.to_string(),
+            serde_json::Value::Array(entries),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+}
+
+/// Walk a JSON string and inject `"loc"` fields into every object that has
+/// `"start"` and `"end"` numeric fields but no existing `"loc"`.
+fn inject_loc_into_json(source: &str, json: &str, column_offset: usize) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return json.to_string();
+    };
+    inject_loc_recursive(source, &mut value, column_offset);
+    serde_json::to_string(&value).unwrap_or_else(|_| json.to_string())
+}
+
+fn inject_loc_recursive(source: &str, value: &mut serde_json::Value, column_offset: usize) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Strip OXC TS-serializer extra fields that acorn doesn't emit.
+            if map.get("decorators") == Some(&serde_json::Value::Array(vec![])) {
+                map.remove("decorators");
+            }
+            // Remove `optional: false` except on CallExpression/MemberExpression
+            let node_type: String = map
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let nt = node_type.as_str();
+            let keep_optional = matches!(
+                nt,
+                "CallExpression" | "MemberExpression" | "OptionalCallExpression" | "OptionalMemberExpression"
+            );
+            if !keep_optional
+                && map.get("optional") == Some(&serde_json::Value::Bool(false))
+            {
+                map.remove("optional");
+            }
+            // Strip null TS-specific fields
+            for field in &[
+                "typeAnnotation",
+                "typeArguments",
+                "typeParameters",
+                "returnType",
+                "superTypeArguments",
+                "accessibility",
+                "directive",
+            ] {
+                if map.get(*field) == Some(&serde_json::Value::Null) {
+                    map.remove(*field);
+                }
+            }
+            // Strip false TS-specific fields
+            for field in &["definite", "declare", "abstract", "override"] {
+                if map.get(*field) == Some(&serde_json::Value::Bool(false)) {
+                    map.remove(*field);
+                }
+            }
+            // Fix TemplateElement spans: TS serializer includes backtick/braces,
+            // but upstream (acorn) excludes them.
+            if nt == "TemplateElement" {
+                let is_tail = map
+                    .get("tail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Some(serde_json::Value::Number(n)) = map.get("start") {
+                    if let Some(v) = n.as_u64() {
+                        map.insert("start".to_string(), serde_json::json!(v + 1));
+                    }
+                }
+                if let Some(serde_json::Value::Number(n)) = map.get("end") {
+                    if let Some(v) = n.as_u64() {
+                        let adj = if is_tail { 1 } else { 2 };
+                        map.insert(
+                            "end".to_string(),
+                            serde_json::json!(v.saturating_sub(adj)),
+                        );
+                    }
+                }
+            }
+            // Recurse into children first
+            for v in map.values_mut() {
+                inject_loc_recursive(source, v, column_offset);
+            }
+            // Unwrap ParenthesizedExpression nodes (acorn doesn't produce these)
+            for v in map.values_mut() {
+                unwrap_parenthesized_expression(v);
+            }
+            // Inject loc if start/end present and loc absent
+            if !map.contains_key("loc") {
+                if let (Some(serde_json::Value::Number(s)), Some(serde_json::Value::Number(e))) =
+                    (map.get("start"), map.get("end"))
+                {
+                    if let (Some(start), Some(end)) = (s.as_u64(), e.as_u64()) {
+                        let start = start as usize;
+                        let end = end as usize;
+                        let (start_line, start_col) = line_column_at_offset(source, start);
+                        let (end_line, end_col) = line_column_at_offset(source, end);
+                        // Apply column_offset for nodes not on line 1 to match
+                        // upstream's synthetic-prefix column shift.
+                        let sc = if start_line > 1 { start_col + column_offset } else { start_col };
+                        let ec = if end_line > 1 { end_col + column_offset } else { end_col };
+                        let loc = serde_json::json!({
+                            "start": { "line": start_line, "column": sc },
+                            "end": { "line": end_line, "column": ec }
+                        });
+                        map.insert("loc".to_string(), loc);
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                inject_loc_recursive(source, v, column_offset);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn legacy_expression_loc(
@@ -1119,12 +1469,6 @@ fn legacy_expression_loc(
         end,
         include_character,
     ))
-}
-
-fn modern_expression_text<'a>(source: &'a str, expression: &modern::Expression) -> &'a str {
-    source
-        .get(expression.start..expression.end)
-        .unwrap_or_default()
 }
 
 fn modern_expression_bounds(expression: &modern::Expression) -> Option<(usize, usize)> {
@@ -1635,35 +1979,56 @@ fn parse_legacy_attributes(source: &str, tag_node: Node<'_>) -> Vec<legacy::Attr
                     }
                 }
                 "shorthand_attribute" => {
-                    has_shorthand = true;
-                    if let Some(shorthand) = parse_attribute_shorthand(source, attr_child) {
-                        if let legacy::Expression::Identifier(identifier) = &shorthand.expression
-                            && let Some(loc) = identifier.loc.as_ref()
-                        {
-                            name = identifier.name.clone();
-                            name_loc = legacy::SourceRange {
-                                start: LineColumn {
-                                    line: loc.start.line,
-                                    column: loc.start.column,
-                                    character: loc.start.character.unwrap_or(identifier.start),
-                                },
-                                end: LineColumn {
-                                    line: loc.end.line,
-                                    column: loc.end.column,
-                                    character: loc.end.character.unwrap_or(identifier.end),
-                                },
-                            };
-                        }
+                    // In grammar 0.1.6+, spread_attribute merged into shorthand_attribute.
+                    // Check if content starts with "..." to distinguish spreads from shorthands.
+                    if let Some((expression_text, expression_start)) =
+                        shorthand_spread_expression_text(source, attr_child)
+                    {
+                        let (line, column) = line_column_at_offset(source, expression_start);
+                        spread_expression = parse_legacy_expression_from_text(
+                            source,
+                            expression_text.as_ref(),
+                            expression_start,
+                            line,
+                            column,
+                            false,
+                        );
+                    } else {
+                        has_shorthand = true;
+                        if let Some(shorthand) = parse_attribute_shorthand(source, attr_child) {
+                            if let legacy::Expression::Identifier(identifier) =
+                                &shorthand.expression
+                                && let Some(loc) = identifier.loc.as_ref()
+                            {
+                                name = identifier.name.clone();
+                                name_loc = legacy::SourceRange {
+                                    start: LineColumn {
+                                        line: loc.start.line,
+                                        column: loc.start.column,
+                                        character: loc.start.character
+                                            .unwrap_or(identifier.start),
+                                    },
+                                    end: LineColumn {
+                                        line: loc.end.line,
+                                        column: loc.end.column,
+                                        character: loc.end.character
+                                            .unwrap_or(identifier.end),
+                                    },
+                                };
+                            }
 
-                        values.push(legacy::AttributeValue::AttributeShorthand(shorthand));
+                            values.push(legacy::AttributeValue::AttributeShorthand(shorthand));
+                        }
                     }
                 }
                 "spread_attribute" => {
+                    // Legacy grammar compat — kept for older tree-sitter-htmlx-svelte versions
                     if let Some((expression_text, expression_start)) =
                         spread_attribute_expression_text(source, attr_child)
                     {
                         let (line, column) = line_column_at_offset(source, expression_start);
                         spread_expression = parse_legacy_expression_from_text(
+                            source,
                             expression_text.as_ref(),
                             expression_start,
                             line,
@@ -1723,6 +2088,7 @@ fn parse_legacy_attributes(source: &str, tag_node: Node<'_>) -> Vec<legacy::Attr
                 let fallback_end = name_loc.end.character;
                 Some(legacy::Expression::Identifier(
                     legacy::IdentifierExpression {
+                        r#type: legacy::IdentifierType::Identifier,
                         start: fallback_start,
                         end: fallback_end,
                         name: head.name.clone(),
@@ -1976,7 +2342,7 @@ fn split_legacy_unquoted_attribute_value_parts(
         let (line, column) = line_column_at_offset(source, expr_start);
 
         if let Some(expression) =
-            parse_legacy_expression_from_text(trimmed, expr_start, line, column, false)
+            parse_legacy_expression_from_text(source, trimmed, expr_start, line, column, false)
         {
             has_expression = true;
             out.push(legacy::AttributeValue::MustacheTag(legacy::MustacheTag {
@@ -2081,7 +2447,7 @@ fn parse_legacy_textarea_children(source: &str, start: usize, end: usize) -> Vec
         let (line, column) = line_column_at_offset(source, expr_start);
 
         if let Some(expression) =
-            parse_legacy_expression_from_text(trimmed, expr_start, line, column, false)
+            parse_legacy_expression_from_text(source, trimmed, expr_start, line, column, false)
         {
             out.push(legacy::Node::MustacheTag(legacy::MustacheTag {
                 start: start + open,
@@ -2125,7 +2491,7 @@ fn recover_legacy_braced_expression_from_attribute_values(
     let leading = inner.find(trimmed).unwrap_or(0);
     let expr_start = text.start + 1 + leading;
     let (line, column) = line_column_at_offset(source, expr_start);
-    parse_legacy_expression_from_text(trimmed, expr_start, line, column, false)
+    parse_legacy_expression_from_text(source, trimmed, expr_start, line, column, false)
 }
 
 pub(crate) fn parse_modern_attributes(
@@ -2336,45 +2702,68 @@ pub(crate) fn parse_modern_attributes(
                     }
                 }
                 "shorthand_attribute" => {
-                    attribute_value_syntax = modern::AttributeValueSyntax::Expression;
-                    let raw = text_for_node(source, attr_child);
-                    if let Some(inner) = raw
-                        .as_ref()
-                        .strip_prefix('{')
-                        .and_then(|text| text.strip_suffix('}'))
+                    // In grammar 0.1.6+, spread_attribute merged into shorthand_attribute.
+                    // Check if content starts with "..." to handle as spread.
+                    if let Some((expression_text, expression_start)) =
+                        shorthand_spread_expression_text(source, attr_child)
                     {
-                        let trimmed = inner.trim();
-                        if !trimmed.is_empty() {
-                            let leading = inner.find(trimmed).unwrap_or(0);
-                            let expression_start = attr_child.start_byte() + 1 + leading;
-                            let (line, column) = line_column_at_offset(source, expression_start);
-                            let expression = parse_modern_expression_from_text(
-                                trimmed,
+                        let (line, column) = line_column_at_offset(source, expression_start);
+                        spread_expression = crate::parse::parse_modern_expression_with_oxc(
+                            expression_text.as_ref(),
+                            expression_start,
+                            line,
+                            column,
+                        )
+                        .or_else(|| {
+                            parse_modern_expression_from_text(
+                                expression_text.as_ref(),
                                 expression_start,
                                 line,
                                 column,
                             )
-                            .unwrap_or_else(|| modern_empty_identifier_expression(attr_child));
+                        });
+                    } else {
+                        attribute_value_syntax = modern::AttributeValueSyntax::Expression;
+                        let raw = text_for_node(source, attr_child);
+                        if let Some(inner) = raw
+                            .as_ref()
+                            .strip_prefix('{')
+                            .and_then(|text| text.strip_suffix('}'))
+                        {
+                            let trimmed = inner.trim();
+                            if !trimmed.is_empty() {
+                                let leading = inner.find(trimmed).unwrap_or(0);
+                                let expression_start = attr_child.start_byte() + 1 + leading;
+                                let (line, column) =
+                                    line_column_at_offset(source, expression_start);
+                                let expression = parse_modern_expression_from_text(
+                                    trimmed,
+                                    expression_start,
+                                    line,
+                                    column,
+                                )
+                                .unwrap_or_else(|| modern_empty_identifier_expression(attr_child));
 
-                            if let Some(identifier_name) = expression.identifier_name() {
-                                name = identifier_name.clone();
-                                let start = expression.start;
-                                let end = expression.end;
-                                name_loc = legacy::SourceRange {
-                                    start: location_at_offset(source, start),
-                                    end: location_at_offset(source, end),
+                                if let Some(identifier_name) = expression.identifier_name() {
+                                    name = identifier_name.clone();
+                                    let start = expression.start;
+                                    let end = expression.end;
+                                    name_loc = legacy::SourceRange {
+                                        start: location_at_offset(source, start),
+                                        end: location_at_offset(source, end),
+                                    };
+                                }
+
+                                let tag = modern::ExpressionTag {
+                                    r#type: modern::ExpressionTagType::ExpressionTag,
+                                    start: attr_child.start_byte(),
+                                    end: attr_child.end_byte(),
+                                    expression,
                                 };
+                                has_expression = true;
+                                expression_values.push(tag.clone());
+                                value_parts.push(modern::AttributeValue::ExpressionTag(tag));
                             }
-
-                            let tag = modern::ExpressionTag {
-                                r#type: modern::ExpressionTagType::ExpressionTag,
-                                start: attr_child.start_byte(),
-                                end: attr_child.end_byte(),
-                                expression,
-                            };
-                            has_expression = true;
-                            expression_values.push(tag.clone());
-                            value_parts.push(modern::AttributeValue::ExpressionTag(tag));
                         }
                     }
                 }
@@ -3085,6 +3474,22 @@ fn spread_attribute_expression_text(source: &str, node: Node<'_>) -> Option<(Arc
     Some((Arc::from(trimmed), node.start_byte() + 4 + leading))
 }
 
+/// Checks if a `shorthand_attribute` node is actually a spread (`{...expr}`).
+/// In tree-sitter-htmlx-svelte 0.1.6+, `spread_attribute` was merged into `shorthand_attribute`,
+/// so the `...` prefix is part of the JS content field.
+/// Returns the expression text (without `...`) and its start offset if this is a spread.
+fn shorthand_spread_expression_text(source: &str, node: Node<'_>) -> Option<(Arc<str>, usize)> {
+    let content = node.child_by_field_name("content")?;
+    let text = text_for_node(source, content);
+    let after_dots = text.as_ref().strip_prefix("...")?;
+    let trimmed = after_dots.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let leading = after_dots.find(trimmed).unwrap_or(0);
+    Some((Arc::from(trimmed), content.start_byte() + 3 + leading))
+}
+
 fn parse_directive_head(source: &str, name_node: Node<'_>) -> Option<DirectiveHead> {
     let prefix = first_named_descendant(name_node, "attribute_directive");
     let name = first_named_descendant(name_node, "attribute_identifier");
@@ -3238,6 +3643,7 @@ fn parse_legacy_binding_field(
 ) -> Option<legacy::Expression> {
     let raw = node.utf8_text(source.as_bytes()).ok()?;
     parse_legacy_pattern_from_text(
+        source,
         raw,
         node.start_byte(),
         node.start_position().row + 1,
@@ -3245,6 +3651,7 @@ fn parse_legacy_binding_field(
     )
     .or_else(|| {
         parse_legacy_expression_from_text(
+            source,
             raw,
             node.start_byte(),
             node.start_position().row + 1,
@@ -3363,13 +3770,12 @@ fn parse_legacy_if_from_branch_typed(
             )
         });
 
-    // Body nodes are children of the clause node
+    // Body nodes are children of the clause node — skip header nodes
     let clause_children = named_children_vec(branch);
     let clause_body_start = clause_children
         .iter()
-        .position(|c| c.kind() == "expression_value")
-        .map(|i| i + 1)
-        .unwrap_or(0);
+        .position(|c| !matches!(c.kind(), "block_open" | "block_close" | "expression_value" | "branch_kind"))
+        .unwrap_or(clause_children.len());
     let block_children = trim_legacy_block_children(parse_legacy_nodes_slice(
         source,
         &clause_children[clause_body_start..],
@@ -3427,8 +3833,9 @@ fn parse_legacy_else_for_if_typed(
             vec![legacy::Node::IfBlock(nested)]
         }
         "else_clause" => {
-            // Body nodes are children of the else_clause
-            let clause_children = named_children_vec(branch);
+            // Body nodes are children of the else_clause, filtering out grammar
+            // delimiter nodes (block_open / block_close) added in grammar 0.1.4.
+            let clause_children = else_clause_body_nodes(branch);
             trim_legacy_block_children(parse_legacy_nodes_slice(source, &clause_children))
         }
         _ => return None,
@@ -3437,21 +3844,15 @@ fn parse_legacy_else_for_if_typed(
     // For else clauses, start is after the {:else} or {:else if ...} header
     let else_start = match branch.kind() {
         "else_if_clause" => {
-            // Body starts after the {:else if ...} header
-            let clause_children = named_children_vec(branch);
-            let body_idx = clause_children
-                .iter()
-                .position(|c| c.kind() == "expression_value")
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            clause_children
-                .get(body_idx)
-                .map(|n| n.start_byte())
-                .unwrap_or(branch.end_byte())
+            // For else_if, ElseBlock start = nested IfBlock start
+            branch_children.first().map(|child| match child {
+                legacy::Node::IfBlock(ib) => ib.start,
+                _ => legacy_node_start(child),
+            }).unwrap_or(branch.end_byte())
         }
         "else_clause" => {
-            // Body starts after the {:else} header — use first body child or clause end
-            let clause_children = named_children_vec(branch);
+            // Body starts after the {:else} header — use first body CST node position
+            let clause_children = else_clause_body_nodes(branch);
             clause_children
                 .first()
                 .map(|n| n.start_byte())
@@ -3582,7 +3983,7 @@ fn parse_legacy_each_block(
     let else_block = if let Some(&else_idx) = else_indices.first() {
         let else_node = children[else_idx];
         let boundary_node = children.get(end_idx)?;
-        let clause_children = named_children_vec(else_node);
+        let clause_children = else_clause_body_nodes(else_node);
         let else_start = clause_children
             .first()
             .map(|n| n.start_byte())
@@ -3744,7 +4145,21 @@ fn parse_legacy_await_block(
 
         let inline_start = shorthand_children
             .map(|node| node.start_byte())
-            .or_else(|| children.get(body_start).map(|node| node.start_byte()))
+            .or_else(|| {
+                // Skip block_close to find real body start position
+                let mut idx = body_start;
+                while idx < children.len()
+                    && matches!(children[idx].kind(), "block_close" | "block_open")
+                {
+                    idx += 1;
+                }
+                if idx > body_start && idx <= children.len() {
+                    // Use end_byte of the last skipped block_close
+                    Some(children[idx - 1].end_byte())
+                } else {
+                    children.get(body_start).map(|node| node.start_byte())
+                }
+            })
             .or_else(|| inline_children.first().map(legacy_node_start));
         let recovery_inline_end = (inline_children.is_empty() && expression_needs_recovery)
             .then(|| {
@@ -3789,15 +4204,28 @@ fn parse_legacy_await_block(
             pending.skip = false;
         } else if typed_branch_indices.is_empty() {
             // No await_pending and no branches: the whole body is pending
-            let body_start =
+            let mut body_start =
                 super::modern::body_start_index(block, children, &["expression", "binding"]);
+            // Skip block_close nodes (grammar 0.1.4 delimiter) to find real body
+            while body_start < children.len()
+                && matches!(children[body_start].kind(), "block_close" | "block_open")
+            {
+                body_start += 1;
+            }
             let pending_nodes: Vec<legacy::Node> = children
                 .iter()
                 .take(first_branch_idx)
                 .skip(body_start)
                 .flat_map(|node| parse_legacy_nodes_slice(source, std::slice::from_ref(node)))
                 .collect();
-            let p_start = children.get(body_start).map(|n| n.start_byte());
+            // Use end_byte of previous block_close for accurate start position
+            let p_start = if body_start > 0
+                && matches!(children[body_start - 1].kind(), "block_close")
+            {
+                Some(children[body_start - 1].end_byte())
+            } else {
+                children.get(body_start).map(|n| n.start_byte())
+            };
             let p_end = children.get(first_branch_idx).map(|n| n.start_byte());
             if !pending_nodes.is_empty() {
                 pending.start = p_start;
@@ -4013,12 +4441,12 @@ fn parse_legacy_nodes_slice_with_depth(
             "ERROR" if recovery_depth < 16 => {
                 let mut nested = parse_legacy_children(source, node, false, recovery_depth + 1);
                 let modern_nodes = recover_modern_error_nodes(source, node, false);
-                let modern_as_legacy = legacy_nodes_from_modern_error_recovery(modern_nodes);
+                let modern_as_legacy = legacy_nodes_from_modern_error_recovery(source, modern_nodes);
                 if !modern_as_legacy.is_empty() {
-                    let nested_has_structure = legacy_nodes_have_structural_content(&nested);
-                    let modern_has_structure =
-                        legacy_nodes_have_structural_content(&modern_as_legacy);
-                    if nested.is_empty() || (modern_has_structure && !nested_has_structure) {
+                    let nested_structural = count_structural_nodes(&nested);
+                    let modern_structural = count_structural_nodes(&modern_as_legacy);
+                    // Prefer the recovery with more structural nodes
+                    if nested.is_empty() || modern_structural > nested_structural {
                         nested = modern_as_legacy;
                     }
                 }
@@ -4047,7 +4475,20 @@ fn parse_legacy_nodes_slice_with_depth(
                     out.push(legacy_node_from_element_with_source(source, element));
                 }
             }
-            "end_tag"
+            "block_open" => {
+                // Recover unclosed block: block_open + expression + block_close → IfBlock/KeyBlock/EachBlock
+                if let Some((block_node, consumed)) =
+                    recover_legacy_unclosed_block(source, nodes, index, recovery_depth)
+                {
+                    out.push(block_node);
+                    consumed_until = consumed_until.max(
+                        nodes.get(index + consumed - 1).map(|n| n.end_byte()).unwrap_or(consumed_until)
+                    );
+                    index += consumed;
+                    continue;
+                }
+            }
+            "block_close" | "end_tag"
             | "block_end"
             | "else_if_clause"
             | "else_clause"
@@ -4061,6 +4502,172 @@ fn parse_legacy_nodes_slice_with_depth(
     }
 
     out
+}
+
+/// Recover an unclosed block from loose token sequence in legacy parsing.
+fn recover_legacy_unclosed_block(
+    source: &str,
+    nodes: &[Node<'_>],
+    start_index: usize,
+    recovery_depth: usize,
+) -> Option<(legacy::Node, usize)> {
+    let block_open = nodes[start_index];
+    if block_open.kind() != "block_open" {
+        return None;
+    }
+
+    // Find expression and block_close
+    let mut expr_index = None;
+    let mut close_index = None;
+    let mut binding_index = None;
+
+    for i in (start_index + 1)..nodes.len().min(start_index + 6) {
+        match nodes[i].kind() {
+            "expression" if expr_index.is_none() => expr_index = Some(i),
+            "pattern" if binding_index.is_none() => binding_index = Some(i),
+            "block_close" if close_index.is_none() => {
+                close_index = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let close_idx = close_index?;
+    let block_start = block_open.start_byte();
+    let block_close_end = nodes[close_idx].end_byte();
+
+    // Determine keyword
+    let keyword_start = block_open.end_byte();
+    let keyword_end = expr_index
+        .map(|i| nodes[i].start_byte())
+        .unwrap_or(nodes[close_idx].start_byte());
+    let keyword_text = source.get(keyword_start..keyword_end)?.trim();
+
+    // Children: everything after block_close until next boundary.
+    // Stop at: block_end, end_tag, start_tag, or ERROR with closing pattern.
+    // Do NOT stop at block_open — nested unclosed blocks become children.
+    let children_start = close_idx + 1;
+    let mut children_end = nodes.len();
+    let mut block_end_consumed = false; // Whether we found and consumed a {/keyword} closing
+    for i in children_start..nodes.len() {
+        let kind = nodes[i].kind();
+        if kind == "block_end" {
+            children_end = i;
+            block_end_consumed = true;
+            break;
+        }
+        if kind == "start_tag" || kind == "end_tag" {
+            children_end = i;
+            break;
+        }
+        if kind == "ERROR" {
+            let text = text_for_node(source, nodes[i]);
+            let trimmed = text.trim_start();
+            if trimmed.starts_with("{/") {
+                // This is a closing block tag — consume it as part of this block's span
+                children_end = i;
+                block_end_consumed = true;
+                break;
+            }
+            if trimmed.starts_with("</") {
+                children_end = i;
+                break;
+            }
+        }
+    }
+
+    let (child_nodes, block_end) = if children_start < children_end {
+        let parsed = parse_legacy_nodes_slice_with_depth(source, &nodes[children_start..children_end], recovery_depth + 1);
+        // Filter out whitespace-only text nodes from children
+        let filtered: Vec<legacy::Node> = parsed.into_iter().filter(|n| !is_legacy_whitespace_text(n)).collect();
+        let end = if block_end_consumed {
+            nodes[children_end].end_byte() // Include the closing tag in the span
+        } else {
+            nodes[children_end - 1].end_byte()
+        };
+        (filtered, end)
+    } else if block_end_consumed {
+        (Vec::new(), nodes[children_end].end_byte())
+    } else {
+        (Vec::new(), block_close_end)
+    };
+
+    // Consumed count: includes the closing tag if found
+    let consumed = if block_end_consumed {
+        children_end + 1 - start_index
+    } else {
+        children_end - start_index
+    };
+
+    match keyword_text {
+        "if" => {
+            let expression = expr_index
+                .and_then(|i| parse_legacy_expression_for_loose_block(source, nodes[i]))
+                .unwrap_or_else(|| legacy_empty_identifier_expression(block_close_end, block_close_end, None));
+            Some((
+                legacy::Node::IfBlock(legacy::IfBlock {
+                    start: block_start,
+                    end: block_end,
+                    expression,
+                    children: child_nodes.into_boxed_slice(),
+                    else_block: None,
+                    elseif: None,
+                }),
+                consumed,
+            ))
+        }
+        "key" => {
+            let expression = expr_index
+                .and_then(|i| parse_legacy_expression_for_loose_block(source, nodes[i]))
+                .unwrap_or_else(|| legacy_empty_identifier_expression(block_close_end, block_close_end, None));
+            Some((
+                legacy::Node::KeyBlock(legacy::KeyBlock {
+                    start: block_start,
+                    end: block_end,
+                    expression,
+                    children: child_nodes.into_boxed_slice(),
+                }),
+                consumed,
+            ))
+        }
+        kw if kw.starts_with("each") => {
+            let expression = expr_index
+                .and_then(|i| parse_legacy_expression_for_loose_block(source, nodes[i]))
+                .unwrap_or_else(|| legacy_empty_identifier_expression(block_close_end, block_close_end, None));
+            let context = binding_index
+                .and_then(|i| parse_legacy_expression_for_loose_block(source, nodes[i]))
+                .unwrap_or_else(|| legacy_empty_identifier_expression(block_close_end, block_close_end, None));
+            Some((
+                legacy::Node::EachBlock(legacy::EachBlock {
+                    start: block_start,
+                    end: block_end,
+                    expression,
+                    context: Some(context),
+                    children: child_nodes.into_boxed_slice(),
+                    else_block: None,
+                    index: None,
+                    key: None,
+                }),
+                consumed,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Parse a legacy expression from a tree-sitter expression node for loose block recovery.
+fn parse_legacy_expression_for_loose_block(
+    source: &str,
+    node: Node<'_>,
+) -> Option<legacy::Expression> {
+    if node.kind() != "expression" && node.kind() != "pattern" {
+        return None;
+    }
+    let text = text_for_node(source, node);
+    let start = node.start_byte();
+    let (line, column) = crate::line_column_at_offset(source, start);
+    parse_legacy_expression_from_text(source, text.as_ref(), start, line, column, false)
 }
 
 fn parse_legacy_loose_block_from_node(
@@ -4370,7 +4977,7 @@ fn legacy_element_tag_from_attribute_value(
                 let start = text.start + 1 + leading;
                 let (line, column) = line_column_at_offset(source, start);
                 if let Some(expression) =
-                    parse_legacy_expression_from_text(trimmed, start, line, column, false)
+                    parse_legacy_expression_from_text(source, trimmed, start, line, column, false)
                 {
                     return Some(legacy::ElementTag::Expression(expression));
                 }
@@ -4435,7 +5042,7 @@ fn parse_legacy_special_tag_expression_or_empty(source: &str, tag: Node<'_>) -> 
     let expression = find_first_named_child(tag, "expression_value")
         .or_else(|| find_first_named_child(tag, "expression"))
         .and_then(|node| super::modern::parse_modern_expression_field(source, node))
-        .map(legacy_expression_from_modern_or_empty);
+        .map(|e| legacy_expression_from_modern_or_empty(source, e));
 
     expression.unwrap_or_else(|| {
         let end = tag.end_byte().saturating_sub(1);
@@ -4456,7 +5063,7 @@ fn parse_legacy_debug_tag_arguments(source: &str, tag: Node<'_>) -> Box<[legacy:
             arguments
                 .into_vec()
                 .into_iter()
-                .map(legacy_expression_from_modern_or_empty)
+                .map(|e| legacy_expression_from_modern_or_empty(source, e))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         })
@@ -4485,7 +5092,7 @@ fn parse_attribute_shorthand(source: &str, node: Node<'_>) -> Option<legacy::Att
         let start = node.start_byte() + 1 + leading;
         let end = start + trimmed.len();
         let (line, column) = line_column_at_offset(source, start);
-        parse_legacy_expression_from_text(inner, start, line, column, true).or_else(|| {
+        parse_legacy_expression_from_text(source, inner, start, line, column, true).or_else(|| {
             let loc = legacy_loc(
                 source,
                 line,
@@ -4516,6 +5123,7 @@ fn legacy_expression_span(expression: &legacy::Expression) -> Option<(usize, usi
         legacy::Expression::CallExpression(expr) => Some((expr.start, expr.end)),
         legacy::Expression::BinaryExpression(expr) => Some((expr.start, expr.end)),
         legacy::Expression::Other(expr) => Some((expr.start, expr.end)),
+        legacy::Expression::OtherJson(_) => None,
     }
 }
 
@@ -4538,6 +5146,7 @@ fn parse_legacy_expression(
     {
         let inner = &text_ref[1..text_ref.len().saturating_sub(1)];
         return parse_legacy_expression_from_text(
+            source,
             inner,
             node.start_byte() + 1,
             node.start_position().row + 1,
@@ -4547,6 +5156,7 @@ fn parse_legacy_expression(
     }
 
     parse_legacy_expression_from_text(
+        source,
         text_ref,
         js_node.start_byte(),
         js_node.start_position().row + 1,
@@ -4556,6 +5166,7 @@ fn parse_legacy_expression(
 }
 
 fn parse_legacy_expression_from_text(
+    source: &str,
     text: &str,
     start_byte: usize,
     line: usize,
@@ -4576,7 +5187,7 @@ fn parse_legacy_expression_from_text(
     {
         attach_leading_comments_to_expression(&mut modern_expression, trimmed, start);
         attach_trailing_comments_to_expression(&mut modern_expression, trimmed, start);
-        if let Some(expr) = legacy_expression_from_modern(modern_expression, include_character) {
+        if let Some(expr) = legacy_expression_from_modern(source, modern_expression, include_character) {
             return Some(expr);
         }
     }
@@ -4590,6 +5201,7 @@ fn legacy_empty_identifier_expression(
     loc: Option<legacy::ExpressionLoc>,
 ) -> legacy::Expression {
     legacy::Expression::Identifier(legacy::IdentifierExpression {
+        r#type: legacy::IdentifierType::Identifier,
         name: Arc::from(""),
         start,
         end,
@@ -4598,6 +5210,7 @@ fn legacy_empty_identifier_expression(
 }
 
 fn parse_legacy_pattern_from_text(
+    source: &str,
     text: &str,
     start_byte: usize,
     line: usize,
@@ -4616,7 +5229,16 @@ fn parse_legacy_pattern_from_text(
     let start_col = column + leading_ws + 1;
 
     let modern_expression = super::modern::parse_pattern_with_oxc(trimmed, start, line, start_col)?;
-    legacy_expression_from_modern(modern_expression, false)
+    // Use column_offset=1 to match upstream Svelte's `read_pattern` wrapping
+    // which shifts newline positions by -1 and inflates columns by +1.
+    if let Some(pattern) = modern_expression.oxc_pattern() {
+        if let Some(converted) = legacy_expression_from_binding_pattern_inner(
+            source, pattern, &modern_expression, false, 1,
+        ) {
+            return Some(converted);
+        }
+    }
+    legacy_expression_from_modern(source, modern_expression, false)
 }
 
 pub(crate) fn parse_identifier_name(text: &str) -> Option<Arc<str>> {
@@ -4791,12 +5413,68 @@ fn collect_legacy_document_comments(
 }
 
 fn collect_comments_from_script_content_range(
-    _source: &str,
-    _script: &legacy::Script,
-    _comments: &mut Vec<legacy::ProgramComment>,
-    _seen: &mut HashSet<(usize, usize, u8)>,
+    source: &str,
+    script: &legacy::Script,
+    comments: &mut Vec<legacy::ProgramComment>,
+    seen: &mut HashSet<(usize, usize, u8)>,
 ) {
-    // TODO: re-implement comment extraction without EstreeNode
+    use oxc_ast::{CommentKind};
+    let program = script.content.program();
+    let offset = script.content_start;
+    let content = script.content.source();
+    for comment in program.comments.iter() {
+        let abs_start = comment.span.start as usize + offset;
+        let abs_end = comment.span.end as usize + offset;
+        let kind_tag: u8 = match comment.kind {
+            CommentKind::Line => 0,
+            _ => 1,
+        };
+        if !seen.insert((abs_start, abs_end, kind_tag)) {
+            continue;
+        }
+        let content_span = comment.content_span();
+        let value_text = &content[content_span.start as usize..content_span.end as usize];
+        let comment_type = match comment.kind {
+            CommentKind::Line => legacy::RootCommentType::Line,
+            CommentKind::SingleLineBlock | CommentKind::MultiLineBlock => legacy::RootCommentType::Block,
+        };
+        // Compute loc using full source positions
+        let loc = compute_comment_loc(source, abs_start, abs_end);
+        comments.push(legacy::ProgramComment {
+            r#type: comment_type,
+            value: Arc::from(value_text),
+            start: abs_start,
+            end: abs_end,
+            loc,
+        });
+    }
+}
+
+fn compute_comment_loc(source: &str, start: usize, end: usize) -> legacy::ExpressionLoc {
+    let (sl, sc) = source_line_column(source, start);
+    let (el, ec) = source_line_column(source, end);
+    legacy::ExpressionLoc {
+        start: legacy::ExpressionPoint { line: sl, column: sc, character: None },
+        end: legacy::ExpressionPoint { line: el, column: ec, character: None },
+    }
+}
+
+/// Compute 1-based line and 0-based column at `offset` in `source`.
+fn source_line_column(source: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut col = 0;
+    for (i, ch) in source.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 fn collect_comments_from_legacy_nodes(
@@ -4977,7 +5655,82 @@ fn collect_comments_from_legacy_expression(
             collect_comments_from_legacy_expression(_source, &binary.left, _comments, _seen);
             collect_comments_from_legacy_expression(_source, &binary.right, _comments, _seen);
         }
+        legacy::Expression::OtherJson(other_json) => {
+            // Extract leadingComments/trailingComments from embedded JSON
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(other_json.json.as_ref()) {
+                extract_comments_from_json_value(_source, &value, _comments, _seen);
+            }
+        }
         legacy::Expression::Other(_) => {}
+    }
+}
+
+/// Recursively extract leadingComments/trailingComments from JSON expression tree
+/// and add them to the _comments array.
+fn extract_comments_from_json_value(
+    source: &str,
+    value: &serde_json::Value,
+    comments: &mut Vec<legacy::ProgramComment>,
+    seen: &mut HashSet<(usize, usize, u8)>,
+) {
+    let Some(obj) = value.as_object() else { return };
+
+    for key in &["leadingComments", "trailingComments"] {
+        if let Some(serde_json::Value::Array(arr)) = obj.get(*key) {
+            for entry in arr {
+                let Some(type_str) = entry.get("type").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(value_str) = entry.get("value").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(start) = entry.get("start").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let Some(end) = entry.get("end").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                let start = start as usize;
+                let end = end as usize;
+                let kind_tag: u8 = if type_str == "Line" { 0 } else { 1 };
+                if !seen.insert((start, end, kind_tag)) {
+                    continue;
+                }
+                let comment_type = if type_str == "Line" {
+                    legacy::RootCommentType::Line
+                } else {
+                    legacy::RootCommentType::Block
+                };
+                let loc = compute_comment_loc(source, start, end);
+                comments.push(legacy::ProgramComment {
+                    r#type: comment_type,
+                    value: Arc::from(value_str),
+                    start,
+                    end,
+                    loc,
+                });
+            }
+        }
+    }
+
+    // Recurse into child objects/arrays to find nested comments
+    for (k, v) in obj {
+        if k == "leadingComments" || k == "trailingComments" {
+            continue;
+        }
+        match v {
+            serde_json::Value::Object(_) => {
+                extract_comments_from_json_value(source, v, comments, seen);
+            }
+            serde_json::Value::Array(arr) => {
+                for item in arr {
+                    if item.is_object() {
+                        extract_comments_from_json_value(source, item, comments, seen);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -4985,10 +5738,11 @@ fn is_legacy_whitespace_text(node: &legacy::Node) -> bool {
     matches!(node, legacy::Node::Text(text) if text.data.chars().all(char::is_whitespace))
 }
 
-fn legacy_nodes_have_structural_content(nodes: &[legacy::Node]) -> bool {
+fn count_structural_nodes(nodes: &[legacy::Node]) -> usize {
     nodes
         .iter()
-        .any(|node| !matches!(node, legacy::Node::Text(_) | legacy::Node::Comment(_)))
+        .filter(|node| !matches!(node, legacy::Node::Text(_) | legacy::Node::Comment(_)))
+        .count()
 }
 
 pub(crate) fn is_legacy_void_element(name: &str) -> bool {

@@ -12,22 +12,38 @@ use crate::ast::modern;
 use crate::js::JsProgram;
 use crate::parse::legacy_expression_from_modern_expression;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Script {
     pub r#type: ScriptType,
     pub start: usize,
     pub end: usize,
     pub context: ScriptContext,
-    #[serde(
-        skip_serializing,
-        skip_deserializing,
-        default = "empty_parsed_js_program"
-    )]
+    #[serde(skip_deserializing, default = "empty_parsed_js_program")]
     pub content: Arc<JsProgram>,
-    #[serde(skip_serializing, default)]
+    #[serde(skip, default)]
     pub content_start: usize,
-    #[serde(skip_serializing, default)]
+    #[serde(skip, default)]
     pub content_end: usize,
+    /// Pre-serialized ESTree JSON for the content Program AST.
+    #[serde(skip, default)]
+    pub content_json: Option<Arc<str>>,
+}
+
+impl serde::Serialize for Script {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &self.r#type)?;
+        map.serialize_entry("start", &self.start)?;
+        map.serialize_entry("end", &self.end)?;
+        map.serialize_entry("context", &self.context)?;
+        if let Some(json) = &self.content_json {
+            let raw = serde_json::value::RawValue::from_string(json.to_string())
+                .map_err(serde::ser::Error::custom)?;
+            map.serialize_entry("content", &raw)?;
+        }
+        map.end()
+    }
 }
 
 fn empty_parsed_js_program() -> Arc<JsProgram> {
@@ -201,54 +217,113 @@ pub struct AttributeShorthand {
 /// Typed variants exist for the handful of expression shapes that legacy tests
 /// and consumers inspect structurally. All other expression types are
 /// represented via `Other`, which wraps the modern `Expression` (OXC-backed).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum Expression {
     Identifier(IdentifierExpression),
     Literal(LiteralExpression),
     CallExpression(CallExpressionNode),
     BinaryExpression(BinaryExpressionNode),
-    /// Any expression type not covered above. Delegates serialization to the
-    /// modern Expression which uses OXC ESTree serialization.
+    /// Any expression type not covered above.
+    /// Stores a pre-serialized JSON string (with `loc` fields injected)
+    /// so that serialization is self-contained.
+    #[serde(skip)]
+    OtherJson(OtherExpressionJson),
+    /// Fallback for deserialization — wraps the modern Expression directly.
     Other(modern::Expression),
+}
+
+/// Pre-serialized ESTree JSON for expression types not covered by typed variants.
+/// The JSON string already contains `loc` fields computed from source at construction time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherExpressionJson {
+    pub json: Arc<str>,
+}
+
+impl serde::Serialize for Expression {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Identifier(v) => v.serialize(serializer),
+            Self::Literal(v) => v.serialize(serializer),
+            Self::CallExpression(v) => v.serialize(serializer),
+            Self::BinaryExpression(v) => v.serialize(serializer),
+            Self::OtherJson(v) => {
+                let raw = serde_json::value::RawValue::from_string(v.json.to_string())
+                    .map_err(serde::ser::Error::custom)?;
+                raw.serialize(serializer)
+            }
+            Self::Other(v) => v.serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentifierExpression {
-    pub name: Arc<str>,
+    pub r#type: IdentifierType,
     pub start: usize,
     pub end: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loc: Option<ExpressionLoc>,
+    pub name: Arc<str>,
+}
+
+/// Serde discriminant for `"type": "Identifier"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentifierType {
+    Identifier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiteralExpression {
+    pub r#type: LiteralType,
     pub start: usize,
     pub end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub loc: Option<ExpressionLoc>,
     pub value: LiteralValue,
     pub raw: Arc<str>,
 }
 
+/// Serde discriminant for `"type": "Literal"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LiteralType {
+    Literal,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallExpressionNode {
+    pub r#type: CallExpressionType,
     pub start: usize,
     pub end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub loc: Option<ExpressionLoc>,
     pub callee: Box<Expression>,
     pub arguments: Box<[Expression]>,
     pub optional: bool,
 }
 
+/// Serde discriminant for `"type": "CallExpression"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallExpressionType {
+    CallExpression,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryExpressionNode {
+    pub r#type: BinaryExpressionType,
     pub start: usize,
     pub end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub loc: Option<ExpressionLoc>,
     pub left: Box<Expression>,
     pub operator: Arc<str>,
     pub right: Box<Expression>,
+}
+
+/// Serde discriminant for `"type": "BinaryExpression"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinaryExpressionType {
+    BinaryExpression,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,105 +536,120 @@ pub enum Node {
     SnippetBlock(SnippetBlock),
 }
 
-impl From<modern::DirectiveAttribute> for DirectiveAttribute {
-    fn from(directive: modern::DirectiveAttribute) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            expression: Some(legacy_expression_from_modern_or_empty(directive.expression)),
-            modifiers: directive.modifiers,
-        }
+pub fn directive_attribute_from_modern(
+    source: &str,
+    directive: modern::DirectiveAttribute,
+) -> DirectiveAttribute {
+    DirectiveAttribute {
+        start: directive.start,
+        end: directive.end,
+        name: directive.name,
+        name_loc: directive.name_loc,
+        expression: Some(legacy_expression_from_modern_or_empty(
+            source,
+            directive.expression,
+        )),
+        modifiers: directive.modifiers,
     }
 }
 
-impl From<modern::StyleDirective> for StyleDirective {
-    fn from(directive: modern::StyleDirective) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            modifiers: directive.modifiers,
-            value: directive.value.into(),
-        }
+pub fn style_directive_from_modern(
+    source: &str,
+    directive: modern::StyleDirective,
+) -> StyleDirective {
+    StyleDirective {
+        start: directive.start,
+        end: directive.end,
+        name: directive.name,
+        name_loc: directive.name_loc,
+        modifiers: directive.modifiers,
+        value: attribute_value_kind_from_modern(source, directive.value),
     }
 }
 
-impl From<modern::TransitionDirective> for TransitionDirective {
-    fn from(directive: modern::TransitionDirective) -> Self {
-        Self {
-            start: directive.start,
-            end: directive.end,
-            name: directive.name,
-            name_loc: directive.name_loc,
-            expression: Some(legacy_expression_from_modern_or_empty(directive.expression)),
-            modifiers: directive.modifiers,
-            intro: directive.intro,
-            outro: directive.outro,
-        }
+pub fn transition_directive_from_modern(
+    source: &str,
+    directive: modern::TransitionDirective,
+) -> TransitionDirective {
+    TransitionDirective {
+        start: directive.start,
+        end: directive.end,
+        name: directive.name,
+        name_loc: directive.name_loc,
+        expression: Some(legacy_expression_from_modern_or_empty(
+            source,
+            directive.expression,
+        )),
+        modifiers: directive.modifiers,
+        intro: directive.intro,
+        outro: directive.outro,
     }
 }
 
-impl From<modern::AttributeValueKind> for AttributeValueKind {
-    fn from(value: modern::AttributeValueKind) -> Self {
-        match value {
-            modern::AttributeValueKind::Boolean(flag) => Self::Boolean(flag),
-            modern::AttributeValueKind::Values(values) => Self::Values(
-                values
-                    .into_vec()
-                    .into_iter()
-                    .map(Into::into)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-            ),
-            modern::AttributeValueKind::ExpressionTag(tag) => Self::Values(
-                vec![AttributeValue::MustacheTag(MustacheTag {
-                    start: tag.start,
-                    end: tag.end,
-                    expression: legacy_expression_from_modern_or_empty(tag.expression),
-                })]
+pub fn attribute_value_kind_from_modern(
+    source: &str,
+    value: modern::AttributeValueKind,
+) -> AttributeValueKind {
+    match value {
+        modern::AttributeValueKind::Boolean(flag) => AttributeValueKind::Boolean(flag),
+        modern::AttributeValueKind::Values(values) => AttributeValueKind::Values(
+            values
+                .into_vec()
+                .into_iter()
+                .map(|v| attribute_value_from_modern(source, v))
+                .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            ),
-        }
-    }
-}
-
-impl From<modern::AttributeValue> for AttributeValue {
-    fn from(value: modern::AttributeValue) -> Self {
-        match value {
-            modern::AttributeValue::Text(text) => Self::Text(Text {
-                start: text.start,
-                end: text.end,
-                raw: Some(text.raw),
-                data: text.data,
-            }),
-            modern::AttributeValue::ExpressionTag(tag) => Self::MustacheTag(MustacheTag {
+        ),
+        modern::AttributeValueKind::ExpressionTag(tag) => AttributeValueKind::Values(
+            vec![AttributeValue::MustacheTag(MustacheTag {
                 start: tag.start,
                 end: tag.end,
-                expression: legacy_expression_from_modern_or_empty(tag.expression),
-            }),
-        }
+                expression: legacy_expression_from_modern_or_empty(source, tag.expression),
+            })]
+            .into_boxed_slice(),
+        ),
     }
 }
 
-impl From<modern::Script> for Script {
-    fn from(script: modern::Script) -> Self {
-        Self {
-            r#type: script.r#type,
-            start: script.start,
-            end: script.end,
-            context: script.context,
-            content_start: script.content_start,
-            content_end: script.content_end,
-            content: script.content,
-        }
+pub fn attribute_value_from_modern(
+    source: &str,
+    value: modern::AttributeValue,
+) -> AttributeValue {
+    match value {
+        modern::AttributeValue::Text(text) => AttributeValue::Text(Text {
+            start: text.start,
+            end: text.end,
+            raw: Some(text.raw),
+            data: text.data,
+        }),
+        modern::AttributeValue::ExpressionTag(tag) => AttributeValue::MustacheTag(MustacheTag {
+            start: tag.start,
+            end: tag.end,
+            expression: legacy_expression_from_modern_or_empty(source, tag.expression),
+        }),
     }
 }
 
-fn legacy_expression_from_modern_or_empty(expression: modern::Expression) -> Expression {
-    if let Some(converted) = legacy_expression_from_modern_expression(expression.clone(), false) {
+pub fn script_from_modern(source: &str, script: modern::Script) -> Script {
+    let content_json = if !source.is_empty() {
+        Some(Arc::from(script.content.to_estree_json(source, script.content_start, script.end)))
+    } else {
+        None
+    };
+    Script {
+        r#type: script.r#type,
+        start: script.start,
+        end: script.end,
+        context: script.context,
+        content_start: script.content_start,
+        content_end: script.content_end,
+        content: script.content,
+        content_json,
+    }
+}
+
+fn legacy_expression_from_modern_or_empty(source: &str, expression: modern::Expression) -> Expression {
+    if let Some(converted) = legacy_expression_from_modern_expression(source, expression.clone(), false) {
         return converted;
     }
     let (start, end) = modern_expression_bounds(&expression).unwrap_or((0, 0));
@@ -576,6 +666,7 @@ fn legacy_empty_identifier_expression(
     loc: Option<ExpressionLoc>,
 ) -> Expression {
     Expression::Identifier(IdentifierExpression {
+        r#type: IdentifierType::Identifier,
         name: Arc::from(""),
         start,
         end,

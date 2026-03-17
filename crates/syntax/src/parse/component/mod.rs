@@ -19,7 +19,8 @@ pub use elements::{
     is_component_name, is_custom_element_name, is_valid_component_name, is_valid_element_name,
     is_void_element_name,
 };
-pub(crate) use legacy::parse_root as parse_legacy_root_from_cst;
+pub use legacy::parse_root as parse_legacy_root_from_cst;
+pub use legacy::legacy_root_from_modern;
 pub(crate) use legacy::{
     find_first_named_child, parse_identifier_name, parse_modern_attributes,
     line_column_from_point, text_for_node,
@@ -154,6 +155,47 @@ pub fn parse_modern_root(source: &str) -> Result<crate::ast::modern::Root, Compi
         parse_root_from_cst(source_text.text, cst.root_node(), false)
     }))
     .map_err(|_| CompileError::internal("failed to parse component root from cst"))
+}
+
+/// Detailed timing breakdown of the parse pipeline.
+#[derive(Debug, Clone)]
+pub struct ParseTimings {
+    /// tree-sitter GLR parse (source → Tree)
+    pub tree_sitter_parse_us: u64,
+    /// CST walk → modern AST
+    pub cst_to_ast_us: u64,
+    /// Expression enrichment (ESTree JSON with loc fields)
+    pub enrich_expressions_us: u64,
+    /// Total
+    pub total_us: u64,
+}
+
+/// Parse with detailed timing for each sub-phase.
+///
+/// Does NOT call `enrich_expressions` — caller is responsible for that if needed.
+pub fn parse_modern_root_timed(source: &str) -> Result<(crate::ast::modern::Root, ParseTimings), CompileError> {
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let source_text = SourceText::new(SourceId::new(0), source, None);
+    let cst = crate::cst::parse_svelte(source_text)?;
+    let tree_sitter_us = t0.elapsed().as_micros() as u64;
+
+    let t1 = Instant::now();
+    let root = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_root_from_cst(source_text.text, cst.root_node(), false)
+    }))
+    .map_err(|_| CompileError::internal("failed to parse component root from cst"))?;
+    let cst_to_ast_us = t1.elapsed().as_micros() as u64;
+
+    let total_us = t0.elapsed().as_micros() as u64;
+
+    Ok((root, ParseTimings {
+        tree_sitter_parse_us: tree_sitter_us,
+        cst_to_ast_us,
+        enrich_expressions_us: 0,
+        total_us,
+    }))
 }
 
 /// Parse a Svelte component into the modern AST root incrementally, reusing

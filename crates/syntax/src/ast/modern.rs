@@ -242,24 +242,41 @@ impl Fragment {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Script {
     pub r#type: ScriptType,
     pub start: usize,
     pub end: usize,
     /// Byte range of the script content (between open tag `>` and `</script>`).
-    #[serde(skip_serializing, default)]
+    #[serde(skip_deserializing, default)]
     pub content_start: usize,
-    #[serde(skip_serializing, default)]
+    #[serde(skip_deserializing, default)]
     pub content_end: usize,
     pub context: ScriptContext,
-    #[serde(
-        skip_serializing,
-        skip_deserializing,
-        default = "empty_parsed_js_program"
-    )]
+    #[serde(skip_deserializing, default = "empty_parsed_js_program")]
     pub content: Arc<JsProgram>,
+    /// Pre-serialized ESTree JSON for the content Program node.
+    #[serde(skip_deserializing, default)]
+    pub content_json: Option<Arc<str>>,
     pub attributes: Box<[Attribute]>,
+}
+
+impl Serialize for Script {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("type", &self.r#type)?;
+        map.serialize_entry("start", &self.start)?;
+        map.serialize_entry("end", &self.end)?;
+        map.serialize_entry("context", &self.context)?;
+        if let Some(ref json) = self.content_json {
+            let raw = serde_json::value::RawValue::from_string(json.to_string())
+                .map_err(serde::ser::Error::custom)?;
+            map.serialize_entry("content", &raw)?;
+        }
+        map.serialize_entry("attributes", &self.attributes)?;
+        map.end()
+    }
 }
 
 impl Script {
@@ -656,6 +673,23 @@ pub enum JsNodeHandle {
     },
 }
 
+/// A JS comment extracted from expression source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsComment {
+    pub kind: JsCommentKind,
+    pub value: Arc<str>,
+    /// Absolute source position (start). `None` for synthetic comments (e.g. HTML comments).
+    pub start: Option<usize>,
+    /// Absolute source position (end). `None` for synthetic comments.
+    pub end: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsCommentKind {
+    Line,
+    Block,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Expression {
     pub start: usize,
@@ -664,6 +698,16 @@ pub struct Expression {
     pub syntax: ExpressionSyntax,
     #[serde(skip_serializing, skip_deserializing, default)]
     pub node: Option<JsNodeHandle>,
+    /// Pre-computed ESTree JSON with loc fields injected from the full source.
+    /// Set by `Root::enrich_expressions` after parsing.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub enriched_json: Option<Arc<str>>,
+    /// Leading JS comments extracted from the expression source text.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub leading_comments: Vec<JsComment>,
+    /// Trailing JS comments extracted from the expression source text.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub trailing_comments: Vec<JsComment>,
 }
 
 impl Expression {
@@ -673,6 +717,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: None,
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -687,6 +734,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::Expression(parsed)),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -701,6 +751,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::SequenceItem { root, index }),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -710,6 +763,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::Pattern(parsed)),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -724,6 +780,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::ParameterItem { parameters, index }),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -733,6 +792,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::RestParameter(parameters)),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -747,6 +809,9 @@ impl Expression {
             end,
             syntax: Default::default(),
             node: Some(JsNodeHandle::StatementInProgram { program, index }),
+            enriched_json: None,
+            leading_comments: Vec::new(),
+            trailing_comments: Vec::new(),
         }
     }
 
@@ -815,6 +880,17 @@ impl Expression {
         }
 
         Some(expression)
+    }
+
+    /// Returns `true` if this expression represents a destructured pattern
+    /// (ObjectPattern or ArrayPattern).
+    pub fn is_destructured_pattern(&self) -> bool {
+        self.oxc_pattern().is_some_and(|p| {
+            matches!(
+                p,
+                BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_)
+            )
+        })
     }
 
     pub fn oxc_pattern(&self) -> Option<&BindingPattern<'_>> {
@@ -949,14 +1025,24 @@ impl Span for Expression {
 
 impl Serialize for Expression {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Prefer enriched JSON (with loc fields) if available.
+        if let Some(ref enriched) = self.enriched_json {
+            let raw = serde_json::value::RawValue::from_string(enriched.to_string())
+                .map_err(serde::ser::Error::custom)?;
+            return raw.serialize(serializer);
+        }
         if let Some(raw_json) = self.to_estree_json() {
             // Embed pre-serialized JSON directly via RawValue — no re-parsing.
             let raw = serde_json::value::RawValue::from_string(raw_json)
                 .map_err(serde::ser::Error::custom)?;
             raw.serialize(serializer)
         } else {
-            // Fallback: just emit start/end when no OXC node is available
-            let mut map = serializer.serialize_map(Some(2))?;
+            // Fallback: emit empty Identifier when no OXC node is available.
+            // Upstream produces {type: "Identifier", name: "", start, end} for
+            // broken or empty expressions in loose mode.
+            let mut map = serializer.serialize_map(Some(4))?;
+            map.serialize_entry("type", "Identifier")?;
+            map.serialize_entry("name", "")?;
             map.serialize_entry("start", &self.start)?;
             map.serialize_entry("end", &self.end)?;
             map.end()
@@ -965,6 +1051,118 @@ impl Serialize for Expression {
 }
 
 impl Expression {
+    /// Compute and store the enriched ESTree JSON with `loc` fields.
+    /// Uses the full source to compute line/column information.
+    /// `column_offset` is added to loc columns for nodes not on line 1
+    /// (used for destructured patterns to match upstream's wrapping behavior).
+    pub fn enrich_with_source(&mut self, full_source: &str) {
+        self.enrich_inner(full_source, 0, false);
+    }
+
+    pub fn enrich_with_source_and_column_offset(
+        &mut self,
+        full_source: &str,
+        column_offset: usize,
+    ) {
+        self.enrich_inner(full_source, column_offset, false);
+    }
+
+    /// Like `enrich_with_source` but adds `character` (byte offset) to loc objects.
+    /// Used for SnippetBlock expression names where upstream includes character.
+    pub fn enrich_with_character(&mut self, full_source: &str) {
+        self.enrich_inner(full_source, 0, true);
+    }
+
+    fn enrich_inner(
+        &mut self,
+        full_source: &str,
+        column_offset: usize,
+        with_character: bool,
+    ) {
+        let Some(raw_json) = self.serialize_oxc_node() else {
+            // For empty expressions (no OXC node), we can still produce enriched JSON
+            // with loc fields if character mode is requested (loose mode).
+            if with_character {
+                self.enrich_empty_with_character(full_source);
+            }
+            return;
+        };
+        let offset = self.oxc_span_offset();
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw_json) else {
+            return;
+        };
+        // Fix TemplateElement spans for TS-serialized expressions.
+        // Only Expression handles use the TS serializer; Pattern/Statement use JS.
+        if self.uses_ts_serializer() {
+            crate::js::fix_template_element_spans(&mut value);
+        }
+        if with_character {
+            crate::js::adjust_expression_json_with_character(
+                &mut value,
+                full_source,
+                offset,
+            );
+        } else {
+            crate::js::adjust_expression_json_with_column_offset(
+                &mut value,
+                full_source,
+                offset,
+                column_offset,
+            );
+        }
+        // Inject leadingComments if present
+        if !self.leading_comments.is_empty() {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert(
+                    "leadingComments".to_string(),
+                    serde_json::Value::Array(crate::estree::make_comment_json(&self.leading_comments)),
+                );
+            }
+        }
+        // Inject trailingComments if present
+        if !self.trailing_comments.is_empty() {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert(
+                    "trailingComments".to_string(),
+                    serde_json::Value::Array(crate::estree::make_comment_json(&self.trailing_comments)),
+                );
+            }
+        }
+        // Attach internal comments (comments within function bodies, etc.)
+        let internal_comments = self.extract_internal_comments();
+        if !internal_comments.is_empty() {
+            crate::js::attach_comments_to_json_tree(&mut value, &internal_comments, full_source);
+        }
+        if let Ok(enriched) = serde_json::to_string(&value) {
+            self.enriched_json = Some(Arc::from(enriched));
+        }
+    }
+
+    /// Check if this expression uses the TS serializer (for TemplateElement span fixing).
+    fn uses_ts_serializer(&self) -> bool {
+        matches!(
+            &self.node,
+            Some(JsNodeHandle::Expression(_))
+                | Some(JsNodeHandle::SequenceItem { .. })
+                | Some(JsNodeHandle::ParameterItem { .. })
+                | Some(JsNodeHandle::RestParameter(_))
+                | Some(JsNodeHandle::StatementInProgram { .. })
+        )
+    }
+
+    /// Generate enriched JSON for an empty expression (no OXC node) with loc+character.
+    fn enrich_empty_with_character(&mut self, full_source: &str) {
+        let start = self.start;
+        let end = self.end;
+        let (sl, sc) = crate::line_column_at_offset(full_source, start);
+        let (el, ec) = crate::line_column_at_offset(full_source, end);
+        let json = format!(
+            r#"{{"type":"Identifier","name":"","start":{},"end":{},"loc":{{"start":{{"line":{},"column":{},"character":{}}},"end":{{"line":{},"column":{},"character":{}}}}}}}"#,
+            start, end, sl, sc, start, el, ec, end
+        );
+        self.enriched_json = Some(Arc::from(json));
+    }
+
     /// Serialize this expression to an ESTree JSON string using OXC's serializer,
     /// with span offsets adjusted from OXC-local to Svelte source coordinates.
     /// Single-pass string-level adjustment, no intermediate tree parsing.
@@ -982,12 +1180,12 @@ impl Expression {
 
     /// Serialize the underlying OXC node to a JSON string via oxc_estree.
     fn serialize_oxc_node(&self) -> Option<String> {
-        use oxc_estree::{CompactJSSerializer, ESTree};
+        use oxc_estree::ESTree;
 
         match &self.node {
             Some(JsNodeHandle::Expression(parsed)) => {
-                let mut ser = CompactJSSerializer::new(false);
-                serialize_oxc_expression_unwrapped(parsed.expression(), &mut ser);
+                let mut ser = oxc_estree::CompactTSSerializer::new(false);
+                serialize_oxc_expression_unwrapped_ts(parsed.expression(), &mut ser);
                 Some(ser.into_string())
             }
             Some(JsNodeHandle::SequenceItem { root, index }) => {
@@ -995,30 +1193,32 @@ impl Expression {
                     return None;
                 };
                 let expr = seq.expressions.get(*index)?;
-                let mut ser = CompactJSSerializer::new(false);
+                let mut ser = oxc_estree::CompactTSSerializer::new(false);
                 expr.serialize(&mut ser);
                 Some(ser.into_string())
             }
             Some(JsNodeHandle::Pattern(parsed)) => {
-                let mut ser = CompactJSSerializer::new(false);
+                let mut ser = oxc_estree::CompactJSSerializer::new(false);
                 parsed.pattern().serialize(&mut ser);
                 Some(ser.into_string())
             }
             Some(JsNodeHandle::ParameterItem { parameters, index }) => {
                 let param = parameters.parameter(*index)?;
-                let mut ser = CompactJSSerializer::new(false);
+                // Use TS serializer so typeAnnotation is included
+                let mut ser = oxc_estree::CompactTSSerializer::new(false);
                 param.serialize(&mut ser);
                 Some(ser.into_string())
             }
             Some(JsNodeHandle::RestParameter(parameters)) => {
                 let rest = parameters.rest_parameter()?;
-                let mut ser = CompactJSSerializer::new(false);
+                // Use TS serializer so typeAnnotation is included
+                let mut ser = oxc_estree::CompactTSSerializer::new(false);
                 rest.serialize(&mut ser);
                 Some(ser.into_string())
             }
             Some(JsNodeHandle::StatementInProgram { program, index }) => {
                 let stmt = program.statement(*index)?;
-                let mut ser = CompactJSSerializer::new(false);
+                let mut ser = oxc_estree::CompactTSSerializer::new(false);
                 stmt.serialize(&mut ser);
                 Some(ser.into_string())
             }
@@ -1066,11 +1266,128 @@ impl Expression {
     }
 }
 
+impl Expression {
+    /// Scan the expression's source text and extract all internal JS comments.
+    /// Returns (absolute_start, absolute_end, json_value) tuples suitable for
+    /// `attach_comments_to_json_tree`.
+    pub fn extract_internal_comments(&self) -> Vec<(u32, u32, serde_json::Value)> {
+        let source = match &self.node {
+            Some(JsNodeHandle::Expression(parsed)) => parsed.source(),
+            _ => return Vec::new(),
+        };
+        let offset = self.oxc_span_offset();
+        let mut comments = Vec::new();
+        let bytes = source.as_bytes();
+        let mut i = 0;
+
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    let start = i;
+                    i += 2;
+                    let value_start = i;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    let value = &source[value_start..i];
+                    let abs_start = (start as i64 + offset) as u32;
+                    let abs_end = (i as i64 + offset) as u32;
+                    comments.push((
+                        abs_start,
+                        abs_end,
+                        crate::estree::EstreeComment {
+                            kind: crate::estree::EstreeCommentKind::Line,
+                            value: value.to_string(),
+                            start: Some(abs_start as usize),
+                            end: Some(abs_end as usize),
+                        }
+                        .to_json_value(),
+                    ));
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    let start = i;
+                    i += 2;
+                    let value_start = i;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    let value_end = i;
+                    if i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i = bytes.len();
+                    }
+                    let value = &source[value_start..value_end];
+                    let abs_start = (start as i64 + offset) as u32;
+                    let abs_end = (i as i64 + offset) as u32;
+                    comments.push((
+                        abs_start,
+                        abs_end,
+                        crate::estree::EstreeComment {
+                            kind: crate::estree::EstreeCommentKind::Block,
+                            value: value.to_string(),
+                            start: Some(abs_start as usize),
+                            end: Some(abs_end as usize),
+                        }
+                        .to_json_value(),
+                    ));
+                }
+                b'"' => {
+                    // Skip string literals
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'\'' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                b'`' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'`' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        comments
+    }
+}
+
 /// Serialize an OXC expression, unwrapping ParenthesizedExpression nodes.
 /// Svelte tracks parens via `Expression.syntax.parens`, not in the AST.
-fn serialize_oxc_expression_unwrapped(
+/// Uses TS serializer to emit typeAnnotation on params/identifiers.
+fn serialize_oxc_expression_unwrapped_ts(
     expr: &OxcExpression<'_>,
-    ser: &mut oxc_estree::CompactJSSerializer,
+    ser: &mut oxc_estree::CompactTSSerializer,
 ) {
     use oxc_estree::ESTree;
     let mut inner = expr;
@@ -1079,6 +1396,7 @@ fn serialize_oxc_expression_unwrapped(
     }
     inner.serialize(ser);
 }
+
 
 /// Single-pass adjustment of `"start":N` and `"end":N` span values in a JSON string.
 ///
@@ -1627,6 +1945,237 @@ impl Node {
     }
 }
 
+/// Visitor trait for mutable AST walks.
+///
+/// Default implementations recurse into children. Override `visit_node` or
+/// `visit_attribute` for per-variant customisation, calling `walk_node_children`
+/// / `walk_attribute_expressions` for the default recursion.
+pub trait NodeVisitorMut {
+    /// Called for every `Expression` leaf.
+    fn visit_expression(&mut self, expr: &mut Expression);
+
+    /// Called for every `Node`. Default: recurse into children.
+    fn visit_node(&mut self, node: &mut Node) {
+        self.walk_node_children(node);
+    }
+
+    /// Called for every `Fragment`. Default: visit each child node.
+    fn visit_fragment(&mut self, fragment: &mut Fragment) {
+        for node in fragment.nodes.iter_mut() {
+            self.visit_node(node);
+        }
+    }
+
+    /// Called for every `Attribute`. Default: visit contained expressions.
+    fn visit_attribute(&mut self, attr: &mut Attribute) {
+        self.walk_attribute_expressions(attr);
+    }
+
+    /// Walk all children of a node, dispatching to `visit_expression`,
+    /// `visit_fragment`, and `visit_attribute` as appropriate.
+    ///
+    /// This is the single canonical match over all `Node` variants.
+    fn walk_node_children(&mut self, node: &mut Node) {
+        match node {
+            Node::ExpressionTag(tag) => {
+                self.visit_expression(&mut tag.expression);
+            }
+            Node::IfBlock(block) => {
+                self.visit_expression(&mut block.test);
+                self.visit_fragment(&mut block.consequent);
+                if let Some(ref mut alt) = block.alternate {
+                    self.walk_alternate(alt);
+                }
+            }
+            Node::EachBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                if let Some(ref mut ctx) = block.context {
+                    self.visit_expression(ctx);
+                }
+                if let Some(ref mut key) = block.key {
+                    self.visit_expression(key);
+                }
+                self.visit_fragment(&mut block.body);
+                if let Some(ref mut fallback) = block.fallback {
+                    self.visit_fragment(fallback);
+                }
+            }
+            Node::KeyBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                self.visit_fragment(&mut block.fragment);
+            }
+            Node::AwaitBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                if let Some(ref mut v) = block.value {
+                    self.visit_expression(v);
+                }
+                if let Some(ref mut e) = block.error {
+                    self.visit_expression(e);
+                }
+                if let Some(ref mut f) = block.pending {
+                    self.visit_fragment(f);
+                }
+                if let Some(ref mut f) = block.then {
+                    self.visit_fragment(f);
+                }
+                if let Some(ref mut f) = block.catch {
+                    self.visit_fragment(f);
+                }
+            }
+            Node::SnippetBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                for param in block.parameters.iter_mut() {
+                    self.visit_expression(param);
+                }
+                self.visit_fragment(&mut block.body);
+            }
+            Node::RenderTag(tag) => {
+                self.visit_expression(&mut tag.expression);
+            }
+            Node::HtmlTag(tag) => {
+                self.visit_expression(&mut tag.expression);
+            }
+            Node::ConstTag(tag) => {
+                self.visit_expression(&mut tag.declaration);
+            }
+            Node::DebugTag(tag) => {
+                for expr in tag.arguments.iter_mut() {
+                    self.visit_expression(expr);
+                }
+            }
+            // Element-like nodes: attributes + fragment
+            Node::RegularElement(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::Component(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SlotElement(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteHead(el) => {
+                // SvelteHead: only fragment, no attribute enrichment
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteBody(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteWindow(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteDocument(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteComponent(el) => {
+                if let Some(ref mut expr) = el.expression {
+                    self.visit_expression(expr);
+                }
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteElement(el) => {
+                if let Some(ref mut expr) = el.expression {
+                    self.visit_expression(expr);
+                }
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteSelf(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteFragment(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::SvelteBoundary(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::TitleElement(el) => {
+                for attr in el.attributes.iter_mut() { self.visit_attribute(attr); }
+                self.visit_fragment(&mut el.fragment);
+            }
+            Node::Text(_) | Node::Comment(_) => {}
+        }
+    }
+
+    /// Walk an `Alternate` branch (else / else-if chain).
+    fn walk_alternate(&mut self, alt: &mut Alternate) {
+        match alt {
+            Alternate::Fragment(f) => self.visit_fragment(f),
+            Alternate::IfBlock(block) => {
+                self.visit_expression(&mut block.test);
+                self.visit_fragment(&mut block.consequent);
+                if let Some(ref mut inner) = block.alternate {
+                    self.walk_alternate(inner);
+                }
+            }
+        }
+    }
+
+    /// Walk all expressions inside an `Attribute`.
+    ///
+    /// This is the single canonical match over all `Attribute` variants.
+    fn walk_attribute_expressions(&mut self, attr: &mut Attribute) {
+        match attr {
+            Attribute::Attribute(a) => {
+                match &mut a.value {
+                    AttributeValueKind::ExpressionTag(tag) => {
+                        self.visit_expression(&mut tag.expression);
+                    }
+                    AttributeValueKind::Values(values) => {
+                        for val in values.iter_mut() {
+                            if let AttributeValue::ExpressionTag(tag) = val {
+                                self.visit_expression(&mut tag.expression);
+                            }
+                        }
+                    }
+                    AttributeValueKind::Boolean(_) => {}
+                }
+            }
+            Attribute::SpreadAttribute(a) => {
+                self.visit_expression(&mut a.expression);
+            }
+            Attribute::OnDirective(d)
+            | Attribute::BindDirective(d)
+            | Attribute::ClassDirective(d)
+            | Attribute::LetDirective(d)
+            | Attribute::AnimateDirective(d)
+            | Attribute::UseDirective(d) => {
+                self.visit_expression(&mut d.expression);
+            }
+            Attribute::StyleDirective(d) => {
+                match &mut d.value {
+                    AttributeValueKind::ExpressionTag(tag) => {
+                        self.visit_expression(&mut tag.expression);
+                    }
+                    AttributeValueKind::Values(values) => {
+                        for val in values.iter_mut() {
+                            if let AttributeValue::ExpressionTag(tag) = val {
+                                self.visit_expression(&mut tag.expression);
+                            }
+                        }
+                    }
+                    AttributeValueKind::Boolean(_) => {}
+                }
+            }
+            Attribute::TransitionDirective(d) => {
+                self.visit_expression(&mut d.expression);
+            }
+            Attribute::AttachTag(a) => {
+                self.visit_expression(&mut a.expression);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootComment {
     pub r#type: RootCommentType,
@@ -1657,6 +2206,206 @@ pub struct Root {
     pub comments: Option<Box<[RootComment]>>,
     #[serde(skip_serializing, default)]
     pub errors: Box<[crate::ast::common::ParseError]>,
+}
+
+impl Root {
+    /// Walk all expressions in the AST and compute enriched ESTree JSON with `loc` fields.
+    /// When `loose` is true, certain expression types get `character` in their loc.
+    pub fn enrich_expressions(&mut self, source: &str, loose: bool) {
+        enrich_fragment_expressions(&mut self.fragment, source, loose);
+        if let Some(ref mut options) = self.options {
+            enrich_options_expressions(options, source, loose);
+        }
+        // Inject HTML comments as leadingComments on Script Program nodes.
+        self.inject_html_comments_into_scripts();
+    }
+
+    /// Find HTML Comment nodes in fragment that immediately precede a Script tag,
+    /// and inject them as `leadingComments` on the Script's Program content_json.
+    fn inject_html_comments_into_scripts(&mut self) {
+        // Collect HTML comments from the fragment that appear before scripts.
+        let mut html_comments_before_instance: Vec<JsComment> = Vec::new();
+        let mut html_comments_before_module: Vec<JsComment> = Vec::new();
+
+        let instance_start = self.instance.as_ref().map(|s| s.start);
+        let module_start = self.module.as_ref().map(|s| s.start);
+
+        for node in self.fragment.nodes.iter() {
+            if let Node::Comment(comment) = node {
+                // Check if this comment immediately precedes the instance script
+                if let Some(inst_start) = instance_start {
+                    if comment.end <= inst_start {
+                        html_comments_before_instance.push(JsComment {
+                            kind: JsCommentKind::Line,
+                            value: comment.data.clone(),
+                            start: None,
+                            end: None,
+                        });
+                    }
+                }
+                // Check if this comment immediately precedes the module script
+                if let Some(mod_start) = module_start {
+                    if comment.end <= mod_start {
+                        html_comments_before_module.push(JsComment {
+                            kind: JsCommentKind::Line,
+                            value: comment.data.clone(),
+                            start: None,
+                            end: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Inject into instance content_json
+        if !html_comments_before_instance.is_empty() {
+            if let Some(ref mut script) = self.instance {
+                inject_leading_comments_into_content_json(
+                    &mut script.content_json,
+                    &html_comments_before_instance,
+                );
+            }
+        }
+        if !html_comments_before_module.is_empty() {
+            if let Some(ref mut script) = self.module {
+                inject_leading_comments_into_content_json(
+                    &mut script.content_json,
+                    &html_comments_before_module,
+                );
+            }
+        }
+    }
+}
+
+fn inject_leading_comments_into_content_json(
+    content_json: &mut Option<Arc<str>>,
+    comments: &[JsComment],
+) {
+    let Some(json_str) = content_json.as_ref() else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(json_str.as_ref()) else {
+        return;
+    };
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "leadingComments".to_string(),
+            serde_json::Value::Array(crate::estree::make_comment_json(comments)),
+        );
+    }
+    if let Ok(enriched) = serde_json::to_string(&value) {
+        *content_json = Some(Arc::from(enriched));
+    }
+}
+
+fn enrich_expression(expr: &mut Expression, source: &str) {
+    if expr.node.is_some() && expr.enriched_json.is_none() {
+        expr.enrich_with_source(source);
+    }
+}
+
+fn enrich_expression_with_character(expr: &mut Expression, source: &str) {
+    if expr.enriched_json.is_none() {
+        expr.enrich_with_character(source);
+    }
+}
+
+/// Visitor that enriches all expressions in the AST with ESTree JSON + loc fields.
+struct EnrichVisitor<'a> {
+    source: &'a str,
+    loose: bool,
+}
+
+impl NodeVisitorMut for EnrichVisitor<'_> {
+    fn visit_expression(&mut self, expr: &mut Expression) {
+        enrich_expression(expr, self.source);
+    }
+
+    fn visit_node(&mut self, node: &mut Node) {
+        // Variants with special enrichment logic that differs from the default
+        // `visit_expression` path (character mode, column offsets, etc.).
+        match node {
+            Node::EachBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                if let Some(ref mut ctx) = block.context {
+                    if ctx.is_destructured_pattern() {
+                        // Destructured patterns need +1 column offset (matching upstream wrapping)
+                        ctx.enrich_with_source_and_column_offset(self.source, 1);
+                    } else if self.loose {
+                        enrich_expression_with_character(ctx, self.source);
+                    } else {
+                        enrich_expression(ctx, self.source);
+                    }
+                }
+                if let Some(ref mut key) = block.key {
+                    self.visit_expression(key);
+                }
+                self.visit_fragment(&mut block.body);
+                if let Some(ref mut fallback) = block.fallback {
+                    self.visit_fragment(fallback);
+                }
+            }
+            Node::AwaitBlock(block) => {
+                self.visit_expression(&mut block.expression);
+                // value and error need character mode in loose
+                for opt_expr in [&mut block.value, &mut block.error] {
+                    if let Some(expr) = opt_expr {
+                        if self.loose {
+                            enrich_expression_with_character(expr, self.source);
+                        } else {
+                            enrich_expression(expr, self.source);
+                        }
+                    }
+                }
+                if let Some(ref mut f) = block.pending {
+                    self.visit_fragment(f);
+                }
+                if let Some(ref mut f) = block.then {
+                    self.visit_fragment(f);
+                }
+                if let Some(ref mut f) = block.catch {
+                    self.visit_fragment(f);
+                }
+            }
+            Node::SnippetBlock(block) => {
+                // SnippetBlock expression (name) uses loc with `character` field
+                block.expression.enrich_with_character(self.source);
+                for param in block.parameters.iter_mut() {
+                    self.visit_expression(param);
+                }
+                self.visit_fragment(&mut block.body);
+            }
+            // All other variants use the default walk.
+            _ => self.walk_node_children(node),
+        }
+    }
+
+    fn visit_attribute(&mut self, attr: &mut Attribute) {
+        // In loose mode, shorthand empty expressions like `<div {}>` get loc with `character`
+        if self.loose {
+            if let Attribute::Attribute(a) = attr {
+                if let AttributeValueKind::ExpressionTag(tag) = &mut a.value {
+                    if tag.expression.node.is_none() && a.name.is_empty() {
+                        enrich_expression_with_character(&mut tag.expression, self.source);
+                        return;
+                    }
+                }
+            }
+        }
+        self.walk_attribute_expressions(attr);
+    }
+}
+
+fn enrich_fragment_expressions(fragment: &mut Fragment, source: &str, loose: bool) {
+    let mut visitor = EnrichVisitor { source, loose };
+    visitor.visit_fragment(fragment);
+}
+
+fn enrich_options_expressions(options: &mut Options, source: &str, loose: bool) {
+    let mut visitor = EnrichVisitor { source, loose };
+    for attr in options.attributes.iter_mut() {
+        visitor.visit_attribute(attr);
+    }
 }
 
 macro_rules! impl_span_for_struct {
@@ -1842,8 +2591,25 @@ mod tests {
         let json = serde_json::to_string(&expr).expect("serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
 
+        assert_eq!(value["type"], "Identifier");
+        assert_eq!(value["name"], "");
         assert_eq!(value["start"], 10);
         assert_eq!(value["end"], 20);
-        assert!(value.get("type").is_none());
+    }
+
+    #[test]
+    fn ts_serializer_emits_type_annotation_on_arrow_params() {
+        let parsed = crate::js::JsExpression::parse(
+            "(e: MouseEvent) => e",
+            oxc_span::SourceType::ts().with_module(true),
+        )
+        .expect("valid expression");
+
+        let expr = Expression::from_expression(Arc::new(parsed), 0, 20);
+        let raw = expr.serialize_oxc_node().expect("should serialize");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(value["type"], "ArrowFunctionExpression");
+        let param = &value["params"][0];
+        assert!(param.get("typeAnnotation").is_some(), "param should have typeAnnotation");
     }
 }

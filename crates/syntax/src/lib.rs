@@ -78,6 +78,7 @@ pub mod ast;
 pub mod compat;
 pub mod cst;
 mod error;
+pub(crate) mod estree;
 pub mod js;
 mod parse;
 mod primitives;
@@ -85,7 +86,15 @@ mod source;
 
 // --- CST parsing ---
 
-pub use cst::{CstEdit, CstParser, Document, Language, parse_svelte, parse_svelte_incremental};
+pub use cst::{
+    CstEdit, CstParser, Document, ExpressionCache, Language, ParsedDocument,
+    parse_svelte, parse_svelte_incremental,
+    // Wrapper types
+    Root, Element, TextNode, CommentNode, IfBlock, EachBlock, AwaitBlock,
+    KeyBlock, SnippetBlock, ExpressionTag, HtmlTag, ConstTag, DebugTag,
+    RenderTag, AttachTag, AttributeNode, AttributeValuePart, StartTag,
+    ElseClause, Alternate, TemplateNode, ChildIter, AttributeIter, classify_node,
+};
 
 // --- Errors ---
 
@@ -98,12 +107,15 @@ pub use js::{JsExpression, JsProgram};
 // --- AST parsing and element/attribute classification ---
 
 pub use parse::{
-    AttributeKind, ElementKind, ParseMode, ParseOptions, SvelteElementKind,
-    classify_attribute_name, classify_element_name, find_matching_brace_close, is_component_name,
-    is_custom_element_name, is_valid_component_name, is_valid_element_name, is_void_element_name,
-    line_column_at_offset, parse, parse_css, parse_modern_css_nodes,
-    parse_modern_expression_from_text, parse_modern_expression_tag, parse_modern_root,
-    parse_modern_root_incremental, parse_svelte_ignores,
+    AttributeKind, ElementKind, ParseMode, ParseOptions, ParseCounters, ParseTimings,
+    SvelteElementKind, classify_attribute_name, classify_element_name,
+    find_matching_brace_close, is_component_name, is_custom_element_name,
+    is_valid_component_name, is_valid_element_name, is_void_element_name,
+    legacy_root_from_modern, line_column_at_offset, parse, parse_css,
+    parse_legacy_root_from_cst, parse_modern_css_nodes, parse_modern_expression_from_text,
+    parse_modern_expression_tag, parse_modern_root, parse_modern_root_incremental,
+    parse_modern_root_timed, parse_svelte_ignores,
+    read_parse_counters, reset_parse_counters,
 };
 
 // --- Primitives ---
