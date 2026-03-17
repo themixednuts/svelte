@@ -13,7 +13,7 @@ members = [
 default-members = ["crates/cli", "crates/compiler"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -54,9 +54,9 @@ serde_json = { version = "1.0.149", features = ["raw_value"] }
 self_cell = "1.2.2"
 rustc-hash = "1.1.0"
 smallvec = "1.15.1"
-svelte-compiler = { version = "0.1.1", path = "crates/compiler" }
-svelte-syntax = { version = "0.1.1", path = "crates/syntax" }
-svelte-vite-rolldown = { version = "0.1.1", path = "crates/vite-rolldown" }
+svelte-compiler = { version = "0.1.5", path = "crates/compiler" }
+svelte-syntax = { version = "0.1.5", path = "crates/syntax" }
+svelte-vite-rolldown = { version = "0.1.5", path = "crates/vite-rolldown" }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "io-util", "sync"] }
 tower-lsp-server = "0.23.0"
